@@ -1,4 +1,4 @@
-﻿using UdonSharp;
+using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
 using VRC.SDK3.Rendering;
@@ -57,6 +57,119 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     public float vrTargetFOV = 110f;
 
     // ============================================================
+    // SebLague 风格递归渲染（使用现有 A/B 相机与材质，无需重新拖引用）
+    // ============================================================
+
+    [Header("════════════ Seb递归渲染 1.0 ════════════")]
+    [Tooltip("开启后不再依赖 Camera.enabled 自动渲染，而是在 LateUpdate 中用 Camera.Render() 手动多次渲染递归层。")]
+    public bool enableSebRecursiveRendering = true;
+
+    [Range(0, 8)]
+    [Tooltip("最大递归次数：0=不手动渲染，1=普通一层，2+=递归。")]
+    public int recursiveRenderLimit = 3;
+
+    [Tooltip("递归相机手动 Render 前强制 Camera.enabled=false，避免自动渲染重复开销。")]
+    [HideInInspector]
+    public bool recursiveForceManualCamerasDisabled = true;
+
+    [Tooltip("最深层临时隐藏对面门面，让最后一层看到门后世界/天空盒，作为递归终点。")]
+    [HideInInspector]
+    public bool recursiveUseSkyboxTerminal = true;
+
+    [Tooltip("渲染当前出口侧时临时隐藏出口门面，避免递归相机被门面挡住。")]
+    [HideInInspector]
+    public bool recursiveHideExitScreen = true;
+
+    [Tooltip("简易提前停止：递归相机看不到下一扇门时，不继续更深递归。")]
+    [HideInInspector]
+    public bool recursiveEarlyStop = true;
+
+    [Tooltip("递归提前停止：超过这个距离认为看不到下一层。")]
+    [HideInInspector]
+    public float recursiveMaxDistance = 80f;
+
+    [Tooltip("递归提前停止：超过这个视角夹角认为看不到下一层。")]
+    [HideInInspector]
+    public float recursiveMaxViewAngle = 100f;
+
+    [Tooltip("递归调试日志。")]
+    [HideInInspector]
+    public bool debugRecursiveRenderLog = false;
+
+    [Tooltip("递归调试日志间隔帧。")]
+    [HideInInspector]
+    public int debugRecursiveLogIntervalFrames = 60;
+
+    [Tooltip("Seb shader 的显示开关属性名。Screen 2D 递归版 shader 已加入 _DisplayMask。")]
+    [HideInInspector]
+    public string recursiveDisplayMaskProperty = "_DisplayMask";
+
+    [Tooltip("递归终点是否用 Seb 的 displayMask 关闭 linked portal。关闭后将用隐藏 Renderer 的方式，更像天空盒终点。")]
+    [HideInInspector]
+    public bool recursiveTerminalUseDisplayMask = true;
+
+    [Tooltip("隐藏当前出口门面是否用 displayMask。开启更贴近 Seb，关闭则用 Renderer.enabled=false。")]
+    [HideInInspector]
+    public bool recursiveHideExitUseDisplayMask = false;
+
+    [Tooltip("递归手动渲染时强制相机 ClearFlags=Skybox，避免 RenderTexture 残影/拖影。")]
+    [HideInInspector]
+    public bool recursiveForceClearSkybox = true;
+
+    [Tooltip("递归裁剪使用 SebLague 原版 oblique near clip 公式，不使用旧版带符号 clipPlaneOffset 位移。")]
+    [HideInInspector]
+    public bool recursiveUseSebObliqueClip = true;
+
+    [Tooltip("Seb oblique 裁剪偏移。会取绝对值；建议 0.01~0.05。你的旧 clipPlaneOffset=-0.1 不会再反向污染递归裁剪。")]
+    [HideInInspector]
+    public float recursiveNearClipOffset = 0.02f;
+
+    [Tooltip("离门太近时不用 oblique projection，避免抖动/反向裁切。")]
+    [HideInInspector]
+    public float recursiveNearClipLimit = 0.0001f;
+
+    [Tooltip("强制使用递归 oblique 裁剪。你的门间距/near 很小，建议开启；否则离门太近时 ResetProjectionMatrix 会像 near 没对准。")]
+    [HideInInspector]
+    public bool recursiveForceObliqueClip = true;
+
+    [Tooltip("如果递归裁剪方向确实反了，开启此项翻转 Seb oblique 法线方向。默认关闭。")]
+    [HideInInspector]
+    public bool recursiveFlipObliqueClipNormal = false;
+
+    [Tooltip("递归渲染专用经典 Portal 半转。一个门在前墙、一个门在侧墙时如果画面方向不对，先试这个。默认跟随 useClassicHalfTurn。")]
+    [HideInInspector]
+    public bool recursiveRenderUseClassicHalfTurn = false;
+
+    [Tooltip("递归每次 Render 前，把 Camera.nearClipPlane 动态推到刚越过出口传送门平面。用于修复第一层 near 没贴门导致看到下一层/背面的情况。")]
+    [HideInInspector]
+    public bool recursiveSyncNearClipToPortalPlane = true;
+
+    [Tooltip("递归画面校准：让近裁剪刚好越过出口门面。看到门背面/第二层穿帮就略加大；裁太多就减小。推荐 0.01~0.05。")]
+    public float recursiveDynamicNearClipPadding = 0.02f;
+
+    [Header("════════════ 近距离门面置顶修正 ════════════")]
+    [Tooltip("玩家头在门框内且非常靠近门面时，把门面 shader 的 ZTest 临时切到 Always，减少薄门/墙后穿帮和闪烁。需要使用递归 Overlay 版 shader。")]
+    public bool enablePortalOverlayWhenHeadNear = true;
+
+    [Tooltip("头部离门平面多近时启用门面置顶。建议 0.03~0.12。")]
+    public float portalOverlayDepth = 0.08f;
+
+    [Tooltip("shader ZTest 属性名。Overlay 版 shader 已加入 _ZTest。LEqual=4，Always=8。")]
+    public string portalOverlayZTestProperty = "_ZTest";
+
+    [HideInInspector]
+    [Tooltip("旧调试开关：默认关闭。递归和过渡本应互不干扰；过渡问题通常来自过渡相机 nearClipPlane。")]
+    public bool recursivePauseDuringTransition = false;
+
+    [Tooltip("动态 near clip 最大值，防止异常情况下 near 太大导致整屏被裁。")]
+    [HideInInspector]
+    public float recursiveDynamicNearClipMax = 50f;
+
+    [Tooltip("输出递归裁剪/near clip 调试日志。")]
+    [HideInInspector]
+    public bool debugRecursiveClipLog = false;
+
+    // ============================================================
     // 新增：过渡系统（极简）
     // ============================================================
 
@@ -65,6 +178,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     public GameObject portalViewTransitionCube;
     [Tooltip("过渡时长（秒）。")]
     public float transitionDuration = 0.5f;
+
+    [Tooltip("过渡相机安全 Near Clip。过渡相机不做传送门裁剪，只需要一个合法的小 near；避免 cameraNearClip 被调到 0 时过渡画面异常。")]
+    public float transitionCameraSafeNearClip = 0.01f;
 
     [Header("════════════ 同Collider专修/调试 ════════════")]
     [Tooltip("开启基础传送日志")]
@@ -157,6 +273,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     public int portalStateB = 0;
     public bool colliderADisabled = false;
     public bool colliderBDisabled = false;
+    public int recursiveDepthRenderedA = 0;
+    public int recursiveDepthRenderedB = 0;
 
     // ============================================================
     // 私有变量
@@ -188,10 +306,19 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private Quaternion fromPortalRotAtTeleport;
     private Quaternion toPortalRotAtTeleport;
     private bool isTeleporting = false;
+    private Camera[] transitionChildCameras;
 
     // PATCH: 速度延迟重发，防止 VRChat 接地吃速度
     private Vector3 pendingVelocity = Vector3.zero;
     private int pendingVelocityFrames = 0;
+
+    // Seb 递归渲染缓存（固定 8 层，配合 recursiveRenderLimit 滑条）
+    private Vector3[] recursivePositionsA;
+    private Quaternion[] recursiveRotationsA;
+    private Vector3[] recursivePositionsB;
+    private Quaternion[] recursiveRotationsB;
+    private RenderTexture cachedPortalTextureA;
+    private RenderTexture cachedPortalTextureB;
 
     // ============================================================
     // Start
@@ -203,6 +330,17 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         if (cameraA != null) cameraA.nearClipPlane = cameraNearClip;
         if (cameraB != null) cameraB.nearClipPlane = cameraNearClip;
+
+        recursivePositionsA = new Vector3[8];
+        recursiveRotationsA = new Quaternion[8];
+        recursivePositionsB = new Vector3[8];
+        recursiveRotationsB = new Quaternion[8];
+
+        if (enableSebRecursiveRendering && recursiveForceManualCamerasDisabled)
+        {
+            if (cameraA != null) cameraA.enabled = false;
+            if (cameraB != null) cameraB.enabled = false;
+        }
 
         if (portalPlaneA != null)
         {
@@ -221,18 +359,23 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             isVRPlayer = localPlayer.IsUserInVR();
         }
 
+        if (portalMatA != null) portalMatA.SetFloat(recursiveDisplayMaskProperty, 1f);
+        if (portalMatB != null) portalMatB.SetFloat(recursiveDisplayMaskProperty, 1f);
+        SyncPortalRenderTextureBindings();
+
         // 默认关闭过渡 Cube（只在传送时开启）
         if (portalViewTransitionCube != null)
         {
             portalViewTransitionCube.SetActive(false);
 
-            // 关闭子集相机，直到传送时才开启
-            Camera[] childCameras = portalViewTransitionCube.GetComponentsInChildren<Camera>(true);
-            foreach (var cam in childCameras)
+            // 缓存并关闭子集相机，直到传送时才开启。避免过渡中每帧 GetComponentsInChildren。
+            transitionChildCameras = portalViewTransitionCube.GetComponentsInChildren<Camera>(true);
+            foreach (var cam in transitionChildCameras)
             {
-                if (cam.gameObject != portalViewTransitionCube)
+                if (cam != null && cam.gameObject != portalViewTransitionCube)
                 {
                     cam.enabled = false;
+                    cam.nearClipPlane = Mathf.Max(transitionCameraSafeNearClip, 0.001f);
                 }
             }
         }
@@ -317,15 +460,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 bool portalBVisible = IsPortalVisible(playerHead, playerForward, portalPlaneB, rendererB);
                 isCameraBRendering = portalAVisible;
                 isCameraARendering = portalBVisible;
-                if (cameraA != null) cameraA.enabled = isCameraARendering;
-                if (cameraB != null) cameraB.enabled = isCameraBRendering;
+                if (cameraA != null) cameraA.enabled = enableSebRecursiveRendering && recursiveForceManualCamerasDisabled ? false : isCameraARendering;
+                if (cameraB != null) cameraB.enabled = enableSebRecursiveRendering && recursiveForceManualCamerasDisabled ? false : isCameraBRendering;
             }
             else
             {
                 isCameraARendering = true;
                 isCameraBRendering = true;
-                if (cameraA != null) cameraA.enabled = true;
-                if (cameraB != null) cameraB.enabled = true;
+                if (cameraA != null) cameraA.enabled = enableSebRecursiveRendering && recursiveForceManualCamerasDisabled ? false : true;
+                if (cameraB != null) cameraB.enabled = enableSebRecursiveRendering && recursiveForceManualCamerasDisabled ? false : true;
             }
         }
 
@@ -350,6 +493,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         if (portalMatA != null) portalMatA.SetFloat("_FOV", syncFOV);
         if (portalMatB != null) portalMatB.SetFloat("_FOV", syncFOV);
+
+        UpdatePortalOverlayZTest(playerHead);
 
         // ============================================================
         // 传送检测
@@ -386,6 +531,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
                 if (stopAfterTeleportSameFrame)
                 {
+                    // 传送发生同帧优先交给过渡系统。递归手动渲染延后一帧，避免抢过渡 Cube/相机的显示状态。
+                    if (enableSebRecursiveRendering && !(recursivePauseDuringTransition && isTeleporting))
+                    {
+                        RenderSebRecursivePortals(playerHead, playerWorldRot, syncFOV);
+                    }
                     return;
                 }
             }
@@ -396,6 +546,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 TPLog("Teleport check blocked until frame " + teleportBlockedUntilFrame);
             }
+        }
+
+        // ============================================================
+        // SebLague 风格递归渲染（手动 Camera.Render，多层从深到浅）
+        // ============================================================
+
+        if (enableSebRecursiveRendering)
+        {
+            RenderSebRecursivePortals(playerHead, playerWorldRot, syncFOV);
         }
 
         // ============================================================
@@ -496,14 +655,18 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         portalViewTransitionCube.transform.rotation = transitionRot;
         portalViewTransitionCube.transform.position = headData.position;
 
-        // PATCH 2: 过渡相机 FOV 同步玩家
-        Camera[] childCameras = portalViewTransitionCube.GetComponentsInChildren<Camera>(true);
-        foreach (var cam in childCameras)
+        // PATCH 2: 过渡相机只同步玩家视角数据，不参与传送门 oblique 裁剪。
+        // nearClipPlane 使用独立安全值，避免 cameraNearClip=0 时过渡画面异常。
+        if (transitionChildCameras == null)
+        {
+            transitionChildCameras = portalViewTransitionCube.GetComponentsInChildren<Camera>(true);
+        }
+        foreach (var cam in transitionChildCameras)
         {
             if (cam != null)
             {
                 cam.fieldOfView = syncFOV;
-                cam.nearClipPlane = cameraNearClip;
+                cam.nearClipPlane = Mathf.Max(transitionCameraSafeNearClip, 0.001f);
             }
         }
 
@@ -513,9 +676,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             isTeleporting = false;
 
             // 查找子集相机并关闭
-            foreach (var cam in childCameras)
+            foreach (var cam in transitionChildCameras)
             {
-                if (cam.gameObject != portalViewTransitionCube)
+                if (cam != null && cam.gameObject != portalViewTransitionCube)
                 {
                     cam.enabled = false;
                 }
@@ -579,12 +742,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             portalViewTransitionCube.SetActive(true);
 
-            // 激活所有子集相机
-            Camera[] childCameras = portalViewTransitionCube.GetComponentsInChildren<Camera>(true);
-            foreach (var cam in childCameras)
+            // 激活所有子集相机（使用缓存，过渡相机不做 portal 裁剪）
+            if (transitionChildCameras == null)
             {
-                if (cam.gameObject != portalViewTransitionCube)
+                transitionChildCameras = portalViewTransitionCube.GetComponentsInChildren<Camera>(true);
+            }
+            foreach (var cam in transitionChildCameras)
+            {
+                if (cam != null && cam.gameObject != portalViewTransitionCube)
                 {
+                    cam.nearClipPlane = Mathf.Max(transitionCameraSafeNearClip, 0.001f);
                     cam.enabled = true;
                 }
             }
@@ -1181,6 +1348,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // ============================================================
 
         BeginTransition(fromPlane, toPlane);
+        if (!isVRPlayer && portalViewTransitionCube != null)
+        {
+            portalViewTransitionCube.transform.position = headData.position;
+            portalViewTransitionCube.transform.rotation = headData.rotation;
+        }
 
         // ============================================================
         // 执行传送
@@ -1272,6 +1444,404 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             cameraB.transform.rotation = portalParentB.rotation * localRotToA;
         }
     }
+
+    // ============================================================
+    // 近距离门面置顶：头部进入门框且贴近时，临时 ZTest Always。
+    // ============================================================
+
+    void UpdatePortalOverlayZTest(Vector3 playerHead)
+    {
+        if (!enablePortalOverlayWhenHeadNear)
+        {
+            SetPortalZTest(portalMatA, 4f);
+            SetPortalZTest(portalMatB, 4f);
+            return;
+        }
+
+        bool nearA = IsHeadInPortalOverlayZone(portalPlaneA, playerHead);
+        bool nearB = IsHeadInPortalOverlayZone(portalPlaneB, playerHead);
+
+        SetPortalZTest(portalMatA, nearA ? 8f : 4f);
+        SetPortalZTest(portalMatB, nearB ? 8f : 4f);
+    }
+
+    bool IsHeadInPortalOverlayZone(Transform portalPlane, Vector3 playerHead)
+    {
+        if (portalPlane == null) return false;
+        Vector3 localHead = portalPlane.InverseTransformPoint(playerHead);
+        if (!LocalPointInPortalRect(localHead)) return false;
+        return Mathf.Abs(localHead.z) < portalOverlayDepth;
+    }
+
+    void SetPortalZTest(Material mat, float zTest)
+    {
+        if (mat == null) return;
+        mat.SetFloat(portalOverlayZTestProperty, zTest);
+    }
+
+    // ============================================================
+    // SebLague 风格递归渲染核心
+    // ============================================================
+
+    void RenderSebRecursivePortals(Vector3 viewerPos, Quaternion viewerRot, float syncFOV)
+    {
+        if (recursivePauseDuringTransition && isTeleporting) return;
+        if (recursiveRenderLimit <= 0) return;
+        if (portalParentA == null || portalParentB == null) return;
+        if (portalPlaneA == null || portalPlaneB == null) return;
+
+        if (recursiveForceManualCamerasDisabled)
+        {
+            if (cameraA != null) cameraA.enabled = false;
+            if (cameraB != null) cameraB.enabled = false;
+        }
+
+        SyncPortalRenderTextureBindings();
+
+        // A 门表面显示 B 侧视角：严格对应 Seb 中 thisPortal=B, linkedPortal=A。
+        recursiveDepthRenderedA = RenderSebRecursiveOneSide(
+            cameraB,
+            portalParentA,
+            portalParentB,
+            portalPlaneA,
+            portalPlaneB,
+            rendererA,
+            rendererB,
+            portalMatA,
+            portalMatB,
+            isCameraBRendering || isTeleporting || !enableVisibilityOptimization,
+            viewerPos,
+            viewerRot,
+            syncFOV,
+            recursivePositionsA,
+            recursiveRotationsA
+        );
+
+        // B 门表面显示 A 侧视角：严格对应 Seb 中 thisPortal=A, linkedPortal=B。
+        recursiveDepthRenderedB = RenderSebRecursiveOneSide(
+            cameraA,
+            portalParentB,
+            portalParentA,
+            portalPlaneB,
+            portalPlaneA,
+            rendererB,
+            rendererA,
+            portalMatB,
+            portalMatA,
+            isCameraARendering || isTeleporting || !enableVisibilityOptimization,
+            viewerPos,
+            viewerRot,
+            syncFOV,
+            recursivePositionsB,
+            recursiveRotationsB
+        );
+
+        if (debugRecursiveRenderLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
+        {
+            TPLog("RecursiveRender ADepth=" + recursiveDepthRenderedA + " BDepth=" + recursiveDepthRenderedB + " limit=" + recursiveRenderLimit);
+        }
+    }
+
+    int RenderSebRecursiveOneSide(
+        Camera portalCam,
+        Transform linkedParent,
+        Transform thisParent,
+        Transform linkedPlane,
+        Transform thisPlane,
+        Renderer linkedScreen,
+        Renderer thisScreen,
+        Material linkedMat,
+        Material thisMat,
+        bool linkedVisibleFromPlayer,
+        Vector3 viewerPos,
+        Quaternion viewerRot,
+        float syncFOV,
+        Vector3[] positions,
+        Quaternion[] rotations
+    )
+    {
+        // Seb: if player is not looking at linked portal screen, skip rendering this view.
+        if (!linkedVisibleFromPlayer) return 0;
+        if (portalCam == null) return 0;
+        if (linkedParent == null || thisParent == null) return 0;
+        if (linkedPlane == null || thisPlane == null) return 0;
+        if (positions == null || rotations == null) return 0;
+
+        int limit = recursiveRenderLimit;
+        if (limit < 0) limit = 0;
+        if (limit > 8) limit = 8;
+        if (limit > positions.Length) limit = positions.Length;
+        if (limit > rotations.Length) limit = rotations.Length;
+        if (limit == 0) return 0;
+
+        portalCam.fieldOfView = syncFOV;
+        portalCam.nearClipPlane = cameraNearClip;
+        portalCam.ResetProjectionMatrix();
+        if (recursiveForceManualCamerasDisabled) portalCam.enabled = false;
+
+        // Seb 原逻辑：从 player camera 的 localToWorldMatrix 开始，重复乘 this * linked^-1。
+        // 注意这里 linkedParent 是玩家正在看的门，thisParent 是门后出口。
+        Matrix4x4 localToWorldMatrix = Matrix4x4.TRS(viewerPos, viewerRot, Vector3.one);
+        Matrix4x4 linkedWorldToLocal = Matrix4x4.TRS(linkedParent.position, linkedParent.rotation, Vector3.one).inverse;
+        Matrix4x4 thisLocalToWorld = Matrix4x4.TRS(thisParent.position, thisParent.rotation, Vector3.one);
+        Matrix4x4 halfTurnMatrix = Matrix4x4.Rotate(Quaternion.AngleAxis(180f, Vector3.up));
+        bool renderHalfTurn = useClassicHalfTurn || recursiveRenderUseClassicHalfTurn;
+
+        int startIndex = limit;
+        int count = 0;
+
+        for (int i = 0; i < limit; i++)
+        {
+            if (i > 0 && recursiveEarlyStop)
+            {
+                // Seb 用 BoundsOverlap 判断 linked portal 在当前递归相机里是否还可见。
+                // 这里用 WorldToViewportPoint 对门面四角做近似 bounds overlap，语义保持一致。
+                if (!PortalBoundsOverlapCameraView(portalCam, linkedPlane))
+                {
+                    break;
+                }
+            }
+
+            if (renderHalfTurn)
+            {
+                localToWorldMatrix = thisLocalToWorld * halfTurnMatrix * linkedWorldToLocal * localToWorldMatrix;
+            }
+            else
+            {
+                localToWorldMatrix = thisLocalToWorld * linkedWorldToLocal * localToWorldMatrix;
+            }
+
+            int renderOrderIndex = limit - i - 1;
+            positions[renderOrderIndex] = localToWorldMatrix.GetColumn(3);
+            rotations[renderOrderIndex] = localToWorldMatrix.rotation;
+
+            portalCam.transform.SetPositionAndRotation(positions[renderOrderIndex], rotations[renderOrderIndex]);
+            startIndex = renderOrderIndex;
+            count++;
+        }
+
+        if (count <= 0 || startIndex >= limit) return 0;
+
+        bool oldThisScreenEnabled = true;
+        bool oldLinkedScreenEnabled = true;
+        if (thisScreen != null) oldThisScreenEnabled = thisScreen.enabled;
+        if (linkedScreen != null) oldLinkedScreenEnabled = linkedScreen.enabled;
+
+        // Seb 原版在本函数结束前会恢复显示。这里不读 GetFloat，避免 Udon API 差异；默认恢复为 1。
+        float oldThisMask = 1f;
+        float oldLinkedMask = 1f;
+
+        CameraClearFlags oldClearFlags = portalCam.clearFlags;
+        if (recursiveForceClearSkybox)
+        {
+            // 很多“残影/拖影”其实是 RT 没有每次完整清屏，尤其 Camera 是 DepthOnly/Don'tClear 时。
+            portalCam.clearFlags = CameraClearFlags.Skybox;
+        }
+
+        // Seb: Hide screen so that camera can see through portal screen.
+        // 原工程透明 shader 用 displayMask 更稳；如果材质不支持，则可回退 Renderer.enabled=false。
+        if (recursiveHideExitScreen)
+        {
+            if (recursiveHideExitUseDisplayMask && thisMat != null)
+            {
+                SetPortalDisplayMask(thisMat, 0f);
+            }
+            else if (thisScreen != null)
+            {
+                thisScreen.enabled = false;
+            }
+        }
+
+        // Seb: linkedPortal.screen.material.SetInt("displayMask", 0)，作为最深层递归终点。
+        bool linkedTerminalHiddenByRenderer = false;
+        if (recursiveUseSkyboxTerminal)
+        {
+            if (recursiveTerminalUseDisplayMask && linkedMat != null)
+            {
+                SetPortalDisplayMask(linkedMat, 0f);
+            }
+            else if (linkedScreen != null)
+            {
+                linkedScreen.enabled = false;
+                linkedTerminalHiddenByRenderer = true;
+            }
+            portalCam.clearFlags = CameraClearFlags.Skybox;
+        }
+
+        for (int i = startIndex; i < limit; i++)
+        {
+            portalCam.transform.SetPositionAndRotation(positions[i], rotations[i]);
+            SyncRecursiveNearClipToPortalPlane(portalCam, thisPlane, i, startIndex);
+            ApplyObliqueClippingSebStyle(portalCam, thisPlane);
+            portalCam.Render();
+
+            // Seb: after rendering the deepest layer, re-enable linked portal screen.
+            if (i == startIndex && recursiveUseSkyboxTerminal)
+            {
+                if (recursiveTerminalUseDisplayMask && linkedMat != null)
+                {
+                    SetPortalDisplayMask(linkedMat, 1f);
+                }
+                else if (linkedTerminalHiddenByRenderer && linkedScreen != null)
+                {
+                    linkedScreen.enabled = oldLinkedScreenEnabled;
+                    linkedTerminalHiddenByRenderer = false;
+                }
+                portalCam.clearFlags = oldClearFlags;
+            }
+        }
+
+        // Restore states before player camera renders.
+        if (thisMat != null) SetPortalDisplayMask(thisMat, oldThisMask);
+        if (linkedMat != null) SetPortalDisplayMask(linkedMat, oldLinkedMask);
+        if (thisScreen != null) thisScreen.enabled = oldThisScreenEnabled;
+        if (linkedScreen != null) linkedScreen.enabled = oldLinkedScreenEnabled;
+        portalCam.clearFlags = oldClearFlags;
+        portalCam.nearClipPlane = cameraNearClip;
+        portalCam.ResetProjectionMatrix();
+
+        return count;
+    }
+
+    void SyncRecursiveNearClipToPortalPlane(Camera cam, Transform clipPlane, int renderIndex, int startIndex)
+    {
+        if (cam == null) return;
+
+        if (!recursiveSyncNearClipToPortalPlane || clipPlane == null)
+        {
+            cam.nearClipPlane = cameraNearClip;
+            cam.ResetProjectionMatrix();
+            return;
+        }
+
+        // 普通 Camera.nearClipPlane 是垂直于 cam.forward 的平面。
+        // 这里先把 near 推到“沿相机 forward 到传送门平面”的距离之后，
+        // 再叠加 oblique clip，把真正裁剪面贴到 portal plane。
+        // 这能修复 VRChat/透明门面/递归 RT 下第一层 near 仍停在 0.01 导致看到门背面或下一层画面的情况。
+        float forwardDst = Vector3.Dot(clipPlane.position - cam.transform.position, cam.transform.forward);
+        float newNear = cameraNearClip;
+
+        if (forwardDst > cameraNearClip)
+        {
+            newNear = forwardDst + Mathf.Abs(recursiveDynamicNearClipPadding);
+            if (newNear < cameraNearClip) newNear = cameraNearClip;
+            if (newNear > recursiveDynamicNearClipMax) newNear = recursiveDynamicNearClipMax;
+        }
+
+        cam.nearClipPlane = newNear;
+        cam.ResetProjectionMatrix();
+
+        if (debugRecursiveClipLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
+        {
+            TPLog("RecursiveNear renderIndex=" + renderIndex + " start=" + startIndex + " forwardDst=" + forwardDst + " near=" + newNear + " cam=" + cam.name + " clip=" + clipPlane.name);
+        }
+    }
+
+    void ApplyObliqueClippingSebStyle(Camera cam, Transform clipPlane)
+    {
+        if (!recursiveUseSebObliqueClip)
+        {
+            ApplyObliqueClipping(cam, clipPlane);
+            return;
+        }
+
+        if (cam == null || clipPlane == null) return;
+
+        // SebLague 原版 SetNearClipPlane 逻辑：
+        // Transform clipPlane = transform;
+        // int dot = Sign(Dot(clipPlane.forward, transform.position - portalCam.position));
+        // camSpaceDst = -Dot(camSpacePos, camSpaceNormal) + nearClipOffset;
+        // 注意：这里 nearClipOffset 始终使用正值，避免旧配置 clipPlaneOffset=-0.1 把裁剪面推到反方向。
+        int dot = System.Math.Sign(Vector3.Dot(clipPlane.forward, clipPlane.position - cam.transform.position));
+        if (dot == 0) dot = 1;
+        if (recursiveFlipObliqueClipNormal) dot *= -1;
+
+        Vector3 camSpacePos = cam.worldToCameraMatrix.MultiplyPoint(clipPlane.position);
+        Vector3 camSpaceNormal = cam.worldToCameraMatrix.MultiplyVector(clipPlane.forward) * dot;
+        float camSpaceDst = -Vector3.Dot(camSpacePos, camSpaceNormal) + Mathf.Abs(recursiveNearClipOffset);
+
+        if (recursiveForceObliqueClip || Mathf.Abs(camSpaceDst) > recursiveNearClipLimit)
+        {
+            Vector4 clipPlaneCameraSpace = new Vector4(
+                camSpaceNormal.x,
+                camSpaceNormal.y,
+                camSpaceNormal.z,
+                camSpaceDst
+            );
+            cam.ResetProjectionMatrix();
+            cam.projectionMatrix = cam.CalculateObliqueMatrix(clipPlaneCameraSpace);
+        }
+        else
+        {
+            cam.ResetProjectionMatrix();
+        }
+    }
+
+    bool PortalBoundsOverlapCameraView(Camera cam, Transform portalPlane)
+    {
+        if (cam == null || portalPlane == null) return false;
+
+        Vector3 toPortal = portalPlane.position - cam.transform.position;
+        float dist = toPortal.magnitude;
+        if (dist > recursiveMaxDistance) return false;
+        if (dist < 0.001f) return true;
+
+        float angle = Vector3.Angle(cam.transform.forward, toPortal);
+        if (angle > recursiveMaxViewAngle) return false;
+
+        float hx = portalTriggerWidth * 0.5f;
+        float hy = portalTriggerHeight * 0.5f;
+
+        Vector3 p0 = portalPlane.TransformPoint(new Vector3(-hx, -hy, 0f));
+        Vector3 p1 = portalPlane.TransformPoint(new Vector3(-hx,  hy, 0f));
+        Vector3 p2 = portalPlane.TransformPoint(new Vector3( hx, -hy, 0f));
+        Vector3 p3 = portalPlane.TransformPoint(new Vector3( hx,  hy, 0f));
+
+        Vector3 v0 = cam.WorldToViewportPoint(p0);
+        Vector3 v1 = cam.WorldToViewportPoint(p1);
+        Vector3 v2 = cam.WorldToViewportPoint(p2);
+        Vector3 v3 = cam.WorldToViewportPoint(p3);
+
+        bool anyInFront = v0.z > 0f || v1.z > 0f || v2.z > 0f || v3.z > 0f;
+        if (!anyInFront) return false;
+
+        float minX = Mathf.Min(Mathf.Min(v0.x, v1.x), Mathf.Min(v2.x, v3.x));
+        float maxX = Mathf.Max(Mathf.Max(v0.x, v1.x), Mathf.Max(v2.x, v3.x));
+        float minY = Mathf.Min(Mathf.Min(v0.y, v1.y), Mathf.Min(v2.y, v3.y));
+        float maxY = Mathf.Max(Mathf.Max(v0.y, v1.y), Mathf.Max(v2.y, v3.y));
+
+        return maxX >= 0f && minX <= 1f && maxY >= 0f && minY <= 1f;
+    }
+
+    void SetPortalDisplayMask(Material mat, float value)
+    {
+        if (mat == null) return;
+        mat.SetFloat(recursiveDisplayMaskProperty, value);
+    }
+
+    void SyncPortalRenderTextureBindings()
+    {
+        // 保持原工程拖好的 targetTexture 关系：cameraB -> A 门；cameraA -> B 门。
+        // 只在 RT 引用变化时 SetTexture，避免每帧重复改材质状态。
+        RenderTexture texA = null;
+        RenderTexture texB = null;
+
+        if (cameraB != null) texA = cameraB.targetTexture;
+        if (cameraA != null) texB = cameraA.targetTexture;
+
+        if (portalMatA != null && texA != null && cachedPortalTextureA != texA)
+        {
+            portalMatA.SetTexture("_MainTex", texA);
+            cachedPortalTextureA = texA;
+        }
+
+        if (portalMatB != null && texB != null && cachedPortalTextureB != texB)
+        {
+            portalMatB.SetTexture("_MainTex", texB);
+            cachedPortalTextureB = texB;
+        }
+    }
+
 
     bool IsPortalVisible(Vector3 playerPos, Vector3 playerForward, Transform portal, Renderer portalRenderer)
     {
