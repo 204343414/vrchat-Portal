@@ -1,4 +1,4 @@
-﻿using UdonSharp;
+using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
 using VRC.Udon;
@@ -73,6 +73,9 @@ public class 传送枪 : UdonSharpBehaviour
     public Color rayColorA = Color.red;
     public Color rayColorB = Color.blue;
     public Color rayColorFail = Color.gray;
+
+    [Tooltip("放置传送门时输出极简日志：按钮A/B、实际移动哪个Transform、是否给B额外旋转180、最终forward/up。")]
+    public bool debugPortalGunLog = true;
 
     private VRCPlayerApi localPlayer;
     private bool isHeld = false;
@@ -194,13 +197,31 @@ public class 传送枪 : UdonSharpBehaviour
                 }
             }
             
+            bool appliedBHalfTurn = false;
             if (!isPortalA)
             {
                 portalRot = portalRot * Quaternion.Euler(0, 180f, 0);
+                appliedBHalfTurn = true;
             }
             
             portal.position = portalPos;
             portal.rotation = portalRot;
+
+            if (debugPortalGunLog)
+            {
+                Debug.Log(
+                    "[传送枪] " + (isPortalA ? "按钮A" : "按钮B") +
+                    " -> " + portal.name +
+                    " half180=" + appliedBHalfTurn +
+                    " hitN=" + hit.normal +
+                    " pos=" + portal.position +
+                    " rot=" + portal.rotation.eulerAngles +
+                    " fwd=" + portal.forward +
+                    " up=" + portal.up +
+                    " col=" + hit.collider.name +
+                    " layer=" + hit.collider.gameObject.layer
+                );
+            }
 
             // 记录打中的碰撞体
             if (isPortalA)
