@@ -380,7 +380,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
         }
 
-        TPLog("Start. isVRPlayer=" + isVRPlayer + " capsuleRadius=" + playerCapsuleRadius + " capsuleHeight=" + playerCapsuleHeight);
+        TPLog("[启动] 是否VR=" + isVRPlayer + " capsuleRadius=" + playerCapsuleRadius + " capsuleHeight=" + playerCapsuleHeight);
     }
 
     // ============================================================
@@ -544,7 +544,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             if (debugTeleportVerbose && Time.frameCount % debugLogIntervalFrames == 0)
             {
-                TPLog("Teleport check blocked until frame " + teleportBlockedUntilFrame);
+                TPLog("[传送检测暂停] 直到帧 " + teleportBlockedUntilFrame);
             }
         }
 
@@ -594,13 +594,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // ============================================================
     // 过渡更新 - PATCHED
     // ============================================================
-
-    void UpdateTransition(VRCPlayerApi.TrackingData headData)
-    {
-        // 兼容旧调用
-        float syncFOV = isVRPlayer ? vrTargetFOV : (currentFOV > 0 ? currentFOV : 60f);
-        UpdateTransition(headData, syncFOV);
-    }
 
     void UpdateTransition(VRCPlayerApi.TrackingData headData, float syncFOV)
     {
@@ -687,7 +680,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             // 关闭 Cube
             portalViewTransitionCube.SetActive(false);
 
-            TPLog("Transition complete. Cameras disabled. Cube hidden.");
+            TPLog("[过渡完成] 相机已关闭，过渡体已隐藏");
         }
     }
 
@@ -757,7 +750,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
         }
 
-        TPLog("Transition begin. from=" + fromPlane.name + " to=" + toPlane.name);
+        TPLog("[过渡开始] 从=" + fromPlane.name + " to=" + toPlane.name);
     }
 
     // ============================================================
@@ -767,20 +760,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     void TPLog(string msg)
     {
         if (!debugTeleportLog) return;
-        Debug.Log("[PortalTP] f=" + Time.frameCount + " " + msg);
-    }
-
-    int SideFromZ(float z)
-    {
-        if (z > portalSideEpsilon) return 1;
-        if (z < -portalSideEpsilon) return -1;
-        return 0;
-    }
-
-    bool IsPointInPortalRectExpanded(Vector3 localPoint, float extra)
-    {
-        return Mathf.Abs(localPoint.x) < portalTriggerWidth * 0.5f + extra &&
-               Mathf.Abs(localPoint.y) < portalTriggerHeight * 0.5f + extra;
+        Debug.Log("[传送门] 帧=" + Time.frameCount + " " + msg);
     }
 
     bool IsBodyInPortalXY(Transform portalPlane, Vector3 playerHead, Vector3 playerFeet)
@@ -816,12 +796,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return IsBodyInPortalXY(portalPlane, playerHead, playerFeet) &&
                bodyMinZ < colliderThreshold &&
                bodyMaxZ > -colliderThreshold;
-    }
-
-    void SetColliderFlag(bool isPortalA, bool disabled)
-    {
-        if (isPortalA) colliderADisabled = disabled;
-        else colliderBDisabled = disabled;
     }
 
     bool IsHeadInsidePortalVisualVolume(Transform portalPlane, Vector3 playerHead)
@@ -1007,7 +981,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (bodyInXY || bodyInColliderZone || thisPortalState != 0 || GetHeadTracking(isPortalA))
             {
                 TPLog(
-                    "SebCheck " + portalName +
+                    "[门检测] 门" + portalName +
                     " state=" + thisPortalState +
                     " otherState=" + otherPortalState +
                     " tracking=" + GetHeadTracking(isPortalA) +
@@ -1037,7 +1011,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (sharedCollider && protectSharedMarkedCollider && !warnedSharedCollider)
             {
                 warnedSharedCollider = true;
-                TPLog("Warning: Portal A and B are using the SAME collider. Shared collider protection enabled.");
+                TPLog("[警告] A门和B门在同一个碰撞体上，已启用共享碰撞体保护");
             }
 
             if (markedCollider != null)
@@ -1057,7 +1031,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                             colliderBDisabled = true;
                         }
 
-                        TPLog("Disable collider by portal " + portalName + " shared=" + sharedCollider + " state=" + thisPortalState + " otherState=" + otherPortalState);
+                        TPLog("[关闭碰撞体] 门" + portalName + " shared=" + sharedCollider + " state=" + thisPortalState + " otherState=" + otherPortalState);
                     }
                 }
                 else
@@ -1087,11 +1061,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                                 colliderBDisabled = false;
                             }
 
-                            TPLog("Enable collider by portal " + portalName + " shared=" + sharedCollider + " state=" + thisPortalState + " otherState=" + otherPortalState);
+                            TPLog("[恢复碰撞体] 门" + portalName + " shared=" + sharedCollider + " state=" + thisPortalState + " otherState=" + otherPortalState);
                         }
                         else if (debugTeleportVerbose && Time.frameCount % debugLogIntervalFrames == 0)
                         {
-                            TPLog("Keep shared collider disabled by portal " + portalName + " because portal " + otherName + " still needs it. otherState=" + otherPortalState + " otherZone=" + otherBodyInColliderZone);
+                            TPLog("[保持关闭共享碰撞体] 门" + portalName + " because portal " + otherName + " still needs it. otherState=" + otherPortalState + " otherZone=" + otherBodyInColliderZone);
                         }
                     }
                 }
@@ -1116,7 +1090,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if (startSide != 0) lastBodySide = startSide;
                 if (debugTeleportVerbose)
                 {
-                    TPLog("Start tracking head at portal " + portalName + " local=" + currentHeadLocal + " side=" + startSide);
+                    TPLog("[开始追踪头部] 门" + portalName + " local=" + currentHeadLocal + " side=" + startSide);
                 }
                 return false;
             }
@@ -1171,7 +1145,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 teleportSeq++;
                 TPLog(
-                    "SebTeleport #" + teleportSeq + " " + portalName + " -> " + otherName +
+                    "[传送 #]" + teleportSeq + " " + portalName + " -> " + otherName +
                     " oldSide=" + oldSide +
                     " newSide=" + newSide +
                     " prevLocal=" + previousHeadLocal +
@@ -1190,7 +1164,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
             else if (crossedPlane && debugTeleportVerbose)
             {
-                TPLog("Plane crossed outside portal rect at " + portalName + " crossingLocal=" + crossingLocal);
+                TPLog("[跨越平面但在门框外] 门" + portalName + " crossingLocal=" + crossingLocal);
             }
         }
         else if (thisPortalState == 2)
@@ -1214,7 +1188,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
                 SetHeadTracking(isPortalA, false, LocalPointForPortal(portalPlane, playerHead));
 
-                TPLog("Portal " + portalName + " exit cooldown cleared. lastSide=" + lastBodySide + " headZ=" + headZ + " feetZ=" + feetZ);
+                TPLog("[门" + portalName + " 离开冷却已清除] 最后侧=" + lastBodySide + " headZ=" + headZ + " feetZ=" + feetZ);
 
                 if (portalGun != null)
                 {
@@ -1244,7 +1218,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                             colliderBDisabled = false;
                         }
 
-                        TPLog("Re-enable collider after exiting portal " + portalName + " shared=" + sharedCollider);
+                        TPLog("[离开门后恢复碰撞体] 门" + portalName + " shared=" + sharedCollider);
                     }
                 }
             }
@@ -1380,7 +1354,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Vector3 localToB_afterTeleport = LocalPointForPortal(portalPlaneB, newHeadPos);
             lastBodySideB = localToB_afterTeleport.z > 0f ? 1 : -1;
             SetHeadTracking(true, false, LocalPointForPortal(portalPlaneA, playerHead));
-            SetHeadTracking(false, true, localToB_afterTeleport);
+            // Bug A 修复：传送后把喂给追踪系统的「上一帧位置」沿门法线推到明确远离门平面的位置（保持符号）。
+            // 原因：VRChat 角色控制器在 TeleportTo 落地时会微调头部位置（贴地/碰撞修正），让 z 在 ±0.005 抖动；
+            // 若喂实际落点（z≈0），抖动会让 side 在 0/±1 间跳 → 假触发回弹（b进b出）。
+            // 推到 ±0.4（>noClipDepth=0.3）后 prevSide 锁死，落地抖动绝不可能翻转它，除非玩家真的再穿回门面。
+            Vector3 armedLocalB = localToB_afterTeleport;
+            armedLocalB.z = lastBodySideB > 0 ? 0.4f : -0.4f;
+            SetHeadTracking(false, true, armedLocalB);
 
             if (portalGun != null)
             {
@@ -1395,7 +1375,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 }
             }
 
-            TPLog("Seb After TeleportToB: teleportPos=" + newTeleportPos + " newHead=" + newHeadPos + " headLocalZToB=" + localToB_afterTeleport.z + " lastBodySideB=" + lastBodySideB + " velocity=" + newVel + " diffY=" + diffY);
+            TPLog("[传送后到B门] 传送点=" + newTeleportPos + " newHead=" + newHeadPos + " headLocalZToB=" + localToB_afterTeleport.z + " lastBodySideB=" + lastBodySideB + " velocity=" + newVel + " diffY=" + diffY);
         }
         else
         {
@@ -1405,7 +1385,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Vector3 localToA_afterTeleport = LocalPointForPortal(portalPlaneA, newHeadPos);
             lastBodySideA = localToA_afterTeleport.z > 0f ? 1 : -1;
             SetHeadTracking(false, false, LocalPointForPortal(portalPlaneB, playerHead));
-            SetHeadTracking(true, true, localToA_afterTeleport);
+            // Bug A 修复（对称见上）：把喂给 A 门追踪的上一帧位置沿法线推到 ±0.4，防止落地抖动假触发。
+            Vector3 armedLocalA = localToA_afterTeleport;
+            armedLocalA.z = lastBodySideA > 0 ? 0.4f : -0.4f;
+            SetHeadTracking(true, true, armedLocalA);
 
             if (portalGun != null)
             {
@@ -1420,7 +1403,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 }
             }
 
-            TPLog("Seb After TeleportToA: teleportPos=" + newTeleportPos + " newHead=" + newHeadPos + " headLocalZToA=" + localToA_afterTeleport.z + " lastBodySideA=" + lastBodySideA + " velocity=" + newVel + " diffY=" + diffY);
+            TPLog("[传送后到A门] 传送点=" + newTeleportPos + " newHead=" + newHeadPos + " headLocalZToA=" + localToA_afterTeleport.z + " lastBodySideA=" + lastBodySideA + " velocity=" + newVel + " diffY=" + diffY);
         }
 
         UpdateCamerasNow(newHeadPos, newPlayerRot);
@@ -1538,7 +1521,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         if (debugRecursiveRenderLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
         {
-            TPLog("RecursiveRender ADepth=" + recursiveDepthRenderedA + " BDepth=" + recursiveDepthRenderedB + " limit=" + recursiveRenderLimit);
+            TPLog("[递归渲染] A深度=" + recursiveDepthRenderedA + " BDepth=" + recursiveDepthRenderedB + " limit=" + recursiveRenderLimit);
         }
     }
 
@@ -1733,7 +1716,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         if (debugRecursiveClipLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
         {
-            TPLog("RecursiveNear renderIndex=" + renderIndex + " start=" + startIndex + " forwardDst=" + forwardDst + " near=" + newNear + " cam=" + cam.name + " clip=" + clipPlane.name);
+            TPLog("[递归近裁剪] 序号=" + renderIndex + " start=" + startIndex + " forwardDst=" + forwardDst + " near=" + newNear + " cam=" + cam.name + " clip=" + clipPlane.name);
         }
     }
 
