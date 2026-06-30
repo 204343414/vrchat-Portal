@@ -39,7 +39,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     [Header("════════════ 碰撞控制 ════════════")]
     public 传送枪 portalGun;
+
+    [Tooltip("玩家进入传送门前后多远开始临时切换图层。实际判定深度 = noClipDepth + colliderDisableBuffer + 速度缓冲；想让切换更早/更晚，优先微调这个值。")]
     public float colliderDisableBuffer = 0.15f;
+
+    [Tooltip("玩家靠近传送门时，被传送枪标记的碰撞体所在物体将从此 Layer 临时切到 playerPassThroughLayer。默认 28。")]
+    public int solidCollisionLayer = 28;
+
+    [Tooltip("玩家靠近传送门时临时切换到的 Layer。请在 Unity Collision Matrix 中配置为不与 Player 碰撞，但仍与物品/刚体碰撞。默认 25。")]
+    public int playerPassThroughLayer = 25;
 
     [Header("════════════ 性能优化 ════════════")]
     public bool enableVisibilityOptimization = true;
@@ -285,6 +293,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private Renderer rendererA;
     private Renderer rendererB;
 
+    // Layer 穿透状态：替代旧版 markedCollider.enabled=false。
+    // 只改被传送枪打中的 Collider 所在 GameObject 的 layer：28 -> 25；离开后恢复原始 layer。
+    private bool layerOverrideAActive = false;
+    private bool layerOverrideBActive = false;
+    private int originalLayerA = -1;
+    private int originalLayerB = -1;
+    private Collider layerOverrideColliderA;
+    private Collider layerOverrideColliderB;
+
     private int lastBodySideA = 0;
     private int lastBodySideB = 0;
 
@@ -327,6 +344,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     void Start()
     {
         localPlayer = Networking.LocalPlayer;
+
+        // 兼容旧场景序列化：Unity 已挂到场景里的 UdonBehaviour 不会因为脚本默认值从 29 改到 25 就自动刷新。
+        // 如果 Inspector 里还保留旧值 29，这里运行时强制迁移到用户实测可用的 25。
+        if (playerPassThroughLayer == 29)
+        {
+            playerPassThroughLayer = 25;
+            TPLog("[启动] 检测到旧穿透层29，已自动改为25。若仍看到29，请检查场景中是否有旧脚本/旧Prefab未更新。");
+        }
 
         if (cameraA != null) cameraA.nearClipPlane = cameraNearClip;
         if (cameraB != null) cameraB.nearClipPlane = cameraNearClip;
@@ -930,6 +955,133 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return localVel;
     }
 
+
+    void SetLayerOverrideState(bool isPortalA, bool active, int originalLayer, Collider col)
+    {
+        if (isPortalA)
+        {
+            layerOverrideAActive = active;
+            originalLayerA = originalLayer;
+            layerOverrideColliderA = col;
+            colliderADisabled = active;
+        }
+        else
+        {
+            layerOverrideBActive = active;
+            originalLayerB = originalLayer;
+            layerOverrideColliderB = col;
+            colliderBDisabled = active;
+        }
+    }
+
+    bool GetLayerOverrideActive(bool isPortalA)
+    {
+        return isPortalA ? layerOverrideAActive : layerOverrideBActive;
+    }
+
+    int GetOriginalLayer(bool isPortalA)
+    {
+        return isPortalA ? originalLayerA : originalLayerB;
+    }
+
+    Collider GetLayerOverrideCollider(bool isPortalA)
+    {
+        return isPortalA ? layerOverrideColliderA : layerOverrideColliderB;
+    }
+
+    void ApplyPassThroughLayer(Collider markedCollider, bool isPortalA, bool sharedCollider, string portalName, string reason)
+    {
+        if (markedCollider == null) return;
+        GameObject obj = markedCollider.gameObject;
+        if (obj == null) return;
+
+        bool alreadyActive = GetLayerOverrideActive(isPortalA);
+        Collider oldCollider = GetLayerOverrideCollider(isPortalA);
+        int rememberedLayer = GetOriginalLayer(isPortalA);
+
+        if (!alreadyActive || oldCollider != markedCollider)
+        {
+            // 如果传送门重新打到了新物体，先尽量把旧物体恢复，避免旧物体永久停在 29。
+            if (alreadyActive && oldCollider != null && oldCollider != markedCollider)
+            {
+                GameObject oldObj = oldCollider.gameObject;
+                if (oldObj != null && rememberedLayer >= 0 && oldObj.layer == playerPassThroughLayer)
+                {
+                    oldObj.layer = rememberedLayer;
+                }
+            }
+
+            int original = obj.layer;
+            // 共享 Collider 时，后进入的一侧可能看到的已经是 29；这时沿用另一侧记录的原始 layer。
+            if (original == playerPassThroughLayer)
+            {
+                if (isPortalA && layerOverrideBActive && layerOverrideColliderB == markedCollider && originalLayerB >= 0)
+                {
+                    original = originalLayerB;
+                }
+                else if (!isPortalA && layerOverrideAActive && layerOverrideColliderA == markedCollider && originalLayerA >= 0)
+                {
+                    original = originalLayerA;
+                }
+            }
+            SetLayerOverrideState(isPortalA, true, original, markedCollider);
+        }
+        else
+        {
+            if (isPortalA) colliderADisabled = true;
+            else colliderBDisabled = true;
+        }
+
+        if (sharedCollider)
+        {
+            colliderADisabled = true;
+            colliderBDisabled = true;
+        }
+
+        if (obj.layer == solidCollisionLayer)
+        {
+            obj.layer = playerPassThroughLayer;
+            TPLog("[切换图层] 门" + portalName + " " + solidCollisionLayer + "->" + playerPassThroughLayer + " shared=" + sharedCollider + " reason=" + reason);
+        }
+        else if (obj.layer == playerPassThroughLayer)
+        {
+            // 已经被另一侧或上一帧切换过，无需重复日志。
+        }
+        else if (debugTeleportVerbose && Time.frameCount % debugLogIntervalFrames == 0)
+        {
+            TPLog("[跳过切换图层] 门" + portalName + " 物体当前layer=" + obj.layer + "，不是 solidCollisionLayer=" + solidCollisionLayer);
+        }
+    }
+
+    void RestorePassThroughLayer(Collider markedCollider, bool isPortalA, bool sharedCollider, string portalName, string reason)
+    {
+        bool active = GetLayerOverrideActive(isPortalA);
+        Collider storedCollider = GetLayerOverrideCollider(isPortalA);
+        if (!active) return;
+        // 优先恢复当初被本门切换的 Collider。传送门可能已经重新打到新物体，不能误恢复新物体、漏掉旧物体。
+        if (storedCollider != null) markedCollider = storedCollider;
+        if (markedCollider == null) return;
+
+        GameObject obj = markedCollider.gameObject;
+        if (obj == null) return;
+
+        int restoreLayer = GetOriginalLayer(isPortalA);
+        if (restoreLayer < 0) restoreLayer = solidCollisionLayer;
+
+        if (obj.layer == playerPassThroughLayer)
+        {
+            obj.layer = restoreLayer;
+            TPLog("[恢复图层] 门" + portalName + " " + playerPassThroughLayer + "->" + restoreLayer + " shared=" + sharedCollider + " reason=" + reason);
+        }
+
+        SetLayerOverrideState(isPortalA, false, -1, null);
+        if (sharedCollider)
+        {
+            SetLayerOverrideState(true, false, -1, null);
+            SetLayerOverrideState(false, false, -1, null);
+        }
+    }
+
     // ============================================================
     // 传送核心
     // ============================================================
@@ -998,7 +1150,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
 
         // ============================================================
-        // 同 Collider 保护
+        // Layer 穿透控制（替代旧版关闭 Collider）
         // ============================================================
 
         if (portalGun != null)
@@ -1011,61 +1163,36 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (sharedCollider && protectSharedMarkedCollider && !warnedSharedCollider)
             {
                 warnedSharedCollider = true;
-                TPLog("[警告] A门和B门在同一个碰撞体上，已启用共享碰撞体保护");
+                TPLog("[警告] A门和B门在同一个碰撞体上，已启用共享图层保护");
             }
 
             if (markedCollider != null)
             {
                 if (bodyInColliderZone)
                 {
-                    if (markedCollider.enabled)
-                    {
-                        markedCollider.enabled = false;
-
-                        if (isPortalA) colliderADisabled = true;
-                        else colliderBDisabled = true;
-
-                        if (sharedCollider)
-                        {
-                            colliderADisabled = true;
-                            colliderBDisabled = true;
-                        }
-
-                        TPLog("[关闭碰撞体] 门" + portalName + " shared=" + sharedCollider + " state=" + thisPortalState + " otherState=" + otherPortalState);
-                    }
+                    ApplyPassThroughLayer(markedCollider, isPortalA, sharedCollider, portalName, "near");
                 }
                 else
                 {
-                    if (!markedCollider.enabled && thisPortalState == 0)
+                    if (GetLayerOverrideActive(isPortalA) && thisPortalState == 0)
                     {
-                        bool canEnable = true;
+                        bool canRestore = true;
 
                         if (protectSharedMarkedCollider && sharedCollider)
                         {
                             if (otherPortalState != 0 || otherBodyInColliderZone)
                             {
-                                canEnable = false;
+                                canRestore = false;
                             }
                         }
 
-                        if (canEnable)
+                        if (canRestore)
                         {
-                            markedCollider.enabled = true;
-
-                            if (isPortalA) colliderADisabled = false;
-                            else colliderBDisabled = false;
-
-                            if (sharedCollider)
-                            {
-                                colliderADisabled = false;
-                                colliderBDisabled = false;
-                            }
-
-                            TPLog("[恢复碰撞体] 门" + portalName + " shared=" + sharedCollider + " state=" + thisPortalState + " otherState=" + otherPortalState);
+                            RestorePassThroughLayer(markedCollider, isPortalA, sharedCollider, portalName, "far");
                         }
                         else if (debugTeleportVerbose && Time.frameCount % debugLogIntervalFrames == 0)
                         {
-                            TPLog("[保持关闭共享碰撞体] 门" + portalName + " because portal " + otherName + " still needs it. otherState=" + otherPortalState + " otherZone=" + otherBodyInColliderZone);
+                            TPLog("[保持穿透图层] 门" + portalName + " because portal " + otherName + " still needs it. otherState=" + otherPortalState + " otherZone=" + otherBodyInColliderZone);
                         }
                     }
                 }
@@ -1196,29 +1323,18 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     Collider otherMarkedCollider = isPortalA ? portalGun.GetMarkedColliderB() : portalGun.GetMarkedColliderA();
                     bool sharedCollider = markedCollider != null && otherMarkedCollider != null && markedCollider == otherMarkedCollider;
 
-                    bool canEnable = true;
+                    bool canRestore = true;
                     if (protectSharedMarkedCollider && sharedCollider)
                     {
                         if (otherPortalState != 0 || otherBodyInColliderZone)
                         {
-                            canEnable = false;
+                            canRestore = false;
                         }
                     }
 
-                    if (markedCollider != null && !markedCollider.enabled && canEnable)
+                    if (canRestore)
                     {
-                        markedCollider.enabled = true;
-
-                        if (isPortalA) colliderADisabled = false;
-                        else colliderBDisabled = false;
-
-                        if (sharedCollider)
-                        {
-                            colliderADisabled = false;
-                            colliderBDisabled = false;
-                        }
-
-                        TPLog("[离开门后恢复碰撞体] 门" + portalName + " shared=" + sharedCollider);
+                        RestorePassThroughLayer(markedCollider, isPortalA, sharedCollider, portalName, "leave");
                     }
                 }
             }
@@ -1365,14 +1481,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (portalGun != null)
             {
                 Collider markedB = portalGun.GetMarkedColliderB();
-                if (markedB != null && markedB.enabled)
-                {
-                    markedB.enabled = false;
-                    colliderBDisabled = true;
-
-                    Collider markedA = portalGun.GetMarkedColliderA();
-                    if (markedA != null && markedA == markedB) colliderADisabled = true;
-                }
+                Collider markedA = portalGun.GetMarkedColliderA();
+                bool sharedCollider = markedA != null && markedB != null && markedA == markedB;
+                ApplyPassThroughLayer(markedB, false, sharedCollider, "B", "afterTeleport");
             }
 
             TPLog("[传送后到B门] 传送点=" + newTeleportPos + " newHead=" + newHeadPos + " headLocalZToB=" + localToB_afterTeleport.z + " lastBodySideB=" + lastBodySideB + " velocity=" + newVel + " diffY=" + diffY);
@@ -1393,14 +1504,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (portalGun != null)
             {
                 Collider markedA = portalGun.GetMarkedColliderA();
-                if (markedA != null && markedA.enabled)
-                {
-                    markedA.enabled = false;
-                    colliderADisabled = true;
-
-                    Collider markedB = portalGun.GetMarkedColliderB();
-                    if (markedB != null && markedB == markedA) colliderBDisabled = true;
-                }
+                Collider markedB = portalGun.GetMarkedColliderB();
+                bool sharedCollider = markedA != null && markedB != null && markedA == markedB;
+                ApplyPassThroughLayer(markedA, true, sharedCollider, "A", "afterTeleport");
             }
 
             TPLog("[传送后到A门] 传送点=" + newTeleportPos + " newHead=" + newHeadPos + " headLocalZToA=" + localToA_afterTeleport.z + " lastBodySideA=" + lastBodySideA + " velocity=" + newVel + " diffY=" + diffY);
