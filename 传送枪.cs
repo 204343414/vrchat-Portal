@@ -74,8 +74,14 @@ public class 传送枪 : UdonSharpBehaviour
     public Color rayColorB = Color.blue;
     public Color rayColorFail = Color.gray;
 
+    [Tooltip("旧模式：让传送枪给B门本体额外旋转180度。新经典映射模式必须关闭，否则地板/天花板B门会被翻到背面，导致同门进出。")]
+    public bool applyBHalfTurnInGun = false;
+
     [Tooltip("放置传送门时输出极简日志：按钮A/B、实际移动哪个Transform、是否给B额外旋转180、最终forward/up。")]
     public bool debugPortalGunLog = true;
+
+    [Tooltip("世界启动时输出一次本地玩家物理参数：gravity/jump/walk/run/strafe。")]
+    public bool debugPlayerPhysicsOnStart = true;
 
     private VRCPlayerApi localPlayer;
     private bool isHeld = false;
@@ -86,6 +92,16 @@ public class 传送枪 : UdonSharpBehaviour
     void Start()
     {
         localPlayer = Networking.LocalPlayer;
+        if (debugPlayerPhysicsOnStart && localPlayer != null && localPlayer.IsValid())
+        {
+            Debug.Log(
+                "[玩家物理] gravity=" + localPlayer.GetGravityStrength() +
+                " jump=" + localPlayer.GetJumpImpulse() +
+                " walk=" + localPlayer.GetWalkSpeed() +
+                " run=" + localPlayer.GetRunSpeed() +
+                " strafe=" + localPlayer.GetStrafeSpeed()
+            );
+        }
     }
 
     public override void OnPickup()
@@ -198,7 +214,7 @@ public class 传送枪 : UdonSharpBehaviour
             }
             
             bool appliedBHalfTurn = false;
-            if (!isPortalA)
+            if (!isPortalA && applyBHalfTurnInGun)
             {
                 portalRot = portalRot * Quaternion.Euler(0, 180f, 0);
                 appliedBHalfTurn = true;
