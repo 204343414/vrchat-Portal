@@ -165,6 +165,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("shader ZTest 属性名。Overlay 版 shader 已加入 _ZTest。LEqual=4，Always=8。")]
     public string portalOverlayZTestProperty = "_ZTest";
 
+
     [HideInInspector]
     [Tooltip("旧调试开关：默认关闭。递归和过渡本应互不干扰；过渡问题通常来自过渡相机 nearClipPlane。")]
     public bool recursivePauseDuringTransition = false;
@@ -231,15 +232,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // ============================================================
 
     [Header("════════════ Seb传送原理 / 玩家保持站立 ════════════")]
-    [Tooltip("使用 Sebastian Lague 风格：追踪上一帧/当前帧是否跨过传送门平面")]
-    [HideInInspector]
-    public bool useSebastianCrossing = true;
-
     [Tooltip("玩家头部进入传送门前后多深范围内才开始追踪，建议 0.6~1.2")]
     public float travellerTrackDepth = 0.8f;
 
     [Tooltip("跨越平面判断死区，防止 z 接近 0 抖动")]
     public float crossingEpsilon = 0.005f;
+
+    [Header("════════════ 传送触发平面 ════════")]
+    [Tooltip("传送触发平面离门中心的距离。默认等于 noClipDepth（门厚度外边缘）。设为 0 则回到旧版 z=0 中心触发。Gizmos 中用黄色线框显示触发平面位置。")]
+    public float teleportTriggerOffset = 0.3f;
 
     [Tooltip("传送 traveller 使用根骨/玩家位置而不是头部。推荐开启：歪头不会触发传送，TeleportTo 也不再从头部反推 root；关闭则回到旧头部模式。")]
     public bool useRootAsTraveller = true;
@@ -252,10 +253,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     [Tooltip("出口侧保险的最小离门距离，建议 0.01~0.03。不是速度推力，只在落到错误侧或太贴门时修正。")]
     public float exitSideMinDistance = 0.02f;
-
-    [Tooltip("旧字段兼容：关闭 useRootAsTraveller 时才相当于使用头部 traveller。")]
-    [HideInInspector]
-    public bool useHeadAsTraveller = true;
 
     [Tooltip("头部 traveller 旧模式使用：用 Head 算出新 Head，再用 AvatarRoot/Origin 偏移算 TeleportTo 位置。根骨 traveller 模式会直接 TeleportTo 新 root。")]
     [HideInInspector]
@@ -327,11 +324,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private bool warnedSharedCollider = false;
 
     // Sebastian Lague 风格 traveller tracking
-    private bool trackingHeadA = false;
-    private bool trackingHeadB = false;
-    // previousHeadLocal* 名字沿用旧代码，实际保存的是“触发用 traveller local”。
-    private Vector3 previousHeadLocalA = Vector3.zero;
-    private Vector3 previousHeadLocalB = Vector3.zero;
+    private bool travellerTrackingA = false;
+    private bool travellerTrackingB = false;
+    // traveller tracking：保存触发用 traveller local 和对应的 teleport local。
+    private Vector3 previousTravellerLocalA = Vector3.zero;
+    private Vector3 previousTravellerLocalB = Vector3.zero;
     // 保存真实 TeleportTo 点的 local（root模式=root，head模式=head），用于按 crossingT 插值传送位置。
     private Vector3 previousTeleportLocalA = Vector3.zero;
     private Vector3 previousTeleportLocalB = Vector3.zero;
@@ -384,6 +381,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             useClassicHalfTurn = true;
             TPLog("[启动] 已启用经典Portal半转映射。请确认传送枪 applyBHalfTurnInGun=false。");
+        }
+
+        // 传送触发偏移：旧场景序列化值为 0 时，自动同步到 noClipDepth。
+        if (teleportTriggerOffset <= 0f)
+        {
+            teleportTriggerOffset = noClipDepth;
         }
 
         if (cameraA != null) cameraA.nearClipPlane = cameraNearClip;
@@ -523,6 +526,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             frameCounter = 0;
             bool forcePortalCameraRendering = isTeleporting;
+            // 头在传送门体积内时强制渲染：IsPortalVisible 可能因角度/距离返回 false，
+            // 导致贴门时相机被优化掉、画面消失。
+            if (IsHeadInsidePortalVolume(portalPlaneA, playerHead) || IsHeadInsidePortalVolume(portalPlaneB, playerHead))
+            {
+                forcePortalCameraRendering = true;
+            }
             if (enableVisibilityOptimization && !forcePortalCameraRendering)
             {
                 bool portalAVisible = IsPortalVisible(playerHead, playerForward, portalPlaneA, rendererA);
@@ -886,6 +895,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return inRect && inDepth;
     }
 
+    /// 头部是否在传送门体积内（XY 在门框内，深度在 noClipDepth 范围内）。
+    /// 用于判断是否需要跳过 oblique 裁剪和强制渲染。
+    bool IsHeadInsidePortalVolume(Transform portalPlane, Vector3 playerHead)
+    {
+        if (portalPlane == null) return false;
+        Vector3 localHead = LocalPointForPortal(portalPlane, playerHead);
+        return LocalPointInPortalRect(localHead) && Mathf.Abs(localHead.z) < noClipDepth;
+    }
+
     Vector3 LocalPointForPortal(Transform portal, Vector3 worldPoint)
     {
         if (useScaleFreePortalMatrix)
@@ -928,10 +946,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     int SideFromLocalZ(float z)
     {
-        // SebLague 原版是 Sign(Dot(offset, portal.forward))，没有 epsilon 死区。
-        // 旧版 crossingEpsilon 会人为延迟触发到穿过平面后几毫米；在无限循环里这类“小偏移”会累积成能量误差。
-        // exact 0 时固定归为 +1，避免 0 侧破坏“只在 +1/-1 间切换”的 Seb 前提。
-        return z < 0f ? -1 : 1;
+        // 使用 teleportTriggerOffset 作为触发平面：
+        // z > +offset → +1（门外，正侧）
+        // z < -offset → -1（门外，负侧）
+        // |z| <= offset → 0（门体积内）
+        // offset = 0 时退化为旧版：z < 0 → -1，z >= 0 → +1。
+        if (teleportTriggerOffset <= 0f) return z < 0f ? -1 : 1;
+        if (z > teleportTriggerOffset) return 1;
+        if (z < -teleportTriggerOffset) return -1;
+        return 0;
     }
 
     bool LocalPointInPortalRect(Vector3 localPoint)
@@ -951,28 +974,28 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return nx * nx + ny * ny <= 1f;
     }
 
-    void SetHeadTracking(bool isPortalA, bool tracking, Vector3 previousLocal)
+    void SetTravellerTracking(bool isPortalA, bool tracking, Vector3 previousLocal)
     {
         if (isPortalA)
         {
-            trackingHeadA = tracking;
-            previousHeadLocalA = previousLocal;
+            travellerTrackingA = tracking;
+            previousTravellerLocalA = previousLocal;
         }
         else
         {
-            trackingHeadB = tracking;
-            previousHeadLocalB = previousLocal;
+            travellerTrackingB = tracking;
+            previousTravellerLocalB = previousLocal;
         }
     }
 
-    bool GetHeadTracking(bool isPortalA)
+    bool GetTravellerTracking(bool isPortalA)
     {
-        return isPortalA ? trackingHeadA : trackingHeadB;
+        return isPortalA ? travellerTrackingA : travellerTrackingB;
     }
 
-    Vector3 GetPreviousHeadLocal(bool isPortalA)
+    Vector3 GetPreviousTravellerLocal(bool isPortalA)
     {
-        return isPortalA ? previousHeadLocalA : previousHeadLocalB;
+        return isPortalA ? previousTravellerLocalA : previousTravellerLocalB;
     }
 
     void SetTeleportTrackingLocal(bool isPortalA, Vector3 previousLocal)
@@ -1034,7 +1057,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
 
         // 真实 TeleportTo 点始终是 root。hybrid 只改变“触发点”，不把 root 的真实 local 深度伪装成 head。
-        // 地板/天花板若需要按 head.z 触发，会在 TeleportSebStyle 中把 crossingLocal 当作“目标 head 点”，再减去 headFromRoot 得到 root。
+        // 地板/天花板按 head.z 触发（TravellerLocalForPortal 的 hybrid）。TeleportSebStyle 用 rootXY+headZ 混合点做映射，再按出口门类型决定 root 落点。
         return rootLocal;
     }
 
@@ -1251,13 +1274,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         if (debugTeleportVerbose && Time.frameCount % debugLogIntervalFrames == 0)
         {
-            if (bodyInXY || bodyInColliderZone || thisPortalState != 0 || GetHeadTracking(isPortalA))
+            if (bodyInXY || bodyInColliderZone || thisPortalState != 0 || GetTravellerTracking(isPortalA))
             {
                 TPLog(
                     "[门检测] 门" + portalName +
                     " state=" + thisPortalState +
                     " otherState=" + otherPortalState +
-                    " tracking=" + GetHeadTracking(isPortalA) +
+                    " tracking=" + GetTravellerTracking(isPortalA) +
                     " headInXY=" + headInXY +
                     " feetInXY=" + feetInXY +
                     " colliderZone=" + bodyInColliderZone +
@@ -1333,9 +1356,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Vector3 currentTeleportLocal = TeleportPointLocalForPortal(portalPlane, playerFeet, playerHead);
 
             // 首次初始化：记录上一帧位置，不做传送判断
-            if (!GetHeadTracking(isPortalA))
+            if (!GetTravellerTracking(isPortalA))
             {
-                SetHeadTracking(isPortalA, true, currentTravellerLocal);
+                SetTravellerTracking(isPortalA, true, currentTravellerLocal);
                 SetTeleportTrackingLocal(isPortalA, currentTeleportLocal);
                 int startSide = SideFromLocalZ(currentTravellerLocal.z);
                 if (startSide != 0) lastBodySide = startSide;
@@ -1346,45 +1369,64 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 return false;
             }
 
-            Vector3 previousHeadLocal = GetPreviousHeadLocal(isPortalA);
+            Vector3 previousTravellerLocal = GetPreviousTravellerLocal(isPortalA);
             Vector3 previousTeleportLocal = GetPreviousTeleportLocal(isPortalA);
 
-            int oldSide = SideFromLocalZ(previousHeadLocal.z);
+            int oldSide = SideFromLocalZ(previousTravellerLocal.z);
             int newSide = SideFromLocalZ(currentTravellerLocal.z);
 
             bool crossedPlane = false;
             Vector3 crossingLocal = Vector3.zero;
             float crossingT = 1f; // previous->current 线段上穿过门平面的时间比例；用于重建穿越瞬间速度
 
-            // 1. 经典侧面变号检测
-            if (oldSide != 0 && newSide != 0 && oldSide != newSide)
+            // 1. 经典侧面变号检测：从门外（oldSide ≠ 0）穿越触发平面到门内或另一侧
+            if (oldSide != 0 && oldSide != newSide)
             {
-                float denom = previousHeadLocal.z - currentTravellerLocal.z;
+                float triggerZ = oldSide * teleportTriggerOffset;
+                float denom = previousTravellerLocal.z - currentTravellerLocal.z;
                 if (Mathf.Abs(denom) > 0.0001f)
                 {
-                    float t = previousHeadLocal.z / denom;
+                    float t = (previousTravellerLocal.z - triggerZ) / denom;
                     crossingT = Mathf.Clamp01(t);
-                    crossingLocal = Vector3.Lerp(previousHeadLocal, currentTravellerLocal, crossingT);
+                    crossingLocal = Vector3.Lerp(previousTravellerLocal, currentTravellerLocal, crossingT);
                     crossedPlane = true;
                 }
             }
             else
             {
-                // 2. 扫掠补救：线段与 z=0 平面求交，防止高速隧穿 / epsilon 死区漏检
-                float dz = currentTravellerLocal.z - previousHeadLocal.z;
+                // 2. 扫掠补救：线段与 z=±triggerOffset 平面求交，防止高速隧穿漏检
+                float prevZ = previousTravellerLocal.z;
+                float currZ = currentTravellerLocal.z;
+                float dz = currZ - prevZ;
                 if (Mathf.Abs(dz) > 0.0001f)
                 {
-                    float t = -previousHeadLocal.z / dz;
-                    if (t >= 0f && t <= 1f)
+                    // 检查 z = +triggerOffset（从正侧进入）
+                    float tPlus = (teleportTriggerOffset - prevZ) / dz;
+                    if (tPlus >= 0f && tPlus <= 1f && prevZ > teleportTriggerOffset)
                     {
-                        crossingT = Mathf.Clamp01(t);
-                        crossingLocal = Vector3.Lerp(previousHeadLocal, currentTravellerLocal, crossingT);
-                        // 交点在门框内才算
+                        crossingT = Mathf.Clamp01(tPlus);
+                        crossingLocal = Vector3.Lerp(previousTravellerLocal, currentTravellerLocal, crossingT);
                         if (LocalPointInPortalRect(crossingLocal))
                         {
                             crossedPlane = true;
-                            oldSide = previousHeadLocal.z > 0f ? 1 : -1;
-                            newSide = -oldSide;
+                            oldSide = 1;
+                            newSide = currZ < -teleportTriggerOffset ? -1 : 0;
+                        }
+                    }
+                    // 检查 z = -triggerOffset（从负侧进入）
+                    if (!crossedPlane)
+                    {
+                        float tMinus = (-teleportTriggerOffset - prevZ) / dz;
+                        if (tMinus >= 0f && tMinus <= 1f && prevZ < -teleportTriggerOffset)
+                        {
+                            crossingT = Mathf.Clamp01(tMinus);
+                            crossingLocal = Vector3.Lerp(previousTravellerLocal, currentTravellerLocal, crossingT);
+                            if (LocalPointInPortalRect(crossingLocal))
+                            {
+                                crossedPlane = true;
+                                oldSide = -1;
+                                newSide = currZ > teleportTriggerOffset ? 1 : 0;
+                            }
                         }
                     }
                 }
@@ -1393,7 +1435,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             bool crossedInsidePortalRect = crossedPlane && LocalPointInPortalRect(crossingLocal);
 
             // 更新追踪位置 - 常开，不再用 travellerTrackDepth 关掉
-            SetHeadTracking(isPortalA, true, currentTravellerLocal);
+            SetTravellerTracking(isPortalA, true, currentTravellerLocal);
             SetTeleportTrackingLocal(isPortalA, currentTeleportLocal);
             if (newSide != 0) lastBodySide = newSide;
 
@@ -1404,13 +1446,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 {
                     TPLog(
                         "[T#" + teleportSeq + " " + portalName + ">" + otherName + "]" +
-                        " z=" + previousHeadLocal.z + "->" + currentTravellerLocal.z +
+                        " z=" + previousTravellerLocal.z + "->" + currentTravellerLocal.z +
                         " t=" + crossingT +
                         " xy=(" + crossingLocal.x + "," + crossingLocal.y + ")"
                     );
                 }
 
-                SetHeadTracking(isPortalA, false, currentTravellerLocal);
+                SetTravellerTracking(isPortalA, false, currentTravellerLocal);
 
                 // crossingLocal 是“触发用 traveller”的穿越点；crossingTeleportLocal 是真实 TeleportTo 点(root/head)在同一时刻的位置。
                 // hybrid 模式下二者不同：触发点=rootXY+headZ，传送点=真实root。
@@ -1428,52 +1470,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 TPLog("[跨越平面但在门框外] 门" + portalName + " crossingLocal=" + crossingLocal);
             }
         }
-        else if (thisPortalState == 2)
-        {
-            bool headOut = Mathf.Abs(headZ) > noClipDepth;
-            bool feetOut = Mathf.Abs(feetZ) > noClipDepth;
-
-            if (headOut && feetOut)
-            {
-                thisPortalState = 0;
-
-                if (currentBodySide != 0)
-                {
-                    lastBodySide = currentBodySide;
-                }
-                else
-                {
-                    float centerZ = (headZ + feetZ) * 0.5f;
-                    lastBodySide = centerZ > 0f ? 1 : -1;
-                }
-
-                SetHeadTracking(isPortalA, false, LocalPointForPortal(portalPlane, playerHead));
-
-                if (debugTeleportVerbose) TPLog("[门" + portalName + " 离开冷却已清除] side=" + lastBodySide + " headZ=" + headZ + " feetZ=" + feetZ);
-
-                if (portalGun != null)
-                {
-                    Collider markedCollider = isPortalA ? portalGun.GetMarkedColliderA() : portalGun.GetMarkedColliderB();
-                    Collider otherMarkedCollider = isPortalA ? portalGun.GetMarkedColliderB() : portalGun.GetMarkedColliderA();
-                    bool sharedCollider = markedCollider != null && otherMarkedCollider != null && markedCollider == otherMarkedCollider;
-
-                    bool canRestore = true;
-                    if (protectSharedMarkedCollider && sharedCollider)
-                    {
-                        if (otherPortalState != 0 || otherBodyInColliderZone)
-                        {
-                            canRestore = false;
-                        }
-                    }
-
-                    if (canRestore)
-                    {
-                        RestorePassThroughLayer(markedCollider, isPortalA, sharedCollider, portalName, "leave");
-                    }
-                }
-            }
-        }
-
         return false;
     }
 
@@ -1514,9 +1510,20 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         bool flatHybridTraveller = useRootAsTraveller && useHybridRootXYHeadZTraveller && IsFlatPortal(fromPlane);
 
-        // 普通 root/wall hybrid：映射真实 root crossingTeleportLocal。
-        // flat hybrid：crossingLocal 表示“rootXY + headZ”的触发点，应当作为目标 head 点来映射，随后再减去 headFromRoot 得到 root。
-        Vector3 mappedCrossingLocal = flatHybridTraveller ? crossingLocal : crossingTeleportLocal;
+        // flat hybrid：用 root XY（无漂移）+ head Z（正确穿越深度）构造混合映射点。
+        //   旧版全用 crossingLocal（head 点）→ XY 有 headFromRoot 漂移。
+        //   第一版全用 crossingTeleportLocal（root 点）→ Z 深度错误（root 比 head 早穿越 1.6m）。
+        //   现在：XY 取 root（无漂移），Z 取 head（触发时的穿越深度 ≈ 0）。
+        // 非 flat hybrid（墙面门 / 纯 root）：crossingLocal.z ≈ crossingTeleportLocal.z，直接用 root 即可。
+        Vector3 mappedCrossingLocal;
+        if (flatHybridTraveller)
+        {
+            mappedCrossingLocal = new Vector3(crossingTeleportLocal.x, crossingTeleportLocal.y, crossingLocal.z);
+        }
+        else
+        {
+            mappedCrossingLocal = crossingTeleportLocal;
+        }
         if (useClassicHalfTurn)
         {
             mappedCrossingLocal = halfTurn * mappedCrossingLocal;
@@ -1565,14 +1572,28 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             if (flatHybridTraveller)
             {
-                // 地板/天花板 hybrid：newMappedPointPos 是目标 head 点；TeleportTo 需要 root 点。
-                // 这避免“脚先传”，同时不会把 root 错放到头部高度导致越飞越高。
-                cameraHeadAfterTeleport = newMappedPointPos;
-                newTeleportPos = cameraHeadAfterTeleport - headFromRoot;
+                // mappedCrossingLocal = rootXY + headZ → 混合点。
+                // newMappedPointPos 是混合点的世界坐标：门面内位置来自 root（无漂移），深度来自 head。
+                if (IsFlatPortal(toPlane))
+                {
+                    // 出口也是平面门：沿出口法线把深度从 head 调整到 root。
+                    // headFromRoot 在出口法线方向的分量 = head 和 root 的深度差。
+                    float hfrDepth = Vector3.Dot(headFromRoot, toPlane.forward);
+                    newTeleportPos = newMappedPointPos - toPlane.forward * hfrDepth;
+                    cameraHeadAfterTeleport = newTeleportPos + headFromRoot;
+                }
+                else
+                {
+                    // 出口是墙面门：混合点当作 head 点处理（旧行为），root = head - headFromRoot。
+                    // 墙面门的 forward 是水平的，headFromRoot 在其方向的分量 ≈ 0，
+                    // 所以 root 在出口门面表面，head 在 headFromRoot 偏移处。
+                    cameraHeadAfterTeleport = newMappedPointPos;
+                    newTeleportPos = cameraHeadAfterTeleport - headFromRoot;
+                }
             }
             else
             {
-                // root / 墙面 hybrid：newMappedPointPos 就是真实 root 点。
+                // 非 flat hybrid（墙面门 / 纯 root）：newMappedPointPos 就是 root 点。
                 newTeleportPos = newMappedPointPos;
                 cameraHeadAfterTeleport = newTeleportPos + headFromRoot;
             }
@@ -1609,9 +1630,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             int desiredExitSide = entryOldSide == 0 ? 1 : entryOldSide;
             Vector3 afterLocalForSide = TravellerLocalForPortal(toPlane, newTeleportPos, cameraHeadAfterTeleport);
-            float desiredZ = desiredExitSide * Mathf.Abs(exitSideMinDistance);
+            // 出口目标距离：取 exitSideMinDistance 和 teleportTriggerOffset 的较大值。
+            // 这样传送后玩家落在出口门的外边缘（沉浸式：从一扇门的外缘进，从另一扇门的外缘出）。
+            float exitTargetDist = Mathf.Max(Mathf.Abs(exitSideMinDistance), teleportTriggerOffset);
+            float desiredZ = desiredExitSide * exitTargetDist;
             bool wrongSide = SideFromLocalZ(afterLocalForSide.z) != desiredExitSide;
-            bool tooClose = Mathf.Abs(afterLocalForSide.z) < Mathf.Abs(exitSideMinDistance);
+            bool tooClose = Mathf.Abs(afterLocalForSide.z) < exitTargetDist;
             if (wrongSide || tooClose)
             {
                 exitSideFix = desiredZ - afterLocalForSide.z;
@@ -1659,7 +1683,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (fromAtoB)
         {
             // SebLague 风格：传送后从入口门移除 traveller，并加入出口门；出口门 previous 记录“真实传送后位置”。
-            // 不再设置 portalState=2 冷却，也不再把 previousHeadLocal 人为推到 ±0.4。
+            // 不再设置 portalState=2 冷却，也不再把 previousTravellerLocal 人为推到 ±0.4。
             // 这样不会向无限下坠循环注入额外位移/势能。
             portalStateA = 0;
             portalStateB = 0;
@@ -1667,9 +1691,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Vector3 localToB_afterTeleport = TravellerLocalForPortal(portalPlaneB, newTeleportPos, cameraHeadAfterTeleport);
             Vector3 teleportLocalToB_afterTeleport = TeleportPointLocalForPortal(portalPlaneB, newTeleportPos, cameraHeadAfterTeleport);
             lastBodySideB = SideFromLocalZ(localToB_afterTeleport.z);
-            SetHeadTracking(true, false, TravellerLocalForPortal(portalPlaneA, playerRoot, playerHead));
+            SetTravellerTracking(true, false, TravellerLocalForPortal(portalPlaneA, playerRoot, playerHead));
             SetTeleportTrackingLocal(true, TeleportPointLocalForPortal(portalPlaneA, playerRoot, playerHead));
-            SetHeadTracking(false, true, localToB_afterTeleport);
+            SetTravellerTracking(false, true, localToB_afterTeleport);
             SetTeleportTrackingLocal(false, teleportLocalToB_afterTeleport);
 
             if (portalGun != null)
@@ -1685,16 +1709,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         else
         {
             // SebLague 风格：传送后从入口门移除 traveller，并加入出口门；出口门 previous 记录“真实传送后位置”。
-            // 不再设置 portalState=2 冷却，也不再把 previousHeadLocal 人为推到 ±0.4。
+            // 不再设置 portalState=2 冷却，也不再把 previousTravellerLocal 人为推到 ±0.4。
             portalStateB = 0;
             portalStateA = 0;
 
             Vector3 localToA_afterTeleport = TravellerLocalForPortal(portalPlaneA, newTeleportPos, cameraHeadAfterTeleport);
             Vector3 teleportLocalToA_afterTeleport = TeleportPointLocalForPortal(portalPlaneA, newTeleportPos, cameraHeadAfterTeleport);
             lastBodySideA = SideFromLocalZ(localToA_afterTeleport.z);
-            SetHeadTracking(false, false, TravellerLocalForPortal(portalPlaneB, playerRoot, playerHead));
+            SetTravellerTracking(false, false, TravellerLocalForPortal(portalPlaneB, playerRoot, playerHead));
             SetTeleportTrackingLocal(false, TeleportPointLocalForPortal(portalPlaneB, playerRoot, playerHead));
-            SetHeadTracking(true, true, localToA_afterTeleport);
+            SetTravellerTracking(true, true, localToA_afterTeleport);
             SetTeleportTrackingLocal(true, teleportLocalToA_afterTeleport);
 
             if (portalGun != null)
@@ -1794,7 +1818,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         SyncPortalRenderTextureBindings();
 
+        // 头在传送门体积内时：跳过 oblique 裁剪 + 强制渲染（Seb 风格直接算，不用可调阈值）。
+        bool headInsideVolumeA = IsHeadInsidePortalVolume(portalPlaneA, viewerPos);
+        bool headInsideVolumeB = IsHeadInsidePortalVolume(portalPlaneB, viewerPos);
+
         // A 门表面显示 B 侧视角：严格对应 Seb 中 thisPortal=B, linkedPortal=A。
+        // 头在 A 门体积内 → 镜像相机贴近 B 门 → 跳过 B 门侧 oblique。
         recursiveDepthRenderedA = RenderSebRecursiveOneSide(
             cameraB,
             portalParentA,
@@ -1805,15 +1834,17 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             rendererB,
             portalMatA,
             portalMatB,
-            isCameraBRendering || isTeleporting || !enableVisibilityOptimization,
+            isCameraBRendering || isTeleporting || !enableVisibilityOptimization || headInsideVolumeA,
             viewerPos,
             viewerRot,
             syncFOV,
             recursivePositionsA,
-            recursiveRotationsA
+            recursiveRotationsB,
+            headInsideVolumeA
         );
 
         // B 门表面显示 A 侧视角：严格对应 Seb 中 thisPortal=A, linkedPortal=B。
+        // 头在 B 门体积内 → 镜像相机贴近 A 门 → 跳过 A 门侧 oblique。
         recursiveDepthRenderedB = RenderSebRecursiveOneSide(
             cameraA,
             portalParentB,
@@ -1824,12 +1855,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             rendererA,
             portalMatB,
             portalMatA,
-            isCameraARendering || isTeleporting || !enableVisibilityOptimization,
+            isCameraARendering || isTeleporting || !enableVisibilityOptimization || headInsideVolumeB,
             viewerPos,
             viewerRot,
             syncFOV,
             recursivePositionsB,
-            recursiveRotationsB
+            recursiveRotationsB,
+            headInsideVolumeB
         );
 
         if (debugRecursiveRenderLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
@@ -1853,7 +1885,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Quaternion viewerRot,
         float syncFOV,
         Vector3[] positions,
-        Quaternion[] rotations
+        Quaternion[] rotations,
+        bool skipAllOblique = false
     )
     {
         // Seb: if player is not looking at linked portal screen, skip rendering this view.
@@ -1888,10 +1921,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         for (int i = 0; i < limit; i++)
         {
-            if (i > 0 && recursiveEarlyStop)
+            if (i > 0 && recursiveEarlyStop && !skipAllOblique)
             {
                 // Seb 用 BoundsOverlap 判断 linked portal 在当前递归相机里是否还可见。
                 // 这里用 WorldToViewportPoint 对门面四角做近似 bounds overlap，语义保持一致。
+                // skipAllOblique 时也跳过 early stop：头在门里时相机太近，bounds overlap 可能误判。
                 if (!PortalBoundsOverlapCameraView(portalCam, linkedPlane))
                 {
                     break;
@@ -1968,7 +2002,18 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             portalCam.transform.SetPositionAndRotation(positions[i], rotations[i]);
             SyncRecursiveNearClipToPortalPlane(portalCam, thisPlane, i, startIndex);
-            ApplyObliqueClippingSebStyle(portalCam, thisPlane);
+
+            if (skipAllOblique)
+            {
+                // 头在传送门体积内：跳过 oblique，用正常投影矩阵。
+                // 避免相机贴近裁剪面时法线翻转导致反向裁切 / 画面消失。
+                portalCam.ResetProjectionMatrix();
+            }
+            else
+            {
+                ApplyObliqueClippingSebStyle(portalCam, thisPlane);
+            }
+
             portalCam.Render();
 
             // Seb: after rendering the deepest layer, re-enable linked portal screen.
@@ -2270,6 +2315,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Vector3 colliderZoneSize = new Vector3(portalTriggerWidth, portalTriggerHeight, (noClipDepth + colliderDisableBuffer) * 2f);
         Gizmos.color = colliderDisabled ? new Color(1f, 0f, 0f, 0.15f) : new Color(0f, 1f, 0f, 0.1f);
         Gizmos.DrawWireCube(Vector3.zero, colliderZoneSize);
+
+        // 传送触发平面：黄色线框，在 z = ±teleportTriggerOffset 处。
+        if (teleportTriggerOffset > 0f)
+        {
+            Gizmos.color = new Color(1f, 1f, 0f, 0.6f);
+            float triggerThickness = 0.005f; // 薄片可视化
+            Vector3 triggerSize = new Vector3(portalTriggerWidth, portalTriggerHeight, triggerThickness);
+            Gizmos.DrawWireCube(Vector3.forward * teleportTriggerOffset, triggerSize);
+            Gizmos.DrawWireCube(-Vector3.forward * teleportTriggerOffset, triggerSize);
+        }
 
         Gizmos.matrix = oldMatrix;
 
