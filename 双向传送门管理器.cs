@@ -1182,18 +1182,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             colliderBDisabled = true;
         }
 
-        if (obj.layer == solidCollisionLayer)
+        // 不管原来是什么层（0/28/其他），只要不是已经在 passThrough 层，就强行切过去。
+        // 原始层已经在上面 SetLayerOverrideState 时记录，Restore 时还原。
+        if (obj.layer != playerPassThroughLayer)
         {
+            int fromLayer = obj.layer;
             obj.layer = playerPassThroughLayer;
-            if (debugLayerLog) TPLog("[L " + portalName + "] " + solidCollisionLayer + "->" + playerPassThroughLayer + " shared=" + sharedCollider + " reason=" + reason);
-        }
-        else if (obj.layer == playerPassThroughLayer)
-        {
-            // 已经被另一侧或上一帧切换过，无需重复日志。
-        }
-        else if (debugTeleportVerbose && Time.frameCount % debugLogIntervalFrames == 0)
-        {
-            if (debugLayerLog) TPLog("[L skip " + portalName + "] layer=" + obj.layer + " solid=" + solidCollisionLayer);
+            if (debugLayerLog) TPLog("[L " + portalName + "] " + fromLayer + "->" + playerPassThroughLayer + " shared=" + sharedCollider + " reason=" + reason);
         }
     }
 
