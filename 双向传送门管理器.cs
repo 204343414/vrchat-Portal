@@ -1,3 +1,95 @@
+// ================================================================================
+// 交接文档 —— 写给下一个接手这份代码的人（人类或 LLM）
+// 最后更新：本轮对话结束时（传送枪合法放置检测 + 三形状判定 + 冷却消抖 之后）
+// ================================================================================
+//
+// 【项目结构，一共3个脚本】
+//   双向传送门管理器.cs（本文件）：门的渲染（Seb风格递归渲染+oblique裁剪）、传送判定与坐标映射、
+//                                过渡视角、碰撞穿透（Layer切换）。这是最核心也最庞大的脚本(2700+行)。
+//   传送枪.cs：拾取物，负责把 portalA/portalB 这两个 Transform 挪到玩家瞄准的位置，
+//              包含合法放置检测（贴合校验+遮挡校验）、手持图层切换、冷却/输入消抖。
+//   Editor/传送门中文面板.cs：只在编辑器生效的自定义 Inspector，把上面两个脚本的英文字段名
+//              显示成中文标签，不改变量名本身，不影响 Udon 编译，也不会导致已保存的场景数值丢失。
+//
+// 【几个绝对不能想当然去改的核心约定，改错了会导致传送方向/朝向全错】
+//
+// 1. 经典 Portal 半转 (useClassicHalfTurn，默认 true，必须保持 true)：
+//    传送枪放置B门时，B门本体的 Transform 不再被额外转180度（传送枪那边 applyBHalfTurnInGun 必须是 false）。
+//    所有"A门→B门"的坐标/朝向/速度映射，统一在这个管理器脚本内部用 LocalHalfTurn()（Y轴180度旋转）
+//    去乘一次，映射公式统一形如 to * halfTurn * from^-1。递归渲染、摄像机镜像、传送坐标变换、
+//    过渡视角旋转补偿——全部必须用同一个 halfTurn，绝对不能有的地方转、有的地方不转，
+//    否则地板/天花板门会立刻出现"传送后立刻被传送回去"的鬼畜循环。
+//    如果以后想改这个约定，必须搜索全文件所有 `useClassicHalfTurn` 和 `LocalHalfTurn()` 的调用点，
+//    一次性全部改掉，不能只改一处。
+//
+// 2. 传送门形状系统 (portalShapeA / portalShapeB，int 类型，0=圆形 1=三角形 2=方框)：
+//    - 用 int 常量（PORTAL_SHAPE_CIRCLE/TRIANGLE/BOX/UNSET）而不是 C# enum，是刻意的：
+//      UdonSharp 对自定义 enum 有一些已知的默认值/相等比较的坑，为了稳妥直接用 int。
+//    - 默认值是 PORTAL_SHAPE_UNSET(-1)，代表"没有手动设置"，此时会自动回退到旧字段
+//      useCircularPortalCheck 换算（true→圆形，false→方框）。这是为了兼容旧场景/旧Prefab，
+//      不要把默认值改成 0，否则旧场景升级后行为会静默突变。
+//    - 唯一负责判定的函数是 LocalPointInPortalRect(localPoint, shapeType)，
+//      所有用到"点是否在门范围内"的地方（传送触发判定、碰撞穿透区域、可见性/体积判定、
+//      Gizmos调试线框）全部调用这一个函数、传入 ResolvePortalShape(isPortalA) 解析出来的实际形状。
+//      如果以后要加第4种形状，只需要改这一个函数 + GetPortalShapeOutline2D（Gizmos可视化用），
+//      不需要动其他任何调用点。
+//    - 三角形定义：等腰三角形，尖角朝上，底边在下，用符号面积法判定点在不在三角形内（无三角函数）。
+//    - 传送枪那边的"正面遮挡校验"是个例外：无论门是什么形状，永远用矩形包围盒判定，
+//      这是刻意的简化（矩形能放，圆形/三角形作为矩形的内切/内接子集必然也能放），不是遗漏。
+//
+// 3. Traveller 追踪模式 (useRootAsTraveller=true, useHybridRootXYHeadZTraveller=true，
+//    这是当前测试出来手感最好的组合，不建议改动)：
+//    判断"玩家有没有穿过传送门"这件事，横向XY用玩家根骨(root)位置，纵深Z用头部(head)位置，
+//    这样歪头不会误触发传送，但地板/天花板门需要头部真正穿过深度才会触发，不会因为脚先落地
+//    就卡在天花板。TeleportSebStyle() 里对"地板门"和"墙面门"两种出口分别有不同的 root/head
+//    换算公式（flatHybridTraveller 分支），这部分逻辑很绕，改之前务必在测试世界里对着地板门/
+//    墙面门/斜面门分别实测，不要只测一种朝向就断言"改对了"。
+//
+// 4. 传送触发使用独立的触发平面 (teleportTriggerOffset，默认跟随 noClipDepth)，
+//    不是在门的正中心(z=0)触发，而是在门框外侧 z=±teleportTriggerOffset 处触发。
+//    这是为了让"从A门外侧穿入→在B门外侧穿出"的沉浸感更连贯（穿过整个门厚度才算数），
+//    如果改小/改到0会退化成旧版"沾到门中心线就传送"的行为，手感会变差但不会报错。
+//
+// 5. Layer 穿透方案 (solidCollisionLayer=28 → playerPassThroughLayer=25)：
+//    玩家靠近门时，传送枪打中的碰撞体所在物体会被临时切到 25 层（需要在 Unity 的
+//    Physics Collision Matrix 里把 25 设置成"不与 Player 碰撞，但仍与其他刚体碰撞"）。
+//    这是替代旧版"直接禁用 Collider"的方案，好处是刚体/物品依然能撞到墙。
+//    如果 A、B 两扇门恰好打在同一个 Collider 上，有 protectSharedMarkedCollider 兜底
+//    防止两扇门互相抢着复原 Layer，不要在没搞懂这段共享保护逻辑之前就删掉它。
+//
+// 【传送枪那边这次新加的东西，如果要继续往上迭代，从这几个方法看起】
+//   ValidateAndCorrectPlacement()：四角贴合校验，二分搜索式步长收敛（不是固定步长，也不是
+//     一次性解析解），已经用独立的数值模拟脚本验证过多种"十字穿模墙面"场景的收敛性和方向正确性，
+//     核心细节：贴合目标间隙是 wallOffset 而不是 0；纠偏方向看"哪一侧偏差(badness)更大"而不是
+//     直接对"有符号间隙"做差（后者在"悬空"和"嵌入"两种物理状态下方向会算反，这是本轮踩过的坑，
+//     写在这里防止未来重蹈覆辙）。
+//   CheckFrontObstruction()：正面遮挡校验，矩形 OverlapBox，只排除贴合用的墙面自己和
+//     "当前正在放置的这一扇门"自身(selfPortal参数)，绝不排除另一扇门。
+//   TryShootPortal() 开头的 RaycastAll 逻辑：Portal 原作手感，瞄准射线只会穿过"自己"这一扇门
+//     (portal = isPortalA ? portalA : portalB)自身的碰撞体（含子物体），这样贴着自己的门也能
+//     重新微调位置；但另一扇门必须保留为正常障碍物，射线/遮挡检测都不能把它一起忽略掉——
+//     早期版本曾经把portalA、portalB两个都从过滤名单里排除，导致瞄B门时激光直接穿过B命中
+//     它背后的墙，于是"A被放到了B的位置上"，这是本轮修复的一个真实回归bug，写在这里防止
+//     未来重构时不小心又把两扇门都塞进忽略名单。
+//   CheckMutualExclusion()：独立于上面两项的第三道防线，不依赖任何碰撞体/图层配置，
+//     纯粹用两扇门的包围球半径之和判断候选位置离对方是否太近。这是"A只能放A自己身上、
+//     B只能放B自己身上，A放到B身上或反之永远不合法"这条基本规则的硬性兜底——哪怕以后
+//     场景里的门框忘了挂碰撞体、或者碰撞体设成了Trigger，这道检查依然能生效。
+//     调用点用 enableMutualExclusionCheck 独立开关（不挂在 enablePlacementValidation 下面），
+//     因为这是正确性问题不是可选的美观校验，即使用户关掉贴合/遮挡校验也不该被一起关掉。
+//   Update() 里的 scrollUpLatched/scrollDownLatched：鼠标滚轮是连续轴不是按键，必须做边缘锁存，
+//     否则冷却期间/冷却刚结束瞬间同一次滚动手势会被识别成好几次开火，反复触发失败音效。
+//     VR 扳机那边同理已经有 vrTriggerLeftPressed/vrTriggerRightPressed 锁存，是同一个道理。
+//
+// 【下一步要做的事：刚体传送】
+//   目前的传送只处理了本地玩家(localPlayer.TeleportTo)，不涉及场景里的 Rigidbody 物体穿过传送门。
+//   如果要做物体传送，大概率需要：检测哪些物体的碰撞体处于门的触发区域内(可以复用
+//   IsBodyInColliderZone 类似的思路，但传入的是物体的碰撞体包围盒而不是玩家头/脚位置)，
+//   用同一套 halfTurn 门到门映射公式去变换物体的 position/rotation/velocity，
+//   注意 Udon 网络同步问题——如果物体需要在多人间同步传送，需要考虑 ownership 转移
+//   (Networking.SetOwner)，这块目前完全没做，是全新的功能模块。
+// ================================================================================
+
 using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
@@ -33,8 +125,24 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     public float portalTriggerHeight = 2f;
     public float clipPlaneOffset = 0.01f;
 
+    // 形状类型常量：传给 portalShapeA / portalShapeB。用 int 而不是自定义 enum，
+    // 是为了避开 UdonSharp 对自定义枚举的一些已知限制（默认值/相等比较等）。
+    // 注意：const 字段不会被 Unity 序列化/显示，不能挂 [Header]，所以 Header 要贴在下面第一个真正显示的字段上。
+    public const int PORTAL_SHAPE_CIRCLE = 0;
+    public const int PORTAL_SHAPE_TRIANGLE = 1;
+    public const int PORTAL_SHAPE_BOX = 2;
+    // 未设置的哨兵值：只有旧场景升级时（字段缺失、被 Unity 用编译期默认值补上）才会保持这个值。
+    // 一旦玩家在 Inspector 里手动填过 0/1/2 中任意一个合法值，就再也不会被旧开关覆盖。
+    public const int PORTAL_SHAPE_UNSET = -1;
+
     [Header("════════════ 传送门形状 ════════════")]
-    [Tooltip("开启后用圆形/椭圆判定，关闭则用矩形。圆形门强烈建议开启")]
+    [Tooltip("传送门A的判定形状：0=圆形/椭圆，1=三角形（等腰三角，尖角朝上，底边在下），2=方框（矩形）。\n三种形状都以 portalTriggerWidth/portalTriggerHeight 作为外接包围盒尺寸。\n影响范围：实际传送触发判定、碰撞穿透区域、门面可见性/体积判定，以及下方 Gizmos 调试线框显示，四处逻辑统一使用同一个形状。\n留空(-1)则跟随下方旧版 useCircularPortalCheck 自动换算。")]
+    public int portalShapeA = PORTAL_SHAPE_UNSET;
+
+    [Tooltip("传送门B的判定形状，取值含义同 portalShapeA（0=圆形，1=三角形，2=方框，-1=跟随旧开关）。A、B两门形状可以不同。")]
+    public int portalShapeB = PORTAL_SHAPE_UNSET;
+
+    [Tooltip("旧版全局圆形开关（已废弃）。仅当 portalShapeA/portalShapeB 还是 -1（未设置）时才会被读取，用于把旧场景自动换算成新形状；一旦 portalShapeA/B 被手动设成 0/1/2，此开关不再生效。")]
     public bool useCircularPortalCheck = true;
 
     [Header("════════════ 碰撞控制 ════════════")]
@@ -191,6 +299,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("过渡相机安全 Near Clip。过渡相机不做传送门裁剪，只需要一个合法的小 near；避免 cameraNearClip 被调到 0 时过渡画面异常。")]
     public float transitionCameraSafeNearClip = 0.01f;
 
+    [Header("════════════ 配置快照导出 ════════════")]
+    [Tooltip("开局时（Start）把当前 Inspector 关键配置 + 传送门A/B父物体下所有子物体的 Collider/Renderer/Mesh/Camera/Light/AudioSource/Rigidbody 信息打印到控制台。\n用途：把这份文本复制给别人分析场景结构、排查性能问题，不用截图/不用一个个字段抄。\n只在 Start 执行一次，不影响运行时性能。")]
+    public bool dumpConfigSnapshotOnStart = true;
+
     [Header("════════════ 同Collider专修/调试 ════════════")]
     [Tooltip("总日志开关。关闭后本脚本不输出传送门日志。")]
     public bool debugTeleportLog = true;
@@ -307,6 +419,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private Renderer rendererA;
     private Renderer rendererB;
 
+    // 性能优化：GetVelocity() 在同一帧内结果不变，每帧只在 LateUpdate 开头算一次 speedBuffer，
+    // 供 IsBodyInColliderZone / ProcessPortalTeleport 共用，避免同一帧重复调用 3~4 次。
+    // 数值算法与之前完全一致，只是省掉重复计算，不改变任何判定结果。
+    private float cachedSpeedBufferThisFrame = 0f;
+
     // Layer 穿透状态：替代旧版 markedCollider.enabled=false。
     // 只改被传送枪打中的 Collider 所在 GameObject 的 layer：28 -> 25；离开后恢复原始 layer。
     private bool layerOverrideAActive = false;
@@ -353,7 +470,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     // Seb 递归渲染缓存（固定 8 层，配合 recursiveRenderLimit 滑条）
     private Vector3[] recursivePositionsA;
-    private Quaternion[] recursiveRotationsA;
     private Vector3[] recursivePositionsB;
     private Quaternion[] recursiveRotationsB;
     private RenderTexture cachedPortalTextureA;
@@ -393,7 +509,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (cameraB != null) cameraB.nearClipPlane = cameraNearClip;
 
         recursivePositionsA = new Vector3[8];
-        recursiveRotationsA = new Quaternion[8];
         recursivePositionsB = new Vector3[8];
         recursiveRotationsB = new Quaternion[8];
 
@@ -442,6 +557,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
 
         TPLog("[启动] 是否VR=" + isVRPlayer + " capsuleRadius=" + playerCapsuleRadius + " capsuleHeight=" + playerCapsuleHeight);
+
+        if (dumpConfigSnapshotOnStart)
+        {
+            DumpConfigSnapshot();
+        }
     }
 
     // ============================================================
@@ -453,6 +573,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (localPlayer == null || !localPlayer.IsValid()) return;
         if (portalParentA == null || portalParentB == null) return;
         if (portalPlaneA == null || portalPlaneB == null) return;
+
+        // 性能优化：本帧 speedBuffer 只算一次，供下面碰撞穿透判定复用（算法不变，见字段注释）。
+        cachedSpeedBufferThisFrame = Mathf.Clamp(localPlayer.GetVelocity().magnitude * Time.deltaTime * 2.0f, 0f, 1.5f);
 
         // PATCH: 延迟速度重发，防止 VRChat 接地吃速度
         if (pendingVelocityFrames > 0 && localPlayer != null && localPlayer.IsValid())
@@ -528,7 +651,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             bool forcePortalCameraRendering = isTeleporting;
             // 头在传送门体积内时强制渲染：IsPortalVisible 可能因角度/距离返回 false，
             // 导致贴门时相机被优化掉、画面消失。
-            if (IsHeadInsidePortalVolume(portalPlaneA, playerHead) || IsHeadInsidePortalVolume(portalPlaneB, playerHead))
+            if (IsHeadInsidePortalVolume(portalPlaneA, playerHead, ResolvePortalShape(true)) || IsHeadInsidePortalVolume(portalPlaneB, playerHead, ResolvePortalShape(false)))
             {
                 forcePortalCameraRendering = true;
             }
@@ -639,8 +762,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // Oblique Clipping
         // ============================================================
 
-        bool headInsidePortalA = IsHeadInsidePortalVisualVolume(portalPlaneA, playerHead);
-        bool headInsidePortalB = IsHeadInsidePortalVisualVolume(portalPlaneB, playerHead);
+        bool headInsidePortalA = IsHeadInsidePortalVisualVolume(portalPlaneA, playerHead, ResolvePortalShape(true));
+        bool headInsidePortalB = IsHeadInsidePortalVisualVolume(portalPlaneB, playerHead, ResolvePortalShape(false));
 
         if (cameraA != null && cameraA.enabled)
         {
@@ -851,18 +974,231 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Debug.Log("[传送门] 帧=" + Time.frameCount + " " + msg);
     }
 
-    bool IsBodyInPortalXY(Transform portalPlane, Vector3 playerHead, Vector3 playerFeet)
+    // ============================================================
+    // 配置快照导出：把当前 Inspector 关键配置 + A/B 门下所有子物体信息打印到控制台。
+    // 只在 Start() 里按 dumpConfigSnapshotOnStart 开关跑一次，不影响运行时（LateUpdate）性能。
+    // 不用 TPLog（会被 debugTeleportLog 总开关吃掉），直接 Debug.Log，保证这个开关独立生效。
+    // ============================================================
+
+    string GetPortalShapeName(int shape)
+    {
+        if (shape == PORTAL_SHAPE_CIRCLE) return "圆形(0)";
+        if (shape == PORTAL_SHAPE_TRIANGLE) return "三角形(1)";
+        if (shape == PORTAL_SHAPE_BOX) return "方框(2)";
+        if (shape == PORTAL_SHAPE_UNSET) return "未设置(-1，跟随旧开关)";
+        return "未知值(" + shape + ")";
+    }
+
+    void DumpConfigSnapshot()
+    {
+        Debug.Log("========== [配置快照] 开始（双向传送门管理器：" + gameObject.name + "） ==========");
+        DumpGlobalConfigSnapshot();
+        DumpPortalGunConfigSnapshot();
+        DumpPortalHierarchySnapshot("A", portalParentA, portalPlaneA, cameraA, portalMatA, ResolvePortalShape(true), portalShapeA);
+        DumpPortalHierarchySnapshot("B", portalParentB, portalPlaneB, cameraB, portalMatB, ResolvePortalShape(false), portalShapeB);
+        Debug.Log("========== [配置快照] 结束 ==========");
+    }
+
+    void DumpGlobalConfigSnapshot()
+    {
+        Debug.Log("[配置快照][全局] cameraNearClip=" + cameraNearClip);
+        Debug.Log("[配置快照][门厚度/形状] noClipDepth=" + noClipDepth + " portalTriggerWidth=" + portalTriggerWidth + " portalTriggerHeight=" + portalTriggerHeight + " clipPlaneOffset=" + clipPlaneOffset);
+        Debug.Log("[配置快照][门厚度/形状] portalShapeA原始=" + portalShapeA + " portalShapeB原始=" + portalShapeB + " useCircularPortalCheck(旧开关)=" + useCircularPortalCheck);
+        Debug.Log("[配置快照][碰撞控制] colliderDisableBuffer=" + colliderDisableBuffer + " solidCollisionLayer=" + solidCollisionLayer + " playerPassThroughLayer=" + playerPassThroughLayer);
+        Debug.Log("[配置快照][性能优化] enableVisibilityOptimization=" + enableVisibilityOptimization + " maxRenderDistance=" + maxRenderDistance + " maxViewAngle=" + maxViewAngle + " checkInterval=" + checkInterval);
+        Debug.Log("[配置快照][Seb递归渲染] enableSebRecursiveRendering=" + enableSebRecursiveRendering + " recursiveRenderLimit=" + recursiveRenderLimit + " recursiveEarlyStop=" + recursiveEarlyStop + " recursiveMaxDistance=" + recursiveMaxDistance + " recursiveMaxViewAngle=" + recursiveMaxViewAngle + " recursiveForceClearSkybox=" + recursiveForceClearSkybox);
+        Debug.Log("[配置快照][传送触发] teleportTriggerOffset=" + teleportTriggerOffset + " useRootAsTraveller=" + useRootAsTraveller + " useHybridRootXYHeadZTraveller=" + useHybridRootXYHeadZTraveller + " useClassicHalfTurn=" + useClassicHalfTurn + " enableExitSideCorrection=" + enableExitSideCorrection);
+        Debug.Log("[配置快照][过渡系统] portalViewTransitionCube=" + (portalViewTransitionCube != null ? portalViewTransitionCube.name : "未指定") + " transitionDuration=" + transitionDuration);
+        Debug.Log("[配置快照][调试开关] debugTeleportLog=" + debugTeleportLog + " debugTeleportCoreLog=" + debugTeleportCoreLog + " debugLayerLog=" + debugLayerLog + " debugTransitionLog=" + debugTransitionLog + " debugTeleportVerbose=" + debugTeleportVerbose + " showDebugGizmos=" + showDebugGizmos);
+        Debug.Log("[配置快照][运行环境] isVRPlayer=" + isVRPlayer + " vrTargetFOV=" + vrTargetFOV + " currentFOV=" + currentFOV);
+    }
+
+    void DumpPortalGunConfigSnapshot()
+    {
+        if (portalGun == null)
+        {
+            Debug.Log("[配置快照][传送枪] 未指定 portalGun 引用");
+            return;
+        }
+        Debug.Log(
+            "[配置快照][传送枪] 物体=" + portalGun.gameObject.name +
+            " maxDistance=" + portalGun.maxDistance +
+            " wallOffset=" + portalGun.wallOffset +
+            " cooldownTime=" + portalGun.cooldownTime +
+            " applyBHalfTurnInGun=" + portalGun.applyBHalfTurnInGun +
+            " placementLayers=" + portalGun.placementLayers.value +
+            " blockedLayers=" + portalGun.blockedLayers.value
+        );
+    }
+
+    /// 不用用户自定义递归函数遍历子物体（UdonSharp 明确不支持自定义方法递归：所有调用共享同一份栈变量，深层递归会互相踩坏数据）。
+    /// 改用引擎自带的 Transform.GetComponentsInChildren（引擎内部实现，不受此限制）一次性拿到整棵子树，再逐个用普通循环处理。
+    void DumpPortalHierarchySnapshot(string label, Transform root, Transform plane, Camera cam, Material mat, int resolvedShape, int rawShape)
+    {
+        if (root == null)
+        {
+            Debug.Log("[配置快照][门" + label + "] portalParent" + label + " 未指定，跳过");
+            return;
+        }
+
+        Debug.Log(
+            "[配置快照][门" + label + "] 父物体=" + root.name +
+            " 判定形状=" + GetPortalShapeName(resolvedShape) + "(原始字段值=" + rawShape + ")" +
+            " 世界坐标=" + root.position + " 世界欧拉角=" + root.rotation.eulerAngles
+        );
+
+        if (plane != null)
+        {
+            Debug.Log("[配置快照][门" + label + "] portalPlane" + label + "=" + plane.name + " 世界坐标=" + plane.position);
+        }
+        else
+        {
+            Debug.Log("[配置快照][门" + label + "] portalPlane" + label + " 未指定");
+        }
+
+        if (cam != null)
+        {
+            Debug.Log(
+                "[配置快照][门" + label + "] 摄像机=" + cam.name +
+                " fov=" + cam.fieldOfView + " nearClip=" + cam.nearClipPlane + " farClip=" + cam.farClipPlane +
+                " targetTexture=" + (cam.targetTexture != null ? (cam.targetTexture.width + "x" + cam.targetTexture.height) : "无") +
+                " cullingMask=" + cam.cullingMask
+            );
+        }
+        else
+        {
+            Debug.Log("[配置快照][门" + label + "] 摄像机未指定");
+        }
+
+        if (mat != null)
+        {
+            Debug.Log("[配置快照][门" + label + "] 材质=" + mat.name + " shader=" + (mat.shader != null ? mat.shader.name : "无"));
+        }
+
+        Transform[] allChildren = root.GetComponentsInChildren<Transform>(true);
+
+        int totalTransforms = allChildren.Length;
+        int totalRenderers = 0;
+        int totalColliders = 0;
+        int totalLights = 0;
+        int totalAudioSources = 0;
+        int totalRigidbodies = 0;
+        int totalCameras = 0;
+        long totalVerts = 0;
+        long totalTris = 0;
+
+        Debug.Log("[配置快照][门" + label + "] ---- 子物体清单开始（共 " + totalTransforms + " 个，含自身）----");
+
+        foreach (Transform t in allChildren)
+        {
+            GameObject go = t.gameObject;
+
+            int depth = 0;
+            Transform walker = t;
+            while (walker != null && walker != root && depth < 32)
+            {
+                walker = walker.parent;
+                depth++;
+            }
+            string indent = "";
+            for (int i = 0; i < depth; i++) indent += "  ";
+
+            string line = "[配置快照][门" + label + "]" + indent + " ├ " + t.name +
+                " active=" + go.activeSelf +
+                " layer=" + go.layer +
+                " localPos=" + t.localPosition + " localScale=" + t.localScale;
+
+            Collider col = go.GetComponent<Collider>();
+            if (col != null)
+            {
+                totalColliders++;
+                string colShape = "Collider(未知子类型)";
+                if (go.GetComponent<BoxCollider>() != null) colShape = "BoxCollider";
+                else if (go.GetComponent<SphereCollider>() != null) colShape = "SphereCollider";
+                else if (go.GetComponent<CapsuleCollider>() != null) colShape = "CapsuleCollider";
+                else if (go.GetComponent<MeshCollider>() != null) colShape = "MeshCollider";
+                line += " | " + colShape + "(trigger=" + col.isTrigger + ",enabled=" + col.enabled + ",bounds=" + col.bounds.size + ")";
+            }
+
+            Renderer rend = go.GetComponent<Renderer>();
+            if (rend != null)
+            {
+                totalRenderers++;
+                int matCount = rend.sharedMaterials != null ? rend.sharedMaterials.Length : 0;
+                line += " | Renderer(材质数=" + matCount + ",阴影=" + rend.shadowCastingMode + ",接收阴影=" + rend.receiveShadows + ",bounds=" + rend.bounds.size + ")";
+            }
+
+            MeshFilter mf = go.GetComponent<MeshFilter>();
+            if (mf != null && mf.sharedMesh != null)
+            {
+                int vc = mf.sharedMesh.vertexCount;
+                int tc = mf.sharedMesh.triangles.Length / 3;
+                totalVerts += vc;
+                totalTris += tc;
+                line += " | Mesh(顶点=" + vc + ",三角面=" + tc + ")";
+            }
+
+            SkinnedMeshRenderer smr = go.GetComponent<SkinnedMeshRenderer>();
+            if (smr != null && smr.sharedMesh != null)
+            {
+                int vc = smr.sharedMesh.vertexCount;
+                int tc = smr.sharedMesh.triangles.Length / 3;
+                totalVerts += vc;
+                totalTris += tc;
+                line += " | SkinnedMesh(顶点=" + vc + ",三角面=" + tc + ")";
+            }
+
+            Light light = go.GetComponent<Light>();
+            if (light != null)
+            {
+                totalLights++;
+                line += " | Light(类型=" + light.type + ",强度=" + light.intensity + ",范围=" + light.range + ",阴影=" + light.shadows + ")";
+            }
+
+            AudioSource audio = go.GetComponent<AudioSource>();
+            if (audio != null)
+            {
+                totalAudioSources++;
+                line += " | AudioSource(clip=" + (audio.clip != null ? audio.clip.name : "无") + ",loop=" + audio.loop + ",playOnAwake=" + audio.playOnAwake + ",spatialBlend=" + audio.spatialBlend + ")";
+            }
+
+            Rigidbody rb = go.GetComponent<Rigidbody>();
+            if (rb != null)
+            {
+                totalRigidbodies++;
+                line += " | Rigidbody(mass=" + rb.mass + ",isKinematic=" + rb.isKinematic + ",useGravity=" + rb.useGravity + ")";
+            }
+
+            Camera childCam = go.GetComponent<Camera>();
+            if (childCam != null)
+            {
+                totalCameras++;
+                line += " | Camera(fov=" + childCam.fieldOfView + ",near=" + childCam.nearClipPlane + ",far=" + childCam.farClipPlane + ")";
+            }
+
+            Debug.Log(line);
+        }
+
+        Debug.Log(
+            "[配置快照][门" + label + "] ---- 子物体清单结束：共 " + totalTransforms + " 个物体 | " +
+            "Renderer=" + totalRenderers + " Collider=" + totalColliders + " Light=" + totalLights +
+            " AudioSource=" + totalAudioSources + " Rigidbody=" + totalRigidbodies + " Camera=" + totalCameras +
+            " | 总顶点≈" + totalVerts + " 总三角面≈" + totalTris + " ----"
+        );
+    }
+
+    bool IsBodyInPortalXY(Transform portalPlane, Vector3 playerHead, Vector3 playerFeet, int shapeType)
     {
         Vector3 localHead = portalPlane.InverseTransformPoint(playerHead);
         Vector3 localFeet = portalPlane.InverseTransformPoint(playerFeet);
 
-        bool headInXY = LocalPointInPortalRect(localHead);
-        bool feetInXY = LocalPointInPortalRect(localFeet);
+        bool headInXY = LocalPointInPortalRect(localHead, shapeType);
+        bool feetInXY = LocalPointInPortalRect(localFeet, shapeType);
 
         return headInXY || feetInXY;
     }
 
-    bool IsBodyInColliderZone(Transform portalPlane, Vector3 playerHead, Vector3 playerFeet)
+    bool IsBodyInColliderZone(Transform portalPlane, Vector3 playerHead, Vector3 playerFeet, int shapeType)
     {
         Vector3 localHead = portalPlane.InverseTransformPoint(playerHead);
         Vector3 localFeet = portalPlane.InverseTransformPoint(playerFeet);
@@ -873,35 +1209,30 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         float bodyMinZ = Mathf.Min(headZ, feetZ);
         float bodyMaxZ = Mathf.Max(headZ, feetZ);
 
-        float speedBuffer = 0f;
-        if (localPlayer != null && localPlayer.IsValid())
-        {
-            float v = localPlayer.GetVelocity().magnitude;
-            speedBuffer = Mathf.Clamp(v * Time.deltaTime * 2.0f, 0f, 1.5f);
-        }
-        float colliderThreshold = noClipDepth + colliderDisableBuffer + speedBuffer;
+        // 性能优化：speedBuffer 每帧只在 LateUpdate 里算一次（见 cachedSpeedBufferThisFrame 注释），这里直接复用。
+        float colliderThreshold = noClipDepth + colliderDisableBuffer + cachedSpeedBufferThisFrame;
 
-        return IsBodyInPortalXY(portalPlane, playerHead, playerFeet) &&
+        return IsBodyInPortalXY(portalPlane, playerHead, playerFeet, shapeType) &&
                bodyMinZ < colliderThreshold &&
                bodyMaxZ > -colliderThreshold;
     }
 
-    bool IsHeadInsidePortalVisualVolume(Transform portalPlane, Vector3 playerHead)
+    bool IsHeadInsidePortalVisualVolume(Transform portalPlane, Vector3 playerHead, int shapeType)
     {
         if (portalPlane == null) return false;
         Vector3 localHead = portalPlane.InverseTransformPoint(playerHead);
-        bool inRect = LocalPointInPortalRect(localHead);
+        bool inRect = LocalPointInPortalRect(localHead, shapeType);
         bool inDepth = Mathf.Abs(localHead.z) < travellerTrackDepth;
         return inRect && inDepth;
     }
 
     /// 头部是否在传送门体积内（XY 在门框内，深度在 noClipDepth 范围内）。
     /// 用于判断是否需要跳过 oblique 裁剪和强制渲染。
-    bool IsHeadInsidePortalVolume(Transform portalPlane, Vector3 playerHead)
+    bool IsHeadInsidePortalVolume(Transform portalPlane, Vector3 playerHead, int shapeType)
     {
         if (portalPlane == null) return false;
         Vector3 localHead = LocalPointForPortal(portalPlane, playerHead);
-        return LocalPointInPortalRect(localHead) && Mathf.Abs(localHead.z) < noClipDepth;
+        return LocalPointInPortalRect(localHead, shapeType) && Mathf.Abs(localHead.z) < noClipDepth;
     }
 
     Vector3 LocalPointForPortal(Transform portal, Vector3 worldPoint)
@@ -957,21 +1288,65 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return 0;
     }
 
-    bool LocalPointInPortalRect(Vector3 localPoint)
+    /// 解析 A/B 门各自实际生效的形状（0=圆形，1=三角形，2=方框）。
+    /// portalShapeA/B 未设置（PORTAL_SHAPE_UNSET=-1）或被填了非法值时，回退到旧版全局开关 useCircularPortalCheck，
+    /// 保证升级旧场景/旧 Prefab 时行为不突变；只要玩家在 Inspector 手动填了 0/1/2 中任意合法值，就完全按该值生效。
+    int ResolvePortalShape(bool isPortalA)
     {
-        if (!useCircularPortalCheck)
+        int shape = isPortalA ? portalShapeA : portalShapeB;
+        if (shape == PORTAL_SHAPE_CIRCLE || shape == PORTAL_SHAPE_TRIANGLE || shape == PORTAL_SHAPE_BOX)
         {
-            // 矩形判定 - 原版
-            return Mathf.Abs(localPoint.x) < portalTriggerWidth * 0.5f &&
-                   Mathf.Abs(localPoint.y) < portalTriggerHeight * 0.5f;
+            return shape;
         }
-        // 圆形/椭圆判定 - 无三角函数
-        float rx = portalTriggerWidth * 0.5f;
-        float ry = portalTriggerHeight * 0.5f;
-        if (rx <= 0.0001f || ry <= 0.0001f) return false;
-        float nx = localPoint.x / rx;
-        float ny = localPoint.y / ry;
-        return nx * nx + ny * ny <= 1f;
+        return useCircularPortalCheck ? PORTAL_SHAPE_CIRCLE : PORTAL_SHAPE_BOX;
+    }
+
+    /// 三角形判定用的符号面积法（无三角函数）：判断 (px,py) 与三角形一条边 (ax,ay)-(bx,by) 的相对朝向。
+    float SignPointToEdge(float px, float py, float ax, float ay, float bx, float by)
+    {
+        return (px - bx) * (ay - by) - (ax - bx) * (py - by);
+    }
+
+    /// 等腰三角形判定：顶点朝上 (0, hy)，底边在下方 y=-hy，两个底角为 (-hx,-hy) 与 (hx,-hy)。
+    /// hx=hy 时不是正三角形；若要精确等边三角形，请把 portalTriggerHeight 设为 portalTriggerWidth * 0.8660254（sqrt(3)/2）。
+    /// 使用符号面积法，不依赖三角函数，且不关心三角形绕向（同时检查正负号）。
+    bool PointInPortalTriangle(float x, float y, float hx, float hy)
+    {
+        float ax = 0f, ay = hy;
+        float bx = -hx, by = -hy;
+        float cx = hx, cy = -hy;
+
+        float d1 = SignPointToEdge(x, y, ax, ay, bx, by);
+        float d2 = SignPointToEdge(x, y, bx, by, cx, cy);
+        float d3 = SignPointToEdge(x, y, cx, cy, ax, ay);
+
+        bool hasNeg = (d1 < 0f) || (d2 < 0f) || (d3 < 0f);
+        bool hasPos = (d1 > 0f) || (d2 > 0f) || (d3 > 0f);
+
+        return !(hasNeg && hasPos);
+    }
+
+    bool LocalPointInPortalRect(Vector3 localPoint, int shapeType)
+    {
+        float hx = portalTriggerWidth * 0.5f;
+        float hy = portalTriggerHeight * 0.5f;
+        if (hx <= 0.0001f || hy <= 0.0001f) return false;
+
+        if (shapeType == PORTAL_SHAPE_TRIANGLE)
+        {
+            return PointInPortalTriangle(localPoint.x, localPoint.y, hx, hy);
+        }
+
+        if (shapeType == PORTAL_SHAPE_CIRCLE)
+        {
+            // 圆形/椭圆判定 - 无三角函数
+            float nx = localPoint.x / hx;
+            float ny = localPoint.y / hy;
+            return nx * nx + ny * ny <= 1f;
+        }
+
+        // PORTAL_SHAPE_BOX，以及任何异常值都兜底为方框（矩形）判定 - 原版
+        return Mathf.Abs(localPoint.x) < hx && Mathf.Abs(localPoint.y) < hy;
     }
 
     void SetTravellerTracking(bool isPortalA, bool tracking, Vector3 previousLocal)
@@ -1233,6 +1608,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         ref int lastBodySide,
         bool isPortalA)
     {
+        int thisShapeType = ResolvePortalShape(isPortalA);
+        int otherShapeType = ResolvePortalShape(!isPortalA);
+
         Vector3 localHeadForTrigger = portalPlane.InverseTransformPoint(playerHead);
         Vector3 localFeetForTrigger = portalPlane.InverseTransformPoint(playerFeet);
 
@@ -1241,8 +1619,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         float bodyMinZ = Mathf.Min(headZ, feetZ);
         float bodyMaxZ = Mathf.Max(headZ, feetZ);
 
-        bool headInXY = LocalPointInPortalRect(localHeadForTrigger);
-        bool feetInXY = LocalPointInPortalRect(localFeetForTrigger);
+        bool headInXY = LocalPointInPortalRect(localHeadForTrigger, thisShapeType);
+        bool feetInXY = LocalPointInPortalRect(localFeetForTrigger, thisShapeType);
         bool bodyInXY = headInXY || feetInXY;
 
         int currentBodySide;
@@ -1250,18 +1628,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         else if (bodyMaxZ < 0f) currentBodySide = -1;
         else currentBodySide = 0;
 
-        float speedBuffer = 0f;
-        if (localPlayer != null && localPlayer.IsValid())
-        {
-            float v = localPlayer.GetVelocity().magnitude;
-            speedBuffer = Mathf.Clamp(v * Time.deltaTime * 2.0f, 0f, 1.5f);
-        }
-        float colliderThreshold = noClipDepth + colliderDisableBuffer + speedBuffer;
+        // 性能优化：speedBuffer 每帧只在 LateUpdate 里算一次，这里直接复用，数值算法不变。
+        float colliderThreshold = noClipDepth + colliderDisableBuffer + cachedSpeedBufferThisFrame;
         bool bodyInColliderZone = bodyInXY && (bodyMinZ < colliderThreshold && bodyMaxZ > -colliderThreshold);
         bool otherBodyInColliderZone = false;
         if (otherPortalPlane != null)
         {
-            otherBodyInColliderZone = IsBodyInColliderZone(otherPortalPlane, playerHead, playerFeet);
+            otherBodyInColliderZone = IsBodyInColliderZone(otherPortalPlane, playerHead, playerFeet, otherShapeType);
         }
 
         string portalName = isPortalA ? "A" : "B";
@@ -1401,7 +1774,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     {
                         crossingT = Mathf.Clamp01(tPlus);
                         crossingLocal = Vector3.Lerp(previousTravellerLocal, currentTravellerLocal, crossingT);
-                        if (LocalPointInPortalRect(crossingLocal))
+                        if (LocalPointInPortalRect(crossingLocal, thisShapeType))
                         {
                             crossedPlane = true;
                             oldSide = 1;
@@ -1416,7 +1789,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                         {
                             crossingT = Mathf.Clamp01(tMinus);
                             crossingLocal = Vector3.Lerp(previousTravellerLocal, currentTravellerLocal, crossingT);
-                            if (LocalPointInPortalRect(crossingLocal))
+                            if (LocalPointInPortalRect(crossingLocal, thisShapeType))
                             {
                                 crossedPlane = true;
                                 oldSide = -1;
@@ -1427,7 +1800,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 }
             }
 
-            bool crossedInsidePortalRect = crossedPlane && LocalPointInPortalRect(crossingLocal);
+            bool crossedInsidePortalRect = crossedPlane && LocalPointInPortalRect(crossingLocal, thisShapeType);
 
             // 更新追踪位置 - 常开，不再用 travellerTrackDepth 关掉
             SetTravellerTracking(isPortalA, true, currentTravellerLocal);
@@ -1773,18 +2146,18 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             return;
         }
 
-        bool nearA = IsHeadInPortalOverlayZone(portalPlaneA, playerHead);
-        bool nearB = IsHeadInPortalOverlayZone(portalPlaneB, playerHead);
+        bool nearA = IsHeadInPortalOverlayZone(portalPlaneA, playerHead, ResolvePortalShape(true));
+        bool nearB = IsHeadInPortalOverlayZone(portalPlaneB, playerHead, ResolvePortalShape(false));
 
         SetPortalZTest(portalMatA, nearA ? 8f : 4f);
         SetPortalZTest(portalMatB, nearB ? 8f : 4f);
     }
 
-    bool IsHeadInPortalOverlayZone(Transform portalPlane, Vector3 playerHead)
+    bool IsHeadInPortalOverlayZone(Transform portalPlane, Vector3 playerHead, int shapeType)
     {
         if (portalPlane == null) return false;
         Vector3 localHead = portalPlane.InverseTransformPoint(playerHead);
-        if (!LocalPointInPortalRect(localHead)) return false;
+        if (!LocalPointInPortalRect(localHead, shapeType)) return false;
         return Mathf.Abs(localHead.z) < portalOverlayDepth;
     }
 
@@ -1814,8 +2187,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         SyncPortalRenderTextureBindings();
 
         // 头在传送门体积内时：跳过 oblique 裁剪 + 强制渲染（Seb 风格直接算，不用可调阈值）。
-        bool headInsideVolumeA = IsHeadInsidePortalVolume(portalPlaneA, viewerPos);
-        bool headInsideVolumeB = IsHeadInsidePortalVolume(portalPlaneB, viewerPos);
+        bool headInsideVolumeA = IsHeadInsidePortalVolume(portalPlaneA, viewerPos, ResolvePortalShape(true));
+        bool headInsideVolumeB = IsHeadInsidePortalVolume(portalPlaneB, viewerPos, ResolvePortalShape(false));
 
         // A 门表面显示 B 侧视角：严格对应 Seb 中 thisPortal=B, linkedPortal=A。
         // 头在 A 门体积内 → 镜像相机贴近 B 门 → 跳过 B 门侧 oblique。
@@ -2256,10 +2629,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (!showDebugGizmos) return;
 
         if (portalPlaneA != null)
-            DrawPortalGizmo(portalPlaneA, gizmoColorA, isCameraBRendering, portalStateA, colliderADisabled, lastBodySideA);
+            DrawPortalGizmo(portalPlaneA, gizmoColorA, isCameraBRendering, portalStateA, colliderADisabled, lastBodySideA, ResolvePortalShape(true));
 
         if (portalPlaneB != null)
-            DrawPortalGizmo(portalPlaneB, gizmoColorB, isCameraARendering, portalStateB, colliderBDisabled, lastBodySideB);
+            DrawPortalGizmo(portalPlaneB, gizmoColorB, isCameraARendering, portalStateB, colliderBDisabled, lastBodySideB, ResolvePortalShape(false));
 
         if (cameraA != null)
         {
@@ -2292,33 +2665,106 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
-    void DrawPortalGizmo(Transform portal, Color color, bool isActive, int state, bool colliderDisabled, int bodySide)
+    /// 按 shapeType 取门框轮廓在局部 XY 平面上的顶点（闭合多边形，最后一点会自动连回第一点）。
+    /// 圆形用 24 边多边形近似；三角形直接是三个顶点；方框是四个角。
+    /// 仅用于 Gizmos 可视化，不参与实际判定（实际判定见 LocalPointInPortalRect，两者必须保持数学定义一致）。
+    Vector3[] GetPortalShapeOutline2D(int shapeType, float hx, float hy)
+    {
+        if (shapeType == PORTAL_SHAPE_TRIANGLE)
+        {
+            return new Vector3[]
+            {
+                new Vector3(0f, hy, 0f),
+                new Vector3(-hx, -hy, 0f),
+                new Vector3(hx, -hy, 0f)
+            };
+        }
+
+        if (shapeType == PORTAL_SHAPE_CIRCLE)
+        {
+            const int segments = 24;
+            Vector3[] points = new Vector3[segments];
+            for (int i = 0; i < segments; i++)
+            {
+                float angle = (float)i / segments * 360f * Mathf.Deg2Rad;
+                points[i] = new Vector3(Mathf.Cos(angle) * hx, Mathf.Sin(angle) * hy, 0f);
+            }
+            return points;
+        }
+
+        // PORTAL_SHAPE_BOX 及兜底
+        return new Vector3[]
+        {
+            new Vector3(-hx, -hy, 0f),
+            new Vector3(-hx, hy, 0f),
+            new Vector3(hx, hy, 0f),
+            new Vector3(hx, -hy, 0f)
+        };
+    }
+
+    /// 在 Gizmos.matrix 已设为门局部坐标系的前提下，于 z=zOffset 平面画出该形状的闭合线框。
+    void DrawShapeOutlineAtZ(int shapeType, float hx, float hy, float zOffset)
+    {
+        Vector3[] outline = GetPortalShapeOutline2D(shapeType, hx, hy);
+        int count = outline.Length;
+        for (int i = 0; i < count; i++)
+        {
+            Vector3 a = outline[i];
+            Vector3 b = outline[(i + 1) % count];
+            a.z = zOffset;
+            b.z = zOffset;
+            Gizmos.DrawLine(a, b);
+        }
+    }
+
+    /// 用形状轮廓近似画一个“棱柱体”线框：前后两个截面 + 连接四角/多边形顶点的纵向棱线。
+    /// 圆形/三角形没有 Gizmos.DrawWireCube 对应的现成 API，所以统一走这条路径，方框也复用它以保证三种形状视觉逻辑一致。
+    void DrawShapePrismWire(int shapeType, float hx, float hy, float halfDepth)
+    {
+        DrawShapeOutlineAtZ(shapeType, hx, hy, -halfDepth);
+        DrawShapeOutlineAtZ(shapeType, hx, hy, halfDepth);
+
+        Vector3[] outline = GetPortalShapeOutline2D(shapeType, hx, hy);
+        for (int i = 0; i < outline.Length; i++)
+        {
+            Vector3 front = outline[i]; front.z = -halfDepth;
+            Vector3 back = outline[i]; back.z = halfDepth;
+            Gizmos.DrawLine(front, back);
+        }
+    }
+
+    void DrawPortalGizmo(Transform portal, Color color, bool isActive, int state, bool colliderDisabled, int bodySide, int shapeType)
     {
         Matrix4x4 oldMatrix = Gizmos.matrix;
         Gizmos.matrix = portal.localToWorldMatrix;
 
-        Vector3 boxSize = new Vector3(portalTriggerWidth, portalTriggerHeight, noClipDepth * 2f);
+        float hx = portalTriggerWidth * 0.5f;
+        float hy = portalTriggerHeight * 0.5f;
 
         Gizmos.color = color;
-        Gizmos.DrawWireCube(Vector3.zero, boxSize);
+        DrawShapePrismWire(shapeType, hx, hy, noClipDepth);
 
+        // 用若干层半透明切片近似“体积填充”效果，方框/圆形/三角形统一走这条路径，
+        // 不再依赖 Gizmos.DrawCube（只支持矩形），保证三种形状在 Scene 视图里的视觉逻辑一致。
         Color fillColor = color;
         fillColor.a = isActive ? 0.2f : 0.05f;
         Gizmos.color = fillColor;
-        Gizmos.DrawCube(Vector3.zero, boxSize);
+        const int fillSlices = 5;
+        for (int i = 0; i < fillSlices; i++)
+        {
+            float t = fillSlices <= 1 ? 0f : ((float)i / (fillSlices - 1) * 2f - 1f);
+            DrawShapeOutlineAtZ(shapeType, hx, hy, t * noClipDepth);
+        }
 
-        Vector3 colliderZoneSize = new Vector3(portalTriggerWidth, portalTriggerHeight, (noClipDepth + colliderDisableBuffer) * 2f);
         Gizmos.color = colliderDisabled ? new Color(1f, 0f, 0f, 0.15f) : new Color(0f, 1f, 0f, 0.1f);
-        Gizmos.DrawWireCube(Vector3.zero, colliderZoneSize);
+        DrawShapePrismWire(shapeType, hx, hy, noClipDepth + colliderDisableBuffer);
 
         // 传送触发平面：黄色线框，在 z = ±teleportTriggerOffset 处。
         if (teleportTriggerOffset > 0f)
         {
             Gizmos.color = new Color(1f, 1f, 0f, 0.6f);
-            float triggerThickness = 0.005f; // 薄片可视化
-            Vector3 triggerSize = new Vector3(portalTriggerWidth, portalTriggerHeight, triggerThickness);
-            Gizmos.DrawWireCube(Vector3.forward * teleportTriggerOffset, triggerSize);
-            Gizmos.DrawWireCube(-Vector3.forward * teleportTriggerOffset, triggerSize);
+            DrawShapeOutlineAtZ(shapeType, hx, hy, teleportTriggerOffset);
+            DrawShapeOutlineAtZ(shapeType, hx, hy, -teleportTriggerOffset);
         }
 
         Gizmos.matrix = oldMatrix;
