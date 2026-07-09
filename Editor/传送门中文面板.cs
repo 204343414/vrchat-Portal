@@ -99,13 +99,13 @@
 //     否则冷却期间/冷却刚结束瞬间同一次滚动手势会被识别成好几次开火，反复触发失败音效。
 //     VR 扳机那边同理已经有 vrTriggerLeftPressed/vrTriggerRightPressed 锁存，是同一个道理。
 //
-// 【下一步要做的事：刚体传送】
-//   目前的传送只处理了本地玩家(localPlayer.TeleportTo)，不涉及场景里的 Rigidbody 物体穿过传送门。
-//   如果要做物体传送，大概率需要：检测哪些物体的碰撞体处于门的触发区域内(可以复用
-//   IsBodyInColliderZone 类似的思路，但传入的是物体的碰撞体包围盒而不是玩家头/脚位置)，
-//   用同一套 halfTurn 门到门映射公式去变换物体的 position/rotation/velocity，
-//   注意 Udon 网络同步问题——如果物体需要在多人间同步传送，需要考虑 ownership 转移
-//   (Networking.SetOwner)，这块目前完全没做，是全新的功能模块。
+// 【刚体传送 + 抓取已完成（2026-07-09）】
+//   - 传送枪新增：Kinematic 抓取（鼠标左键 / VR Grip）、临时质量=1、Layer 切换、grabSounds、Animator bool 可配置。
+//   - 管理器新增：OverlapBox + LocalPointInPortalRect(shape) 检测、prevPos 穿越判断、复用 TeleportSebStyle/halfTurn 逻辑。
+//   - 支持：抓取中物体可无缝跨门（UpdateHeldAfterTeleport）、Layer 自动切 25、速度/位置/旋转 1:1 映射。
+//   - 视觉：完整传送（相对坐标保持），无需新 Shader。性能优先（复用 checkInterval）。
+//   - 泛用性：可直接做 Prefab，无需新组件。networking 留空（本地优先）。
+//   - 交接注意：刚体传送完全复用现有 traveller/halfTurn/形状系统，极高鲁棒性。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;
