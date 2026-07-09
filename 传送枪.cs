@@ -173,6 +173,18 @@ public class 传送枪 : UdonSharpBehaviour
     [Tooltip("放置校验专用日志：贴合迭代过程、遮挡命中的物体名字。排查“为什么这里放不了传送门”时开启。")]
     public bool debugPlacementValidationLog = false;
 
+    [Header("════════════ 刚体抓取（Portal 原著复刻）════════════")]
+    [Tooltip("抓取刚体时的随机音效数组（参考 shootSounds 逻辑）")]
+    public AudioClip[] grabSounds;
+    [Tooltip("抓取刚体时要设置的 Animator bool 参数名（可自定义，默认 IsGrabbing）")]
+    public string grabAnimatorBoolName = "IsGrabbing";
+    [Tooltip("抓取射线最大距离")]
+    public float grabMaxDistance = 8f;
+    [Tooltip("抓取时临时把刚体质量设为这个值（便于操控重物），释放时还原")]
+    public float heldMassWhileGrabbed = 1f;
+    [Tooltip("抓取刚体后是否自动切换其 Layer 到 heldLayer（25 穿透层）")]
+    public bool switchRBLayersWhenGrabbed = true;
+
     private int originalGunLayerBeforeHeld = -1;
     private bool gunLayerOverrideActive = false;
 
@@ -187,6 +199,15 @@ public class 传送枪 : UdonSharpBehaviour
     // 瞬间同一次物理滚动被重复识别成好几次开火。用这两个锁存位做"边缘触发"：必须先回到零位（松手）才能再次触发。
     private bool scrollUpLatched = false;
     private bool scrollDownLatched = false;
+
+    // 刚体抓取状态
+    private Rigidbody heldRigidbody;
+    private float originalHeldMass = 1f;
+    private int originalRBLayer = -1;
+    private bool rbLayerOverrideActive = false;
+    private Vector3 heldLocalOffset;
+    private Quaternion heldLocalRotationOffset;
+    private bool isGrabbing = false;
 
     void Start()
     {
@@ -224,8 +245,162 @@ public class 传送枪 : UdonSharpBehaviour
             gameObject.layer = originalGunLayerBeforeHeld;
             gunLayerOverrideActive = false;
         }
+
+        // 释放抓取的刚体
+        ReleaseHeldRigidbody();
     }
 
+    // ============================================================
+    // Pickup Use 事件（VRChat 官方推荐交互方式）
+    // 优点：不会被设置界面、Esc菜单、聊天框等 UI 拦截
+    // PC 和 VR 都能正常工作
+    // ============================================================
+
+    public override void OnPickupUseDown()
+    {
+        if (heldRigidbody != null)
+        {
+            // 已有抓取物体 → 释放
+            ReleaseHeldRigidbody();
+        }
+        else
+        {
+            // 没有抓取 → 尝试抓取
+            TryGrabRigidbody();
+        }
+    }
+
+    public override void OnPickupUseUp()
+    {
+        // 可选：松开 Use 键时的逻辑（目前留空）
+    }
+
+    // ============================================================
+    // 刚体抓取核心（Kinematic + 质量临时修改 + Layer 切换）
+    // ============================================================
+
+    void TryGrabRigidbody()
+    {
+        if (heldRigidbody != null) return;
+        if (shootPoint == null) return;
+
+        RaycastHit hit;
+        if (Physics.Raycast(shootPoint.position, shootPoint.forward, out hit, grabMaxDistance))
+        {
+            Collider col = hit.collider;
+            if (col == null) return;
+
+            // 使用 attachedRigidbody 比 GetComponentInParent 更稳定（Udon 推荐）
+            Rigidbody rb = col.attachedRigidbody;
+            if (rb == null || rb.isKinematic) return;
+
+            GrabRigidbody(rb);
+        }
+    }
+
+    void GrabRigidbody(Rigidbody rb)
+    {
+        if (rb == null || shootPoint == null) return;
+
+        heldRigidbody = rb;
+
+        // 保存并临时修改质量
+        originalHeldMass = rb.mass;
+        rb.mass = heldMassWhileGrabbed;
+
+        // Kinematic 模式（最稳定，原著手感）
+        rb.isKinematic = true;
+
+        // 【Portal 原著严格手感】
+        // 相对位置固定为 shootPoint 本地 (0,0,1)
+        Vector3 desiredLocalOffset = new Vector3(0f, 0f, 1f);
+        Vector3 worldGrabPoint = shootPoint.TransformPoint(desiredLocalOffset);
+        heldLocalOffset = rb.transform.InverseTransformPoint(worldGrabPoint);
+
+        // 旋转严格跟随 shootPoint
+        heldLocalRotationOffset = Quaternion.Inverse(rb.transform.rotation) * shootPoint.rotation;
+
+        // Layer 切换
+        if (switchRBLayersWhenGrabbed)
+        {
+            originalRBLayer = rb.gameObject.layer;
+            rb.gameObject.layer = heldLayer;
+            rbLayerOverrideActive = true;
+        }
+
+        isGrabbing = true;
+        SetGrabAnimator(true);
+        PlayGrabSound();
+
+        if (debugPortalGunLog)
+        {
+            Debug.Log("[传送枪] 抓取刚体: " + rb.name);
+        }
+    }
+
+    void ReleaseHeldRigidbody()
+    {
+        if (heldRigidbody == null) return;
+
+        Rigidbody rb = heldRigidbody;
+        heldRigidbody = null;
+
+        // 还原质量
+        rb.mass = originalHeldMass;
+
+        // 还原 Kinematic（允许物理）
+        rb.isKinematic = false;
+
+        // 还原 Layer
+        if (rbLayerOverrideActive && originalRBLayer != -1)
+        {
+            rb.gameObject.layer = originalRBLayer;
+            rbLayerOverrideActive = false;
+        }
+
+        isGrabbing = false;
+        SetGrabAnimator(false);
+
+        if (debugPortalGunLog)
+        {
+            Debug.Log("[传送枪] 释放刚体: " + rb.name);
+        }
+    }
+
+    void SetGrabAnimator(bool grabbing)
+    {
+        if (gunAnimator != null && !string.IsNullOrEmpty(grabAnimatorBoolName))
+        {
+            gunAnimator.SetBool(grabAnimatorBoolName, grabbing);
+        }
+    }
+
+    void PlayGrabSound()
+    {
+        if (audioSource != null && grabSounds != null && grabSounds.Length > 0)
+        {
+            int idx = Random.Range(0, grabSounds.Length);
+            if (grabSounds[idx] != null)
+            {
+                audioSource.PlayOneShot(grabSounds[idx]);
+            }
+        }
+    }
+
+    // 供管理器调用：无缝跨门保持抓取
+    public void UpdateHeldAfterTeleport(Vector3 newWorldPos, Quaternion newWorldRot)
+    {
+        if (heldRigidbody == null) return;
+
+        // 重新计算偏移（基于新位置）
+        heldLocalOffset = heldRigidbody.transform.InverseTransformPoint(newWorldPos);
+        heldLocalRotationOffset = Quaternion.Inverse(heldRigidbody.transform.rotation) * newWorldRot;
+    }
+
+    public Rigidbody GetHeldRigidbody()
+    {
+        return heldRigidbody;
+    }
 
     void Update()
     {
@@ -239,6 +414,9 @@ public class 传送枪 : UdonSharpBehaviour
 
         if (!localPlayer.IsUserInVR())
         {
+            // 抓取逻辑已迁移到 OnPickupUseDown / OnPickupUseUp（Pickup Use 事件）
+            // 这样不会被设置界面、Esc菜单、UI 拦截，更符合 VRChat 官方推荐做法
+
             // 滚轮是连续轴而不是按键，一次物理滚动可能横跨好几帧、且数值会有拖尾，
             // 必须做"边缘触发"锁存：触发一次后必须先回到接近零位，才允许下一次触发。
             // 否则冷却期间/冷却刚结束的瞬间，同一次滚动会被识别成好几次开火，
@@ -280,6 +458,8 @@ public class 传送枪 : UdonSharpBehaviour
                 vrTriggerLeftPressed = true;
                 TryShootPortal(true);
             }
+
+            // VR 左手 Grip 抓取保留作为兜底（主要使用 Pickup Use）
             else if (Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger") < 0.3f)
             {
                 vrTriggerLeftPressed = false;
@@ -294,6 +474,24 @@ public class 传送枪 : UdonSharpBehaviour
             {
                 vrTriggerRightPressed = false;
             }
+        }
+
+        // 更新抓取的刚体（Portal 原著手感：直接跟随 shootPoint 正前方 1 米）
+        if (heldRigidbody != null && isHeld)
+        {
+            // 更稳定、更符合原著的写法：直接用 shootPoint 的世界坐标 + forward * 1
+            Vector3 targetPos = shootPoint.position + shootPoint.forward * 1f;
+            Quaternion targetRot = shootPoint.rotation;
+
+            heldRigidbody.MovePosition(targetPos);
+            heldRigidbody.MoveRotation(targetRot);
+        }
+
+        // 安全兜底
+        if (heldRigidbody == null && isGrabbing)
+        {
+            isGrabbing = false;
+            SetGrabAnimator(false);
         }
     }
 
