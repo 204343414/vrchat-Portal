@@ -42,7 +42,7 @@ public class 传送枪 : UdonSharpBehaviour
     [Header("════════════ 传送门 ════════════")]
     [Tooltip("传送门A大级")]
     public Transform portalA;
-    
+
     [Tooltip("传送门B大级")]
     public Transform portalB;
 
@@ -65,32 +65,32 @@ public class 传送枪 : UdonSharpBehaviour
     [Header("════════════ 冷却设置 ════════════")]
     [Tooltip("发射冷却时间（秒）")]
     public float cooldownTime = 0.5f;
-    
+
     [Tooltip("冷却期间是否播放失败音效。默认关闭：冷却中 Update() 会直接跳过所有输入检测（包括合法放置校验），\n不会调用 TryShootPortal，自然也不会有任何检测失败音效反复触发的问题。\n开启此项仅用于\"我就是想让冷却中的操作也给个提示音\"这种特殊需求，会额外调用一次 PlayFailSound。")]
     public bool playSoundOnCooldown = false;
 
     [Header("════════════ 动画控制器 ════════════")]
     [Tooltip("枪械动画控制器")]
     public Animator gunAnimator;
-    
+
     [Tooltip("发射A门的Trigger名称")]
     public string shootTriggerA = "ShootA";
-    
+
     [Tooltip("发射B门的Trigger名称")]
     public string shootTriggerB = "ShootB";
-    
+
     [Tooltip("发射失败的Trigger名称")]
     public string shootTriggerFail = "ShootFail";
 
     [Header("════════════ 音效（可选）════════════")]
     public AudioSource audioSource;
-    
+
     [Tooltip("A门随机音效数组")]
     public AudioClip[] shootSoundsA;
-    
+
     [Tooltip("B门随机音效数组")]
     public AudioClip[] shootSoundsB;
-    
+
     [Tooltip("发射失败音效数组")]
     public AudioClip[] failSounds;
 
@@ -122,6 +122,14 @@ public class 传送枪 : UdonSharpBehaviour
 
     [Tooltip("手持时临时切换到的 Layer。VRChat 默认工程里 13 = Pickup。")]
     public int heldLayer = 13;
+
+    [Tooltip("手持传送枪时临时关闭枪身 BoxCollider，松手后还原。用于避免玩家穿门后枪身碰撞把枪/手部撞歪。")]
+    public bool disableGunBoxCollidersWhileHeld = true;
+
+    [Tooltip("需要手持时关闭的枪身 BoxCollider。可留空，脚本会自动从传送枪自身和子物体查找。")]
+    public BoxCollider[] gunBoxCollidersToDisableWhileHeld;
+
+    private bool[] originalGunBoxColliderEnabledStates;
 
     [Header("════════════ 合法放置检测 ════════════")]
     [Tooltip("开启后，放置传送门时会做四角贴合校验 + 正面遮挡校验。不合法则放置失败（走失败音效/动画），传送门保留在上一次的合法位置。")]
@@ -164,6 +172,9 @@ public class 传送枪 : UdonSharpBehaviour
     [Tooltip("正面遮挡校验专用层：只有这些层上的物体才会被当成\"挡住门口的障碍物\"。默认全部层(-1)最安全；如果场景里有不该算遮挡的特殊层（比如水面/特效），可以在这里排除。这个层独立于 placementLayers(可放置层)，两者用途不同。")]
     public LayerMask placementObstructionLayers = ~0;
 
+    [Tooltip("Portal 原著手感：放置传送门时忽略所有带 Rigidbody 的碰撞体。开启后，射线会穿过方块/可动物体继续命中后面的墙/地板，四角贴合和正面遮挡校验也不会因为刚体挡路而失败。")]
+    public bool ignoreRigidbodyCollidersForPortalPlacement = true;
+
     [Tooltip("A/B互斥校验：不管两扇门有没有挂碰撞体、碰撞体是不是Trigger、图层设置是否正确，都强制保证A、B两扇门不会互相重叠。\n原理：把每扇门近似看成一个包围球(半径按门框对角线的一半算)，候选位置离另一扇门当前位置的距离必须大于两个半径之和(再加下面的安全余量)，否则直接判定不合法。\n这是一道独立于射线/碰撞体检测之外的硬性兜底，专门防止\"A把自己放到了B的位置上\"这类两门重叠的bug，不建议关闭。")]
     public bool enableMutualExclusionCheck = true;
 
@@ -172,6 +183,9 @@ public class 传送枪 : UdonSharpBehaviour
 
     [Tooltip("放置校验专用日志：贴合迭代过程、遮挡命中的物体名字。排查“为什么这里放不了传送门”时开启。")]
     public bool debugPlacementValidationLog = false;
+
+    [Tooltip("单电子宇宙规则：抓取刚体时禁止发射/放置传送门。默认开启，避免同一把枪同时承担抓取和开门两套状态导致逻辑冲突。")]
+    public bool blockPortalShootingWhileGrabbingRigidbody = true;
 
     [Header("════════════ 刚体抓取（Portal 原著复刻）════════════")]
     [Tooltip("抓取刚体时的随机音效数组（参考 shootSounds 逻辑）")]
@@ -182,8 +196,6 @@ public class 传送枪 : UdonSharpBehaviour
     public float grabMaxDistance = 8f;
     [Tooltip("抓取时临时把刚体质量设为这个值（便于操控重物），释放时还原")]
     public float heldMassWhileGrabbed = 1f;
-    [Tooltip("抓取刚体后是否自动切换其 Layer 到 heldLayer（25 穿透层）")]
-    public bool switchRBLayersWhenGrabbed = true;
 
     private int originalGunLayerBeforeHeld = -1;
     private bool gunLayerOverrideActive = false;
@@ -203,11 +215,13 @@ public class 传送枪 : UdonSharpBehaviour
     // 刚体抓取状态
     private Rigidbody heldRigidbody;
     private float originalHeldMass = 1f;
-    private int originalRBLayer = -1;
-    private bool rbLayerOverrideActive = false;
     private Vector3 heldLocalOffset;
     private Quaternion heldLocalRotationOffset;
     private bool isGrabbing = false;
+    private bool heldTargetMappedThroughPortal = false;
+    private Transform heldTargetFromPortal;
+    private Transform heldTargetToPortal;
+    private bool heldTargetUseClassicHalfTurn = true;
 
     void Start()
     {
@@ -234,6 +248,8 @@ public class 传送枪 : UdonSharpBehaviour
             gameObject.layer = heldLayer;
             gunLayerOverrideActive = true;
         }
+
+        DisableGunBoxCollidersForHeldState();
     }
 
     public override void OnDrop()
@@ -246,8 +262,53 @@ public class 传送枪 : UdonSharpBehaviour
             gunLayerOverrideActive = false;
         }
 
+        RestoreGunBoxCollidersAfterHeldState();
+
         // 释放抓取的刚体
         ReleaseHeldRigidbody();
+    }
+
+    void CacheGunBoxCollidersIfNeeded()
+    {
+        if (gunBoxCollidersToDisableWhileHeld == null || gunBoxCollidersToDisableWhileHeld.Length == 0)
+        {
+            gunBoxCollidersToDisableWhileHeld = GetComponentsInChildren<BoxCollider>(true);
+        }
+
+        if (gunBoxCollidersToDisableWhileHeld != null && (originalGunBoxColliderEnabledStates == null || originalGunBoxColliderEnabledStates.Length != gunBoxCollidersToDisableWhileHeld.Length))
+        {
+            originalGunBoxColliderEnabledStates = new bool[gunBoxCollidersToDisableWhileHeld.Length];
+        }
+    }
+
+    void DisableGunBoxCollidersForHeldState()
+    {
+        if (!disableGunBoxCollidersWhileHeld) return;
+        CacheGunBoxCollidersIfNeeded();
+        if (gunBoxCollidersToDisableWhileHeld == null || originalGunBoxColliderEnabledStates == null) return;
+
+        for (int i = 0; i < gunBoxCollidersToDisableWhileHeld.Length; i++)
+        {
+            BoxCollider col = gunBoxCollidersToDisableWhileHeld[i];
+            if (col == null) continue;
+            originalGunBoxColliderEnabledStates[i] = col.enabled;
+            col.enabled = false;
+        }
+    }
+
+    void RestoreGunBoxCollidersAfterHeldState()
+    {
+        if (!disableGunBoxCollidersWhileHeld) return;
+        if (gunBoxCollidersToDisableWhileHeld == null || originalGunBoxColliderEnabledStates == null) return;
+
+        int count = gunBoxCollidersToDisableWhileHeld.Length;
+        if (originalGunBoxColliderEnabledStates.Length < count) count = originalGunBoxColliderEnabledStates.Length;
+        for (int i = 0; i < count; i++)
+        {
+            BoxCollider col = gunBoxCollidersToDisableWhileHeld[i];
+            if (col == null) continue;
+            col.enabled = originalGunBoxColliderEnabledStates[i];
+        }
     }
 
     // ============================================================
@@ -284,18 +345,83 @@ public class 传送枪 : UdonSharpBehaviour
         if (heldRigidbody != null) return;
         if (shootPoint == null) return;
 
+        Rigidbody rb;
+        if (TryFindGrabbableRigidbodyOnRay(shootPoint.position, shootPoint.forward, grabMaxDistance, out rb))
+        {
+            GrabRigidbody(rb);
+            return;
+        }
+
+        // Portal 原著手感：抓取射线可以穿过传送门一次，继续尝试抓另一侧的刚体。
+        if (portalManager != null)
+        {
+            Vector3 mappedOrigin;
+            Vector3 mappedDirection;
+            float remainingDistance;
+            Transform fromPortal;
+            Transform toPortal;
+            bool mapped = portalManager.TryMapRayThroughPortal(
+                shootPoint.position,
+                shootPoint.forward,
+                grabMaxDistance,
+                out mappedOrigin,
+                out mappedDirection,
+                out remainingDistance,
+                out fromPortal,
+                out toPortal
+            );
+
+            if (mapped)
+            {
+                float portalDistance = grabMaxDistance - remainingDistance;
+                if (!IsBlockedBeforePortal(shootPoint.position, shootPoint.forward, portalDistance) && TryFindGrabbableRigidbodyOnRay(mappedOrigin, mappedDirection, remainingDistance, out rb))
+                {
+                    GrabRigidbody(rb);
+                    SetHeldPortalTargetMapping(fromPortal, toPortal, portalManager.useClassicHalfTurn);
+                }
+            }
+        }
+    }
+
+    bool IsBlockedBeforePortal(Vector3 origin, Vector3 direction, float portalDistance)
+    {
+        if (portalDistance <= 0.01f) return true;
+        if (direction.sqrMagnitude < 0.0001f) return true;
+        direction.Normalize();
+
         RaycastHit hit;
-        if (Physics.Raycast(shootPoint.position, shootPoint.forward, out hit, grabMaxDistance))
+        if (Physics.Raycast(origin, direction, out hit, portalDistance - 0.01f))
         {
             Collider col = hit.collider;
-            if (col == null) return;
-
-            // 使用 attachedRigidbody 比 GetComponentInParent 更稳定（Udon 推荐）
+            if (col == null) return false;
             Rigidbody rb = col.attachedRigidbody;
-            if (rb == null || rb.isKinematic) return;
-
-            GrabRigidbody(rb);
+            // 近处刚体应由第一段直接抓取处理；如果到了这里仍被它挡住，就不要穿门抓更远物体。
+            return true;
         }
+        return false;
+    }
+
+    bool TryFindGrabbableRigidbodyOnRay(Vector3 origin, Vector3 direction, float distance, out Rigidbody rb)
+    {
+        rb = null;
+        if (distance <= 0.01f) return false;
+        if (direction.sqrMagnitude < 0.0001f) return false;
+        direction.Normalize();
+
+        RaycastHit hit;
+        if (Physics.Raycast(origin, direction, out hit, distance))
+        {
+            Collider col = hit.collider;
+            if (col == null) return false;
+
+            Rigidbody found = col.attachedRigidbody;
+            if (found == null || found.isKinematic) return false;
+
+            rb = found;
+            return true;
+        }
+
+        return false;
     }
 
     void GrabRigidbody(Rigidbody rb)
@@ -303,6 +429,9 @@ public class 传送枪 : UdonSharpBehaviour
         if (rb == null || shootPoint == null) return;
 
         heldRigidbody = rb;
+        heldTargetMappedThroughPortal = false;
+        heldTargetFromPortal = null;
+        heldTargetToPortal = null;
 
         // 保存并临时修改质量
         originalHeldMass = rb.mass;
@@ -319,14 +448,6 @@ public class 传送枪 : UdonSharpBehaviour
 
         // 旋转严格跟随 shootPoint
         heldLocalRotationOffset = Quaternion.Inverse(rb.transform.rotation) * shootPoint.rotation;
-
-        // Layer 切换
-        if (switchRBLayersWhenGrabbed)
-        {
-            originalRBLayer = rb.gameObject.layer;
-            rb.gameObject.layer = heldLayer;
-            rbLayerOverrideActive = true;
-        }
 
         isGrabbing = true;
         SetGrabAnimator(true);
@@ -351,12 +472,9 @@ public class 传送枪 : UdonSharpBehaviour
         // 还原 Kinematic（允许物理）
         rb.isKinematic = false;
 
-        // 还原 Layer
-        if (rbLayerOverrideActive && originalRBLayer != -1)
-        {
-            rb.gameObject.layer = originalRBLayer;
-            rbLayerOverrideActive = false;
-        }
+        heldTargetMappedThroughPortal = false;
+        heldTargetFromPortal = null;
+        heldTargetToPortal = null;
 
         isGrabbing = false;
         SetGrabAnimator(false);
@@ -387,12 +505,26 @@ public class 传送枪 : UdonSharpBehaviour
         }
     }
 
-    // 供管理器调用：无缝跨门保持抓取
-    public void UpdateHeldAfterTeleport(Vector3 newWorldPos, Quaternion newWorldRot)
+    // 供管理器调用：无缝跨门保持抓取。
+    // 关键点：Update() 每帧的手持目标也必须映射到出口门另一侧，否则刚体刚传送就会被枪重新拉回入口侧。
+    public void UpdateHeldAfterTeleport(Vector3 newWorldPos, Quaternion newWorldRot, Transform fromPortal, Transform toPortal, bool useClassicHalfTurn)
     {
         if (heldRigidbody == null) return;
 
-        // 重新计算偏移（基于新位置）
+        // 如果当前正处于“玩家已在出口侧，手持物还在入口侧”的反向映射状态，
+        // 那么手持物这次传送完成后，玩家/枪/刚体重新回到同一侧，应清除映射。
+        if (heldTargetMappedThroughPortal && heldTargetFromPortal == toPortal && heldTargetToPortal == fromPortal)
+        {
+            ClearHeldPortalTargetMapping();
+        }
+        else
+        {
+            SetHeldPortalTargetMapping(fromPortal, toPortal, useClassicHalfTurn);
+        }
+
+        heldRigidbody.position = newWorldPos;
+        heldRigidbody.rotation = newWorldRot;
+
         heldLocalOffset = heldRigidbody.transform.InverseTransformPoint(newWorldPos);
         heldLocalRotationOffset = Quaternion.Inverse(heldRigidbody.transform.rotation) * newWorldRot;
     }
@@ -400,6 +532,38 @@ public class 传送枪 : UdonSharpBehaviour
     public Rigidbody GetHeldRigidbody()
     {
         return heldRigidbody;
+    }
+
+    void SetHeldPortalTargetMapping(Transform fromPortal, Transform toPortal, bool useClassicHalfTurn)
+    {
+        heldTargetMappedThroughPortal = fromPortal != null && toPortal != null;
+        heldTargetFromPortal = fromPortal;
+        heldTargetToPortal = toPortal;
+        heldTargetUseClassicHalfTurn = useClassicHalfTurn;
+    }
+
+    public void ClearHeldPortalTargetMapping()
+    {
+        heldTargetMappedThroughPortal = false;
+        heldTargetFromPortal = null;
+        heldTargetToPortal = null;
+    }
+
+    public void HandlePlayerTeleportedThroughPortal(Transform fromPortal, Transform toPortal, bool useClassicHalfTurn)
+    {
+        if (heldRigidbody == null) return;
+
+        if (heldTargetMappedThroughPortal)
+        {
+            // 前进穿门常见路径：刚体先穿门，玩家随后穿门。玩家穿完后，三者同侧，清除映射。
+            ClearHeldPortalTargetMapping();
+        }
+        else
+        {
+            // 倒退穿门常见路径：玩家先穿门，手持刚体还留在原侧。
+            // 这时枪在出口侧，但目标点应反向映射回入口侧，直到刚体也被传送门接走。
+            SetHeldPortalTargetMapping(toPortal, fromPortal, useClassicHalfTurn);
+        }
     }
 
     void Update()
@@ -464,7 +628,7 @@ public class 传送枪 : UdonSharpBehaviour
             {
                 vrTriggerLeftPressed = false;
             }
-            
+
             if (Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger") > 0.7f && !vrTriggerRightPressed)
             {
                 vrTriggerRightPressed = true;
@@ -479,9 +643,26 @@ public class 传送枪 : UdonSharpBehaviour
         // 更新抓取的刚体（Portal 原著手感：直接跟随 shootPoint 正前方 1 米）
         if (heldRigidbody != null && isHeld)
         {
-            // 更稳定、更符合原著的写法：直接用 shootPoint 的世界坐标 + forward * 1
+            // 更稳定、更符合原著的写法：默认直接用 shootPoint 的世界坐标 + forward * 1。
+            // 如果刚体已经穿过传送门，而枪还在入口侧，则把这个“手持目标点”也映射到出口侧，避免物体被拉回入口。
             Vector3 targetPos = shootPoint.position + shootPoint.forward * 1f;
             Quaternion targetRot = shootPoint.rotation;
+
+            if (heldTargetMappedThroughPortal && heldTargetFromPortal != null && heldTargetToPortal != null)
+            {
+                Vector3 localTargetPos = heldTargetFromPortal.InverseTransformPoint(targetPos);
+                Quaternion localTargetRot = Quaternion.Inverse(heldTargetFromPortal.rotation) * targetRot;
+
+                if (heldTargetUseClassicHalfTurn)
+                {
+                    Quaternion halfTurn = Quaternion.AngleAxis(180f, Vector3.up);
+                    localTargetPos = halfTurn * localTargetPos;
+                    localTargetRot = halfTurn * localTargetRot;
+                }
+
+                targetPos = heldTargetToPortal.TransformPoint(localTargetPos);
+                targetRot = heldTargetToPortal.rotation * localTargetRot;
+            }
 
             heldRigidbody.MovePosition(targetPos);
             heldRigidbody.MoveRotation(targetRot);
@@ -506,6 +687,12 @@ public class 传送枪 : UdonSharpBehaviour
             return;
         }
 
+        if (blockPortalShootingWhileGrabbingRigidbody && heldRigidbody != null)
+        {
+            // 单电子宇宙：同一时刻传送枪只做一件事。抓取状态下滚轮/扳机放门直接忽略，不播放失败音。
+            return;
+        }
+
         Transform portal = isPortalA ? portalA : portalB;
         if (portal == null) return;
         if (shootPoint == null) return;
@@ -523,50 +710,34 @@ public class 传送枪 : UdonSharpBehaviour
         // 绝不能把另一扇门也一起忽略——A、B 两扇门必须互相视为实体障碍物，
         // 否则瞄A门时激光会直接穿过B门命中B门背后的墙，导致"A把自己放到了B的位置上"这种
         // 两门重叠的bug（这是本轮修复的一个真实回归问题，改这段代码前一定要意识到这一点）。
-        // 用 RaycastAll 拿到射线路径上的全部命中，只过滤掉属于"自己"这条 Transform 链路下的
-        // 碰撞体，再从剩下的里面手动找最近的一个，等价于"这一扇门对射线不可见，但另一扇门可见"。
-        RaycastHit[] allHits = Physics.RaycastAll(rayOrigin, rayDirection, maxDistance, combinedLayers);
-        RaycastHit hit = default(RaycastHit);
-        bool foundHit = false;
-        float closestDistance = float.MaxValue;
-
-        for (int i = 0; i < allHits.Length; i++)
-        {
-            RaycastHit candidate = allHits[i];
-            if (candidate.collider == null) continue;
-
-            Transform hitTransform = candidate.collider.transform;
-            if (portal != null && (hitTransform == portal || hitTransform.IsChildOf(portal))) continue;
-
-            if (candidate.distance < closestDistance)
-            {
-                closestDistance = candidate.distance;
-                hit = candidate;
-                foundHit = true;
-            }
-        }
+        // 用 RaycastAll 拿到射线路径上的全部命中，过滤掉：
+        // 1) 属于"自己"这条 Transform 链路下的碰撞体；
+        // 2) 默认过滤所有 attachedRigidbody != null 的动态刚体/方块（Portal 原著手感：放门射线穿过方块，命中后方墙/地板）。
+        // 再从剩下的里面手动找最近的一个，等价于"这一扇门对射线不可见，刚体对放门射线不可见，但另一扇门可见"。
+        RaycastHit hit;
+        bool foundHit = FindNearestPlacementRayHit(rayOrigin, rayDirection, maxDistance, combinedLayers, portal, out hit);
 
         if (foundHit)
         {
             int hitLayer = hit.collider.gameObject.layer;
-            
+
             if (((1 << hitLayer) & blockedLayers) != 0)
             {
                 OnShootFailed(rayOrigin, hit.point);
                 return;
             }
-            
+
             VRCPlayerApi.TrackingData headData = localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
-            
+
             Vector3 portalPos = hit.point + hit.normal * wallOffset;
             Quaternion portalRot = Quaternion.LookRotation(hit.normal, Vector3.up);
-            
+
             if (Mathf.Abs(hit.normal.y) > 0.9f)
             {
                 Vector3 playerForward = headData.rotation * Vector3.forward;
                 playerForward.y = 0;
                 playerForward.Normalize();
-                
+
                 if (hit.normal.y > 0)
                 {
                     portalRot = Quaternion.LookRotation(hit.normal, playerForward);
@@ -576,7 +747,7 @@ public class 传送枪 : UdonSharpBehaviour
                     portalRot = Quaternion.LookRotation(hit.normal, -playerForward);
                 }
             }
-            
+
             bool appliedBHalfTurn = false;
             if (!isPortalA && applyBHalfTurnInGun)
             {
@@ -778,12 +949,13 @@ public class 传送枪 : UdonSharpBehaviour
                 Vector3 probeStart = cornerCenter + forward * placementProbeOutDistance;
 
                 RaycastHit cornerHit;
-                bool didHit = Physics.Raycast(
+                bool didHit = FindNearestPlacementRayHit(
                     probeStart,
                     -forward,
-                    out cornerHit,
                     maxRayDistance,
-                    placementLayers
+                    placementLayers,
+                    null,
+                    out cornerHit
                 );
 
                 if (!didHit)
@@ -942,6 +1114,7 @@ public class 传送枪 : UdonSharpBehaviour
         {
             Collider col = overlaps[i];
             if (col == null) continue;
+            if (ShouldIgnoreColliderForPortalPlacement(col)) continue;
 
             // 排除贴合用的墙面自己。
             if (wallCollider != null && col == wallCollider) continue;
@@ -1005,16 +1178,54 @@ public class 传送枪 : UdonSharpBehaviour
         return Mathf.Max(0, cooldownTimer);
     }
 
+    bool ShouldIgnoreColliderForPortalPlacement(Collider col)
+    {
+        if (!ignoreRigidbodyCollidersForPortalPlacement) return false;
+        if (col == null) return false;
+
+        // Portal 原著手感：方块/可动物体不参与“放门”射线和合法性检测。
+        // attachedRigidbody 比 GetComponentInParent 更稳，也能覆盖子碰撞体挂在刚体子物体上的情况。
+        Rigidbody rb = col.attachedRigidbody;
+        return rb != null;
+    }
+
+    bool FindNearestPlacementRayHit(Vector3 origin, Vector3 direction, float distance, LayerMask layerMask, Transform selfPortal, out RaycastHit hit)
+    {
+        RaycastHit[] allHits = Physics.RaycastAll(origin, direction, distance, layerMask);
+        hit = default(RaycastHit);
+        bool foundHit = false;
+        float closestDistance = float.MaxValue;
+
+        for (int i = 0; i < allHits.Length; i++)
+        {
+            RaycastHit candidate = allHits[i];
+            if (candidate.collider == null) continue;
+            if (ShouldIgnoreColliderForPortalPlacement(candidate.collider)) continue;
+
+            Transform hitTransform = candidate.collider.transform;
+            if (selfPortal != null && (hitTransform == selfPortal || hitTransform.IsChildOf(selfPortal))) continue;
+
+            if (candidate.distance < closestDistance)
+            {
+                closestDistance = candidate.distance;
+                hit = candidate;
+                foundHit = true;
+            }
+        }
+
+        return foundHit;
+    }
+
     public Collider GetMarkedColliderA()
     {
         return markedColliderA;
     }
-    
+
     public Collider GetMarkedColliderB()
     {
         return markedColliderB;
     }
-    
+
     public void SetMarkedColliderAEnabled(bool enabled)
     {
         if (markedColliderA != null)
@@ -1022,7 +1233,7 @@ public class 传送枪 : UdonSharpBehaviour
             markedColliderA.enabled = enabled;
         }
     }
-    
+
     public void SetMarkedColliderBEnabled(bool enabled)
     {
         if (markedColliderB != null)
