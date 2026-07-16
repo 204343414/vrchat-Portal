@@ -1,8 +1,6 @@
 using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
-using VRC.SDK3.Rendering;
-using System.Collections.Generic;
 
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class 双向传送门管理器 : UdonSharpBehaviour
@@ -12,6 +10,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // ============================================================
 
     [Header("════════════ 基础设置 ════════════")]
+    [Min(0.001f)]
     public float cameraNearClip = 0.01f;
 
     [Header("════════════ 传送门 A ════════════")]
@@ -60,14 +59,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("玩家进入传送门前后多远开始临时切换图层。实际判定深度 = noClipDepth + colliderDisableBuffer + 速度缓冲；想让切换更早/更晚，优先微调这个值。")]
     public float colliderDisableBuffer = 0.15f;
 
-    [Tooltip("玩家靠近传送门时，被传送枪标记的碰撞体所在物体将从此 Layer 临时切到 playerPassThroughLayer。默认 28。")]
-    public int solidCollisionLayer = 28;
+    [Tooltip("被传送枪标记的墙/地板/屏蔽碰撞体的原始实体层。当前推荐 17 = Walkthrough：挡刚体/物品，不挡玩家。")]
+    public int solidCollisionLayer = 17;
 
-    [Tooltip("玩家靠近传送门时临时切换到的 Layer。请在 Unity Collision Matrix 中配置为不与 Player 碰撞，但仍与物品/刚体碰撞。默认 25。")]
-    public int playerPassThroughLayer = 25;
+    [Tooltip("玩家靠近传送门时，墙/地板/屏蔽碰撞体临时切换到的 Layer。当前推荐同样用 17 = Walkthrough：挡刚体/物品，不挡玩家。")]
+    public int playerPassThroughLayer = 17;
 
-    [Tooltip("刚体进入传送门区域时切换至的 Layer（推荐 17 = Walkthrough）\n17层：玩家可穿透，但其他物体仍可碰撞。比13和5都更合适")]
-    public int rigidbodyPassThroughLayer = 17;
+    [Tooltip("刚体进入传送门区域时切换至的 Layer。当前实测推荐 14 = PickupNoEnvironment：不撞世界墙/地板，但会和 13(Pickup) 碰撞，适合让门边 Pipe 环挡住刚体。")]
+    public int rigidbodyPassThroughLayer = 14;
 
     [Tooltip("刚体离开传送门区域后是否自动还原原始 Layer")]
     public bool restoreRigidbodyLayerOnExit = true;
@@ -77,6 +76,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     public float maxRenderDistance = 50f;
     public float maxViewAngle = 100f;
     public int checkInterval = 2;
+
+    [Tooltip("强制关闭 A/B 传送门相机的 Occlusion Culling。传送门相机会穿墙渲染另一侧世界，Unity 遮挡剔除可能把门后/墙后的 clone 或刚体错误剔除。建议保持开启。")]
+    public bool disablePortalCameraOcclusionCulling = true;
 
     [Header("════════════ 调试 ════════════")]
     public bool showDebugGizmos = true;
@@ -90,10 +92,20 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Header("════════════ 刚体传送（Portal 原著复刻）════════════")]
     [Tooltip("是否启用刚体传送功能")]
     public bool enableRigidbodyTeleport = true;
-    [Tooltip("刚体检测周期（复用 checkInterval）")]
-    public float rbCheckIntervalMultiplier = 1f;
-    [Tooltip("刚体检测用的 OverlapBox 额外深度扩展（建议 0.5~1.0 防止高速物体漏检）")]
+    [Tooltip("刚体检测用的 OverlapBox 额外深度扩展（基础值）。实际追踪深度还会按刚体沿门法线速度动态扩大，以降低高速漏检。")]
     public float rbTriggerDepthExtension = 0.8f;
+    [Tooltip("是否按刚体沿门法线速度动态扩大追踪深度。不是直接传送，只是更早加入 Seb traveller 追踪，降低高速隧穿。")]
+    public bool enableRigidbodyDynamicTrackingDepth = true;
+    [Tooltip("动态追踪深度上限，防止极高速刚体把 OverlapBox 扩得过大造成性能/误触发问题。")]
+    public float rbMaxDynamicTrackingDepth = 8f;
+    [Tooltip("刚体传送时使用 crossingT 连续修正：回到穿越平面瞬间，再积分本帧剩余时间。用于减少地板双洞越飞越高。")]
+    public bool enableRigidbodyCrossingTimeCorrection = true;
+    [Tooltip("刚体 crossingT 修正的剩余时间估算方式：开启=按 当前离门平面距离/当前法线速度 反推，更适合刚体物理；关闭=按 crossingT * Time.deltaTime，较依赖渲染帧时间。")]
+    public bool useRigidbodyDistanceBasedPostCrossTime = true;
+    [Tooltip("距离/速度反推剩余时间时使用的最小法线速度，低于此值则回退到 crossingT*deltaTime，避免除零和低速抖动。")]
+    public float rbPostCrossNormalSpeedEpsilon = 0.05f;
+    [Tooltip("刚体 crossingT 修正的剩余时间上限，防止极端低速/异常位置反推出过大的 dt。")]
+    public float rbPostCrossMaxDt = 0.05f;
     [Tooltip("是否对抓取中的刚体也做传送（配合传送枪的 UpdateHeldAfterTeleport）")]
     public bool allowHeldRigidbodyTeleport = true;
 
@@ -161,8 +173,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [HideInInspector]
     public bool recursiveUseSebObliqueClip = true;
 
-    [Tooltip("Seb oblique 裁剪偏移。会取绝对值；建议 0.01~0.05。你的旧 clipPlaneOffset=-0.1 不会再反向污染递归裁剪。")]
-    [HideInInspector]
+    [Tooltip("Seb oblique 裁剪偏移。会取绝对值；建议 0.001~0.05。越小越贴门，越容易显示贴门刚体/clone，但更可能看到门背面/墙；越大越保守，可能加重缝隙。")]
     public float recursiveNearClipOffset = 0.02f;
 
     [Tooltip("离门太近时不用 oblique projection，避免抖动/反向裁切。")]
@@ -215,6 +226,20 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // 新增：过渡系统（极简）
     // ============================================================
 
+    [Header("════════════ 玩家出门音效 ════════════")]
+    [Tooltip("玩家每次从传送门出口出来时播放一次的音源。建议放一个独立 3D AudioSource，不要挂在 A/B 门父物体上。")]
+    public AudioSource playerPortalExitAudioSource;
+
+    [Tooltip("玩家出门音效数组。每次玩家传送成功后随机播放一个。")]
+    public AudioClip[] playerPortalExitSounds;
+
+    [Tooltip("玩家出门音效音量。")]
+    [Range(0f, 1f)]
+    public float playerPortalExitSoundVolume = 1f;
+
+    [Tooltip("播放玩家出门音效前，是否把音源移动到出口门位置。默认关闭：避免用户误把 A/B 门本体或父物体上的 AudioSource 拖进来，导致每次传送时移动传送门。若要 3D 出口音效，请使用独立 AudioSource 物体再开启。")]
+    public bool movePlayerExitAudioSourceToExitPortal = false;
+
     [Header("════════════ 过渡系统（新版） ════════════")]
     [Tooltip("过渡 Cube。子集包含过渡相机。传送时显示并控制旋转，过渡完成后关闭。")]
     public GameObject portalViewTransitionCube;
@@ -226,7 +251,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     [Header("════════════ 配置快照导出 ════════════")]
     [Tooltip("开局时（Start）把当前 Inspector 关键配置 + 传送门A/B父物体下所有子物体的 Collider/Renderer/Mesh/Camera/Light/AudioSource/Rigidbody 信息打印到控制台。\n用途：把这份文本复制给别人分析场景结构、排查性能问题，不用截图/不用一个个字段抄。\n只在 Start 执行一次，不影响运行时性能。")]
-    public bool dumpConfigSnapshotOnStart = true;
+    public bool dumpConfigSnapshotOnStart = false;
 
     [Header("════════════ 同Collider专修/调试 ════════════")]
     [Tooltip("总日志开关。关闭后本脚本不输出传送门日志。")]
@@ -249,10 +274,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("VRC 玩家默认胶囊高度，仅用于调试参考，默认 1.6")]
     [HideInInspector]
     public float playerCapsuleHeight = 1.6f;
-
-    [Tooltip("判断玩家在传送门哪一侧时的死区，防止接近 0 时抖动")]
-    [HideInInspector]
-    public float portalSideEpsilon = 0.02f;
 
     [Tooltip("传送后屏蔽几帧传送检测，防止同帧/连续帧误触发")]
     [HideInInspector]
@@ -295,12 +316,24 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [HideInInspector]
     public bool useVRCTrackingRootTeleport = true;
 
-    // 刚体追踪 - 100% Udon 兼容（固定数组 + 计数器，避免 List.Add / Dictionary）
+    // 刚体 traveller 追踪 - SebLague Portal.HandleTravellers 的 Udon 固定数组版。
+    // 不能使用 List/Dictionary；A/B 两扇门各维护一组 trackedTravellers，等价于 Seb 原版每个 Portal 自己的 trackedTravellers。
     private const int MAX_TRACKED_RBS = 32;
-    private Rigidbody[] trackedRigidbodies = new Rigidbody[MAX_TRACKED_RBS];
-    private Vector3[] rbPrevPosList = new Vector3[MAX_TRACKED_RBS];
-    private int[] rbOriginalLayerList = new int[MAX_TRACKED_RBS];
-    private int trackedRBCount = 0;
+    private Rigidbody[] trackedRigidbodiesA = new Rigidbody[MAX_TRACKED_RBS];
+    private Rigidbody[] trackedRigidbodiesB = new Rigidbody[MAX_TRACKED_RBS];
+    private Vector3[] rbPreviousOffsetFromPortalA = new Vector3[MAX_TRACKED_RBS];
+    private Vector3[] rbPreviousOffsetFromPortalB = new Vector3[MAX_TRACKED_RBS];
+    private int[] rbOriginalLayerA = new int[MAX_TRACKED_RBS];
+    private int[] rbOriginalLayerB = new int[MAX_TRACKED_RBS];
+    // 记录刚体最近一次明确处于传送门哪一侧。解决低速/贴门时首次追踪点已经在 z≈0 死区内，导致 previous/current 都无法可靠换边的问题。
+    private int[] rbLastPortalSideA = new int[MAX_TRACKED_RBS];
+    private int[] rbLastPortalSideB = new int[MAX_TRACKED_RBS];
+    private int trackedRBCountA = 0;
+    private int trackedRBCountB = 0;
+
+    // 刚体检测 OverlapBox NonAlloc 缓冲。A/B 门顺序处理，共用一个缓冲即可，避免每帧分配 Collider[]。
+    private const int MAX_RB_OVERLAP_COLLIDERS = 128;
+    private Collider[] rbOverlapBuffer = new Collider[MAX_RB_OVERLAP_COLLIDERS];
 
     [Tooltip("传送空间变换忽略 Transform 缩放，避免门/父物体 scale 影响传送位置")]
     [HideInInspector]
@@ -415,12 +448,18 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     {
         localPlayer = Networking.LocalPlayer;
 
-        // 兼容旧场景序列化：Unity 已挂到场景里的 UdonBehaviour 不会因为脚本默认值从 29 改到 25 就自动刷新。
-        // 如果 Inspector 里还保留旧值 29，这里运行时强制迁移到用户实测可用的 25。
-        if (playerPassThroughLayer == 29)
+        if (cameraNearClip < 0.001f)
         {
-            playerPassThroughLayer = 25;
-            TPLog("[启动] 检测到旧穿透层29，已自动改为25。若仍看到29，请检查场景中是否有旧脚本/旧Prefab未更新。");
+            cameraNearClip = 0.001f;
+            TPLog("[启动] cameraNearClip 不能为0或负数，已自动钳制到0.001。门后墙/缝隙请优先调 recursiveDynamicNearClipPadding / recursiveNearClipOffset。 ");
+        }
+
+        // 兼容旧场景序列化：Unity 已挂到场景里的 UdonBehaviour 不会因为脚本默认值变化就自动刷新。
+        // 当前方案：墙/地板/屏蔽碰撞体进入门区域时用 17(Walkthrough)，挡刚体/物品但不挡玩家。
+        if (playerPassThroughLayer == 29 || playerPassThroughLayer == 25)
+        {
+            playerPassThroughLayer = 17;
+            TPLog("[启动] 检测到旧玩家穿透层，已自动改为17(Walkthrough)。若 Inspector 仍显示旧值，请检查旧脚本/旧Prefab序列化值。");
         }
 
         // 新版坐标约定：传送枪不再把B门本体翻180度，经典半转必须放在门到门映射里。
@@ -437,8 +476,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             teleportTriggerOffset = noClipDepth;
         }
 
-        if (cameraA != null) cameraA.nearClipPlane = cameraNearClip;
-        if (cameraB != null) cameraB.nearClipPlane = cameraNearClip;
+        if (cameraA != null) cameraA.nearClipPlane = SafeCameraNearClip();
+        if (cameraB != null) cameraB.nearClipPlane = SafeCameraNearClip();
+        ApplyPortalCameraOcclusionSettings();
 
         recursivePositionsA = new Vector3[8];
         recursivePositionsB = new Vector3[8];
@@ -622,13 +662,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (cameraA != null)
         {
             cameraA.fieldOfView = syncFOV;
-            cameraA.nearClipPlane = cameraNearClip;
+            cameraA.nearClipPlane = SafeCameraNearClip();
         }
         if (cameraB != null)
         {
             cameraB.fieldOfView = syncFOV;
-            cameraB.nearClipPlane = cameraNearClip;
+            cameraB.nearClipPlane = SafeCameraNearClip();
         }
+        ApplyPortalCameraOcclusionSettings();
 
         if (portalMatA != null) portalMatA.SetFloat("_FOV", syncFOV);
         if (portalMatB != null) portalMatB.SetFloat("_FOV", syncFOV);
@@ -912,6 +953,35 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Debug.Log("[传送门] 帧=" + Time.frameCount + " " + msg);
     }
 
+    float SafeCameraNearClip()
+    {
+        // Unity Camera nearClipPlane 不能可靠使用 0。用户 Inspector 里可以保留 0 配置，运行时统一兜底到极小正值。
+        return Mathf.Max(cameraNearClip, 0.001f);
+    }
+
+    void ApplyPortalCameraOcclusionSettings()
+    {
+        if (!disablePortalCameraOcclusionCulling) return;
+        if (cameraA != null) cameraA.useOcclusionCulling = false;
+        if (cameraB != null) cameraB.useOcclusionCulling = false;
+    }
+
+    void PlayPlayerPortalExitSound(Transform exitPortal)
+    {
+        if (playerPortalExitAudioSource == null) return;
+        if (playerPortalExitSounds == null || playerPortalExitSounds.Length == 0) return;
+
+        int index = Random.Range(0, playerPortalExitSounds.Length);
+        AudioClip clip = playerPortalExitSounds[index];
+        if (clip == null) return;
+
+        if (movePlayerExitAudioSourceToExitPortal && exitPortal != null)
+        {
+            playerPortalExitAudioSource.transform.position = exitPortal.position;
+        }
+        playerPortalExitAudioSource.PlayOneShot(clip, playerPortalExitSoundVolume);
+    }
+
     // ============================================================
     // 配置快照导出：把当前 Inspector 关键配置 + A/B 门下所有子物体信息打印到控制台。
     // 只在 Start() 里按 dumpConfigSnapshotOnStart 开关跑一次，不影响运行时（LateUpdate）性能。
@@ -942,7 +1012,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Debug.Log("[配置快照][全局] cameraNearClip=" + cameraNearClip);
         Debug.Log("[配置快照][门厚度/形状] noClipDepth=" + noClipDepth + " portalTriggerWidth=" + portalTriggerWidth + " portalTriggerHeight=" + portalTriggerHeight + " clipPlaneOffset=" + clipPlaneOffset);
         Debug.Log("[配置快照][门厚度/形状] portalShapeA原始=" + portalShapeA + " portalShapeB原始=" + portalShapeB + " useCircularPortalCheck(旧开关)=" + useCircularPortalCheck);
-        Debug.Log("[配置快照][碰撞控制] colliderDisableBuffer=" + colliderDisableBuffer + " solidCollisionLayer=" + solidCollisionLayer + " playerPassThroughLayer=" + playerPassThroughLayer);
+        Debug.Log("[配置快照][碰撞控制] colliderDisableBuffer=" + colliderDisableBuffer + " solidCollisionLayer=" + solidCollisionLayer + " playerPassThroughLayer=" + playerPassThroughLayer + " rigidbodyPassThroughLayer=" + rigidbodyPassThroughLayer);
         Debug.Log("[配置快照][性能优化] enableVisibilityOptimization=" + enableVisibilityOptimization + " maxRenderDistance=" + maxRenderDistance + " maxViewAngle=" + maxViewAngle + " checkInterval=" + checkInterval);
         Debug.Log("[配置快照][Seb递归渲染] enableSebRecursiveRendering=" + enableSebRecursiveRendering + " recursiveRenderLimit=" + recursiveRenderLimit + " recursiveEarlyStop=" + recursiveEarlyStop + " recursiveMaxDistance=" + recursiveMaxDistance + " recursiveMaxViewAngle=" + recursiveMaxViewAngle + " recursiveForceClearSkybox=" + recursiveForceClearSkybox);
         Debug.Log("[配置快照][传送触发] teleportTriggerOffset=" + teleportTriggerOffset + " useRootAsTraveller=" + useRootAsTraveller + " useHybridRootXYHeadZTraveller=" + useHybridRootXYHeadZTraveller + " useClassicHalfTurn=" + useClassicHalfTurn + " enableExitSideCorrection=" + enableExitSideCorrection);
@@ -1023,7 +1093,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         int totalRigidbodies = 0;
         int totalCameras = 0;
         long totalVerts = 0;
-        long totalTris = 0;
+        // 只统计顶点数，不读取 mesh.triangles。
+        // 原因：VRChat/Udon 运行时访问未开启 Read/Write 的 Mesh.triangles 会报错；配置快照不应要求所有资源可读。
+        long totalMeshObjects = 0;
 
         Debug.Log("[配置快照][门" + label + "] ---- 子物体清单开始（共 " + totalTransforms + " 个，含自身）----");
 
@@ -1070,20 +1142,18 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (mf != null && mf.sharedMesh != null)
             {
                 int vc = mf.sharedMesh.vertexCount;
-                int tc = mf.sharedMesh.triangles.Length / 3;
                 totalVerts += vc;
-                totalTris += tc;
-                line += " | Mesh(顶点=" + vc + ",三角面=" + tc + ")";
+                totalMeshObjects++;
+                line += " | Mesh(顶点=" + vc + ",三角面=跳过读取)";
             }
 
             SkinnedMeshRenderer smr = go.GetComponent<SkinnedMeshRenderer>();
             if (smr != null && smr.sharedMesh != null)
             {
                 int vc = smr.sharedMesh.vertexCount;
-                int tc = smr.sharedMesh.triangles.Length / 3;
                 totalVerts += vc;
-                totalTris += tc;
-                line += " | SkinnedMesh(顶点=" + vc + ",三角面=" + tc + ")";
+                totalMeshObjects++;
+                line += " | SkinnedMesh(顶点=" + vc + ",三角面=跳过读取)";
             }
 
             Light light = go.GetComponent<Light>();
@@ -1121,7 +1191,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             "[配置快照][门" + label + "] ---- 子物体清单结束：共 " + totalTransforms + " 个物体 | " +
             "Renderer=" + totalRenderers + " Collider=" + totalColliders + " Light=" + totalLights +
             " AudioSource=" + totalAudioSources + " Rigidbody=" + totalRigidbodies + " Camera=" + totalCameras +
-            " | 总顶点≈" + totalVerts + " 总三角面≈" + totalTris + " ----"
+            " | Mesh对象=" + totalMeshObjects + " 总顶点≈" + totalVerts + " 总三角面=跳过读取 ----"
         );
     }
 
@@ -1977,6 +2047,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             newPlayerRot,
             VRC.SDKBase.VRC_SceneDescriptor.SpawnOrientation.AlignPlayerWithSpawnPoint
         );
+        if (portalGun != null) portalGun.HandlePlayerTeleportedThroughPortal(fromPlane, toPlane, useClassicHalfTurn);
+        PlayPlayerPortalExitSound(toPlane);
         localPlayer.SetVelocity(newVel);
         // PATCH: 延迟速度重发，防止 IsGrounded 吃速度
         pendingVelocity = newVel;
@@ -2210,7 +2282,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (limit == 0) return 0;
 
         portalCam.fieldOfView = syncFOV;
-        portalCam.nearClipPlane = cameraNearClip;
+        portalCam.nearClipPlane = SafeCameraNearClip();
         portalCam.ResetProjectionMatrix();
         if (recursiveForceManualCamerasDisabled) portalCam.enabled = false;
 
@@ -2344,7 +2416,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (thisScreen != null) thisScreen.enabled = oldThisScreenEnabled;
         if (linkedScreen != null) linkedScreen.enabled = oldLinkedScreenEnabled;
         portalCam.clearFlags = oldClearFlags;
-        portalCam.nearClipPlane = cameraNearClip;
+        portalCam.nearClipPlane = SafeCameraNearClip();
         portalCam.ResetProjectionMatrix();
 
         return count;
@@ -2356,7 +2428,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         if (!recursiveSyncNearClipToPortalPlane || clipPlane == null)
         {
-            cam.nearClipPlane = cameraNearClip;
+            cam.nearClipPlane = SafeCameraNearClip();
             cam.ResetProjectionMatrix();
             return;
         }
@@ -2366,12 +2438,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 再叠加 oblique clip，把真正裁剪面贴到 portal plane。
         // 这能修复 VRChat/透明门面/递归 RT 下第一层 near 仍停在 0.01 导致看到门背面或下一层画面的情况。
         float forwardDst = Vector3.Dot(clipPlane.position - cam.transform.position, cam.transform.forward);
-        float newNear = cameraNearClip;
+        float safeNear = SafeCameraNearClip();
+        float newNear = safeNear;
 
-        if (forwardDst > cameraNearClip)
+        if (forwardDst > safeNear)
         {
             newNear = forwardDst + Mathf.Abs(recursiveDynamicNearClipPadding);
-            if (newNear < cameraNearClip) newNear = cameraNearClip;
+            if (newNear < safeNear) newNear = safeNear;
             if (newNear > recursiveDynamicNearClipMax) newNear = recursiveDynamicNearClipMax;
         }
 
@@ -2742,16 +2815,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     }
 
     // ============================================================
-    // 刚体传送核心（复用玩家逻辑 + shape 支持 + Layer 切换 + 抓取支持）
+    // 刚体传送核心：SebLague traveller 逻辑的 Udon 固定数组版
     // ============================================================
 
     private void ProcessRigidbodyTravellers()
     {
         if (portalPlaneA == null || portalPlaneB == null) return;
 
-        // A门检测
+        // 等价于 Seb 原版每个 Portal 在 LateUpdate 里 HandleTravellers。
         ProcessRigidbodyForPortal(true);
-        // B门检测
         ProcessRigidbodyForPortal(false);
     }
 
@@ -2759,232 +2831,507 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     {
         Transform thisPlane = isPortalA ? portalPlaneA : portalPlaneB;
         Transform otherPlane = isPortalA ? portalPlaneB : portalPlaneA;
-        Transform thisParent = isPortalA ? portalParentA : portalParentB;
-        Transform otherParent = isPortalA ? portalParentB : portalParentA;
         int thisShape = ResolvePortalShape(isPortalA);
 
         if (thisPlane == null || otherPlane == null) return;
 
+        Rigidbody[] trackers = isPortalA ? trackedRigidbodiesA : trackedRigidbodiesB;
+        Vector3[] previousOffsets = isPortalA ? rbPreviousOffsetFromPortalA : rbPreviousOffsetFromPortalB;
+        int[] originalLayers = isPortalA ? rbOriginalLayerA : rbOriginalLayerB;
+        int[] lastSides = isPortalA ? rbLastPortalSideA : rbLastPortalSideB;
+        int count = isPortalA ? trackedRBCountA : trackedRBCountB;
+
         float hx = portalTriggerWidth * 0.5f;
         float hy = portalTriggerHeight * 0.5f;
-        float depth = noClipDepth + rbTriggerDepthExtension;
+        float baseThresholdDepth = noClipDepth + rbTriggerDepthExtension;
+        if (baseThresholdDepth < 0.01f) baseThresholdDepth = 0.01f;
 
-        Vector3 center = thisPlane.position;
-        Vector3 halfExtents = new Vector3(hx, hy, depth * 0.5f);
-        Quaternion orient = thisPlane.rotation;
-
-        Collider[] cols = Physics.OverlapBox(center, halfExtents, orient, ~0, QueryTriggerInteraction.Collide);
-
-        foreach (Collider col in cols)
+        // 查询体积可以比基础阈值大：目的是让高速刚体“有机会被加入追踪”。
+        // 是否真正加入追踪，下面还会按该刚体自己的法线速度算 rbThresholdDepth。
+        float queryDepth = baseThresholdDepth;
+        if (enableRigidbodyDynamicTrackingDepth)
         {
-            if (col == null) continue;
-            Rigidbody rb = col.attachedRigidbody;
-            if (rb == null || rb.isKinematic) continue;
-
-            // 过滤自己抓取的刚体（如果不允许持物传送则跳过）
-            if (!allowHeldRigidbodyTeleport && portalGun != null && portalGun.GetHeldRigidbody() == rb)
-                continue;
-
-            Vector3 localPos = thisPlane.InverseTransformPoint(rb.position);
-            bool inPortalRect = LocalPointInPortalRect(localPos, thisShape);
-            bool inDepth = Mathf.Abs(localPos.z) < (noClipDepth + rbTriggerDepthExtension);
-
-            // 只要刚体在门框范围内，就强制切换到 rigidbodyPassThroughLayer（13）
-            if (inPortalRect && inDepth)
-            {
-                // 记录原始图层（只记录一次）
-                bool alreadyTracked = false;
-                for (int k = 0; k < trackedRBCount; k++)
-                {
-                    if (trackedRigidbodies[k] == rb)
-                    {
-                        alreadyTracked = true;
-                        break;
-                    }
-                }
-
-                if (!alreadyTracked && trackedRBCount < MAX_TRACKED_RBS)
-                {
-                    trackedRigidbodies[trackedRBCount] = rb;
-                    rbPrevPosList[trackedRBCount] = rb.position;
-                    rbOriginalLayerList[trackedRBCount] = rb.gameObject.layer;
-                    trackedRBCount++;
-                }
-
-                if (rb.gameObject.layer != rigidbodyPassThroughLayer)
-                {
-                    rb.gameObject.layer = rigidbodyPassThroughLayer;
-                }
-            }
-
-            // 【新增】持续检测：只要刚体中心在门框内，就尝试触发传送（解决中心接触不触发的问题）
-            if (inPortalRect && inDepth)
-            {
-                // 直接执行传送（不依赖穿越检测）
-                TeleportRigidbody(rb, thisPlane, otherPlane, thisParent, otherParent, isPortalA, -1);
-                continue;
-            }
-
-            if (!inPortalRect) continue;
-
-            // 穿越检测 - 100% Udon 兼容（固定数组 + 计数器）
-            int trackedIndex = -1;
-            for (int i = 0; i < trackedRBCount; i++)
-            {
-                if (trackedRigidbodies[i] == rb)
-                {
-                    trackedIndex = i;
-                    break;
-                }
-            }
-
-            if (trackedIndex == -1)
-            {
-                // 首次见到这个刚体，记录位置（数组版）
-                if (trackedRBCount < MAX_TRACKED_RBS)
-                {
-                    trackedRigidbodies[trackedRBCount] = rb;
-                    rbPrevPosList[trackedRBCount] = rb.position;
-                    rbOriginalLayerList[trackedRBCount] = rb.gameObject.layer;
-                    trackedRBCount++;
-                }
-                continue;
-            }
-
-            Vector3 prevPos = rbPrevPosList[trackedIndex];
-
-            Vector3 localPrev = thisPlane.InverseTransformPoint(prevPos);
-            float prevZ = localPrev.z;
-            float currZ = localPos.z;
-
-            bool crossed = (prevZ > 0 && currZ <= 0) || (prevZ < 0 && currZ >= 0);
-            if (!crossed || !LocalPointInPortalRect(localPos, thisShape)) continue;
-
-            // 执行传送
-            TeleportRigidbody(rb, thisPlane, otherPlane, thisParent, otherParent, isPortalA, trackedIndex);
-
-            // 更新 prev
-            rbPrevPosList[trackedIndex] = rb.position;
+            queryDepth = Mathf.Max(baseThresholdDepth, rbMaxDynamicTrackingDepth);
         }
 
-        // 清理已销毁/无效的刚体 + 还原离开区域的刚体图层
-        for (int i = trackedRBCount - 1; i >= 0; i--)
+        // 1) OnTravellerEnterPortal 替代：用 OverlapBox 找到进入门阈值体积的刚体，并加入本门追踪。
+        // 注意：这里只“加入追踪”，绝不因为进入体积就直接传送；真正传送必须等下面的平面穿越判断。
+        int overlapCount = Physics.OverlapBoxNonAlloc(
+            thisPlane.position,
+            new Vector3(hx, hy, queryDepth),
+            rbOverlapBuffer,
+            thisPlane.rotation,
+            ~0,
+            QueryTriggerInteraction.Collide
+        );
+
+        for (int c = 0; c < overlapCount; c++)
         {
-            Rigidbody rb = trackedRigidbodies[i];
+            Collider col = rbOverlapBuffer[c];
+            if (col == null) continue;
+
+            Rigidbody rb = col.attachedRigidbody;
+            if (rb == null) continue;
+
+            bool heldByGun = portalGun != null && portalGun.GetHeldRigidbody() == rb;
+            if (rb.isKinematic && !heldByGun) continue;
+            if (heldByGun && !allowHeldRigidbodyTeleport) continue;
+
+            Vector3 rbWorldPos = GetRigidbodyTravellerPosition(rb, heldByGun);
+            Vector3 localPos = LocalPointForPortal(thisPlane, rbWorldPos);
+            if (!LocalPointInPortalRect(localPos, thisShape)) continue;
+
+            float rbThresholdDepth = baseThresholdDepth;
+            if (enableRigidbodyDynamicTrackingDepth)
+            {
+                float normalSpeed = Mathf.Abs(Vector3.Dot(GetRigidbodyTravellerVelocity(rb, heldByGun), thisPlane.forward));
+                rbThresholdDepth += normalSpeed * Time.deltaTime * 2f;
+                float maxDepth = Mathf.Max(baseThresholdDepth, rbMaxDynamicTrackingDepth);
+                if (rbThresholdDepth > maxDepth) rbThresholdDepth = maxDepth;
+            }
+            if (Mathf.Abs(localPos.z) > rbThresholdDepth) continue;
+
+            int originalLayer = FindTrackedRigidbodyOriginalLayer(rb);
+            if (originalLayer < 0) originalLayer = rb.gameObject.layer;
+
+            Vector3 rbOffsetFromPortal = rbWorldPos - thisPlane.position;
+            int initialSide = RBSideFromSignedDistance(Vector3.Dot(rbOffsetFromPortal, thisPlane.forward));
+            if (initialSide == 0)
+            {
+                // 如果首次加入追踪时已经贴在门平面死区内，用法线速度推断“来自哪一侧”。
+                // 速度朝 -forward：从 +侧进入；速度朝 +forward：从 -侧进入。
+                float normalSpeed = Vector3.Dot(GetRigidbodyTravellerVelocity(rb, heldByGun), thisPlane.forward);
+                if (normalSpeed < -rbPostCrossNormalSpeedEpsilon) initialSide = 1;
+                else if (normalSpeed > rbPostCrossNormalSpeedEpsilon) initialSide = -1;
+            }
+
+            count = AddRigidbodyTrackerToArrays(
+                rb,
+                rbOffsetFromPortal,
+                originalLayer,
+                initialSide,
+                trackers,
+                previousOffsets,
+                originalLayers,
+                lastSides,
+                count,
+                false
+            );
+
+            if (rb.gameObject.layer != rigidbodyPassThroughLayer)
+            {
+                rb.gameObject.layer = rigidbodyPassThroughLayer;
+            }
+        }
+
+        // 2) Seb HandleTravellers：对本门 trackedTravellers 做“上一帧 offset”和“当前 offset”的侧面比较。
+        int i = 0;
+        while (i < count)
+        {
+            Rigidbody rb = trackers[i];
             if (rb == null)
             {
-                // 数组压缩
-                for (int j = i; j < trackedRBCount - 1; j++)
-                {
-                    trackedRigidbodies[j] = trackedRigidbodies[j + 1];
-                    rbPrevPosList[j] = rbPrevPosList[j + 1];
-                    rbOriginalLayerList[j] = rbOriginalLayerList[j + 1];
-                }
-                trackedRigidbodies[trackedRBCount - 1] = null;
-                trackedRBCount--;
+                count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
                 continue;
             }
 
-            // 检查该刚体是否已经离开门区域
-            Vector3 localPos = thisPlane.InverseTransformPoint(rb.position);
-            bool stillInRect = LocalPointInPortalRect(localPos, thisShape);
-            bool stillInDepth = Mathf.Abs(localPos.z) < (noClipDepth + rbTriggerDepthExtension);
-
-            if (!stillInRect || !stillInDepth)
+            bool heldByGun = portalGun != null && portalGun.GetHeldRigidbody() == rb;
+            if (rb.isKinematic && !heldByGun)
             {
-                // 离开区域 → 还原图层（更可靠版本）
-                if (restoreRigidbodyLayerOnExit && i < trackedRBCount)
+                RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                continue;
+            }
+            if (heldByGun && !allowHeldRigidbodyTeleport)
+            {
+                RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                continue;
+            }
+
+            Vector3 rbWorldPos = GetRigidbodyTravellerPosition(rb, heldByGun);
+            Vector3 currentOffset = rbWorldPos - thisPlane.position;
+            Vector3 previousOffset = previousOffsets[i];
+
+            float previousDot = Vector3.Dot(previousOffset, thisPlane.forward);
+            float currentDot = Vector3.Dot(currentOffset, thisPlane.forward);
+
+            int previousSide = lastSides[i];
+            if (previousSide == 0) previousSide = RBSideFromSignedDistance(previousDot);
+            int currentSide = RBSideFromSignedDistance(currentDot);
+
+            bool crossedPortalPlane = false;
+            if (previousSide != 0 && currentSide != 0 && previousSide != currentSide)
+            {
+                crossedPortalPlane = true;
+            }
+            else
+            {
+                // 兜底：上一帧/首次追踪点贴在 z≈0 死区内，但本帧已经明确到了另一侧。
+                // 这正是低速穿越时“没有触发然后掉虚空”的常见路径。
+                if (previousSide != 0 && currentSide == -previousSide)
                 {
-                    int originalLayer = rbOriginalLayerList[i];
-                    if (originalLayer >= 0 && rb.gameObject.layer == rigidbodyPassThroughLayer)
-                    {
-                        rb.gameObject.layer = originalLayer;
-                    }
+                    crossedPortalPlane = true;
+                }
+            }
+
+            bool crossedInsidePortal = false;
+            Vector3 crossingWorldPosForTeleport = rbWorldPos;
+            float crossingT = 1f;
+            if (crossedPortalPlane)
+            {
+                Vector3 previousWorldPos = thisPlane.position + previousOffset;
+                float denom = previousDot - currentDot;
+                if (Mathf.Abs(denom) > 0.0001f)
+                {
+                    crossingT = Mathf.Clamp01(previousDot / denom);
                 }
 
-                // 从追踪列表中移除
-                for (int j = i; j < trackedRBCount - 1; j++)
-                {
-                    trackedRigidbodies[j] = trackedRigidbodies[j + 1];
-                    rbPrevPosList[j] = rbPrevPosList[j + 1];
-                    rbOriginalLayerList[j] = rbOriginalLayerList[j + 1];
-                }
-                trackedRigidbodies[trackedRBCount - 1] = null;
-                trackedRBCount--;
+                crossingWorldPosForTeleport = Vector3.Lerp(previousWorldPos, rbWorldPos, crossingT);
+                Vector3 crossingLocal = LocalPointForPortal(thisPlane, crossingWorldPosForTeleport);
+                crossedInsidePortal = LocalPointInPortalRect(crossingLocal, thisShape);
             }
+
+            if (crossedInsidePortal)
+            {
+                int originalLayer = originalLayers[i];
+
+                // Seb 原版：traveller.Teleport(from, to, m.GetColumn(3), m.rotation)
+                // 然后 linkedPortal.OnTravellerEnterPortal(traveller)，并从当前 portal.trackedTravellers 移除。
+                TeleportRigidbodySebStyle(rb, thisPlane, otherPlane, isPortalA, crossingWorldPosForTeleport, crossingT, heldByGun);
+
+                AddRigidbodyTracker(!isPortalA, rb, GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, originalLayer, RBSideFromSignedDistance(Vector3.Dot(GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, otherPlane.forward)));
+                count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                continue;
+            }
+
+            Vector3 currentLocal = LocalPointForPortal(thisPlane, rbWorldPos);
+            bool stillInsideThreshold = LocalPointInPortalRect(currentLocal, thisShape) && Mathf.Abs(currentLocal.z) <= baseThresholdDepth;
+            if (!stillInsideThreshold)
+            {
+                // Seb OnTriggerExit 替代：离开门阈值后移除 traveller；若另一扇门没接管，再还原图层。
+                RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                continue;
+            }
+
+            // Seb 原版未穿越时：traveller.previousOffsetFromPortal = offsetFromPortal。
+            previousOffsets[i] = currentOffset;
+            if (currentSide != 0) lastSides[i] = currentSide;
+            i++;
         }
+
+        if (isPortalA) trackedRBCountA = count;
+        else trackedRBCountB = count;
     }
 
-    private void TeleportRigidbody(Rigidbody rb, Transform fromPlane, Transform toPlane, Transform fromParent, Transform toParent, bool fromAtoB, int trackedIndex = -1)
+    public bool TryMapRayThroughPortal(Vector3 rayOrigin, Vector3 rayDirection, float maxDistance, out Vector3 mappedOrigin, out Vector3 mappedDirection, out float remainingDistance, out Transform fromPortal, out Transform toPortal)
     {
-        if (rb == null) return;
+        mappedOrigin = Vector3.zero;
+        mappedDirection = Vector3.forward;
+        remainingDistance = 0f;
+        fromPortal = null;
+        toPortal = null;
 
-        // 复用玩家映射逻辑
-        Vector3 localPos = fromPlane.InverseTransformPoint(rb.position);
-        Quaternion localRot = Quaternion.Inverse(fromPlane.rotation) * rb.rotation;
+        if (portalPlaneA == null || portalPlaneB == null) return false;
+        if (rayDirection.sqrMagnitude < 0.0001f) return false;
+        rayDirection.Normalize();
 
-        // 经典半转
-        if (useClassicHalfTurn)
+        float bestT = maxDistance + 1f;
+        bool found = false;
+        Transform bestFrom = null;
+        Transform bestTo = null;
+        Vector3 bestHit = Vector3.zero;
+
+        float tA;
+        Vector3 hitA;
+        if (TryRayPortalIntersection(rayOrigin, rayDirection, maxDistance, portalPlaneA, ResolvePortalShape(true), out tA, out hitA))
         {
-            localRot = LocalHalfTurn(localRot);
-            localPos = LocalHalfTurn(localPos);
-        }
-
-        Vector3 worldPos = toPlane.TransformPoint(localPos);
-        Quaternion worldRot = toPlane.rotation * localRot;
-
-        // ============================================================
-        // 刚体物理映射（参考 SebLague Portals 实现）
-        // ============================================================
-
-        // 1. 线性速度映射
-        Vector3 localVel = fromPlane.InverseTransformDirection(rb.velocity);
-        if (useClassicHalfTurn) localVel = LocalHalfTurn(localVel);
-        Vector3 newVel = toPlane.TransformDirection(localVel);
-
-        // 2. 角速度映射（关键！让翻滚的物体自然）
-        Vector3 localAngularVel = fromPlane.InverseTransformDirection(rb.angularVelocity);
-        if (useClassicHalfTurn) localAngularVel = LocalHalfTurn(localAngularVel);
-        Vector3 newAngularVel = toPlane.TransformDirection(localAngularVel);
-
-        // 3. 出口侧保险（加强版，防止掉虚空）
-        if (enableExitSideCorrection)
-        {
-            Vector3 localAfter = toPlane.InverseTransformPoint(worldPos);
-            float minDist = Mathf.Max(exitSideMinDistance, 0.12f);
-            int desiredSide = 1;
-            float desiredZ = desiredSide * minDist;
-
-            if (Mathf.Abs(localAfter.z) < minDist || (localAfter.z * desiredSide < 0))
+            if (tA < bestT)
             {
-                Vector3 fix = toPlane.forward * (desiredZ - localAfter.z);
-                worldPos += fix;
+                bestT = tA;
+                bestHit = hitA;
+                bestFrom = portalPlaneA;
+                bestTo = portalPlaneB;
+                found = true;
             }
         }
 
-        // Layer 切换（进入穿透层）
-        int origLayer = rb.gameObject.layer;
-        if (trackedIndex >= 0 && trackedIndex < trackedRBCount)
+        float tB;
+        Vector3 hitB;
+        if (TryRayPortalIntersection(rayOrigin, rayDirection, maxDistance, portalPlaneB, ResolvePortalShape(false), out tB, out hitB))
         {
-            rbOriginalLayerList[trackedIndex] = origLayer;
+            if (tB < bestT)
+            {
+                bestT = tB;
+                bestHit = hitB;
+                bestFrom = portalPlaneB;
+                bestTo = portalPlaneA;
+                found = true;
+            }
         }
+
+        if (!found) return false;
+
+        Vector3 localPoint = LocalPointForPortal(bestFrom, bestHit);
+        Vector3 localDir = LocalDirForPortal(bestFrom, rayDirection);
+        if (useClassicHalfTurn)
+        {
+            Quaternion halfTurn = LocalHalfTurn();
+            localPoint = halfTurn * localPoint;
+            localDir = halfTurn * localDir;
+        }
+
+        mappedDirection = WorldDirFromPortal(bestTo, localDir);
+        if (mappedDirection.sqrMagnitude < 0.0001f) return false;
+        mappedDirection.Normalize();
+
+        // 稍微推出出口门面，避免第二段 Raycast 立刻打回门面/边框自己。
+        mappedOrigin = WorldPointFromPortal(bestTo, localPoint) + mappedDirection * 0.02f;
+        remainingDistance = Mathf.Max(0f, maxDistance - bestT);
+        fromPortal = bestFrom;
+        toPortal = bestTo;
+        return remainingDistance > 0.01f;
+    }
+
+    bool TryRayPortalIntersection(Vector3 rayOrigin, Vector3 rayDirection, float maxDistance, Transform portalPlane, int shapeType, out float t, out Vector3 hitPoint)
+    {
+        t = 0f;
+        hitPoint = Vector3.zero;
+        if (portalPlane == null) return false;
+
+        float denom = Vector3.Dot(rayDirection, portalPlane.forward);
+        if (Mathf.Abs(denom) < 0.0001f) return false;
+
+        t = Vector3.Dot(portalPlane.position - rayOrigin, portalPlane.forward) / denom;
+        if (t <= 0.01f || t >= maxDistance) return false;
+
+        hitPoint = rayOrigin + rayDirection * t;
+        Vector3 local = LocalPointForPortal(portalPlane, hitPoint);
+        return LocalPointInPortalRect(local, shapeType);
+    }
+
+    private int RBSideFromSignedDistance(float signedDistance)
+    {
+        float eps = Mathf.Max(Mathf.Abs(crossingEpsilon), 0.0001f);
+        if (signedDistance > eps) return 1;
+        if (signedDistance < -eps) return -1;
+        return 0;
+    }
+
+    private Vector3 GetRigidbodyTravellerPosition(Rigidbody rb, bool heldByGun)
+    {
+        if (rb == null) return Vector3.zero;
+        if (heldByGun && rb.transform != null) return rb.transform.position;
+        return rb.position;
+    }
+
+    private Vector3 GetRigidbodyTravellerVelocity(Rigidbody rb, bool heldByGun)
+    {
+        if (rb == null) return Vector3.zero;
+        // 抓取中的刚体是 kinematic，Unity/VRChat 不一定会给出可靠 rb.velocity。
+        // 这里仍返回 rb.velocity，避免传送枪脚本承担额外速度缓存；手持位置主要由 MovePosition 跟随。
+        return rb.velocity;
+    }
+
+    private void TeleportRigidbodySebStyle(Rigidbody rb, Transform fromPlane, Transform toPlane, bool fromAtoB, Vector3 crossingWorldPos, float crossingT, bool heldByGun)
+    {
+        if (rb == null || fromPlane == null || toPlane == null) return;
+
+        float postCrossDt = 0f;
+        Vector3 currentTravellerPos = GetRigidbodyTravellerPosition(rb, heldByGun);
+        Vector3 currentVelocity = GetRigidbodyTravellerVelocity(rb, heldByGun);
+        Vector3 sourcePosForMapping = currentTravellerPos;
+        if (enableRigidbodyCrossingTimeCorrection)
+        {
+            postCrossDt = Mathf.Clamp01(1f - crossingT) * Time.deltaTime;
+
+            if (useRigidbodyDistanceBasedPostCrossTime)
+            {
+                // 更稳定的刚体版 post-cross 时间：用“当前已经越过门平面的距离 / 当前沿门法线速度”反推。
+                // 这样不依赖 LateUpdate 的 Time.deltaTime 是否等于物理步实际推进时间，可减少地板双洞的系统性亏能/增能。
+                float currentSignedDistance = Vector3.Dot(currentTravellerPos - fromPlane.position, fromPlane.forward);
+                float currentNormalSpeed = Vector3.Dot(currentVelocity, fromPlane.forward);
+                float absNormalSpeed = Mathf.Abs(currentNormalSpeed);
+                if (absNormalSpeed > Mathf.Abs(rbPostCrossNormalSpeedEpsilon))
+                {
+                    postCrossDt = Mathf.Abs(currentSignedDistance) / absNormalSpeed;
+                    if (postCrossDt < 0f) postCrossDt = 0f;
+                    if (postCrossDt > rbPostCrossMaxDt) postCrossDt = rbPostCrossMaxDt;
+                }
+            }
+
+            sourcePosForMapping = crossingWorldPos;
+        }
+
+        Matrix4x4 fromWorldToLocal = Matrix4x4.TRS(fromPlane.position, fromPlane.rotation, Vector3.one).inverse;
+        Matrix4x4 toLocalToWorld = Matrix4x4.TRS(toPlane.position, toPlane.rotation, Vector3.one);
+        Matrix4x4 rbLocalToWorld = Matrix4x4.TRS(sourcePosForMapping, rb.rotation, rb.transform.lossyScale);
+
+        Matrix4x4 mappedMatrix;
+        if (useClassicHalfTurn)
+        {
+            Matrix4x4 halfTurnMatrix = Matrix4x4.Rotate(LocalHalfTurn());
+            mappedMatrix = toLocalToWorld * halfTurnMatrix * fromWorldToLocal * rbLocalToWorld;
+        }
+        else
+        {
+            mappedMatrix = toLocalToWorld * fromWorldToLocal * rbLocalToWorld;
+        }
+
+        Vector3 mappedPosAtCrossing = mappedMatrix.GetColumn(3);
+        Quaternion newRot = mappedMatrix.rotation;
+
+        // Seb PortalPhysicsObject：
+        // rigidbody.velocity = toPortal.TransformVector(fromPortal.InverseTransformVector(rigidbody.velocity));
+        // rigidbody.angularVelocity = toPortal.TransformVector(fromPortal.InverseTransformVector(rigidbody.angularVelocity));
+        Vector3 gravityAccel = Vector3.zero;
+        if (!heldByGun && rb.useGravity && !rb.isKinematic)
+        {
+            gravityAccel = Physics.gravity;
+        }
+
+        Vector3 velocityAtCrossing = currentVelocity;
+        if (enableRigidbodyCrossingTimeCorrection)
+        {
+            velocityAtCrossing = currentVelocity - gravityAccel * postCrossDt;
+        }
+
+        Vector3 localVelocity = LocalDirForPortal(fromPlane, velocityAtCrossing);
+        Vector3 localAngularVelocity = LocalDirForPortal(fromPlane, rb.angularVelocity);
+        if (useClassicHalfTurn)
+        {
+            localVelocity = LocalHalfTurn(localVelocity);
+            localAngularVelocity = LocalHalfTurn(localAngularVelocity);
+        }
+        Vector3 velocityMappedAtCrossing = WorldDirFromPortal(toPlane, localVelocity);
+        Vector3 newAngularVelocity = WorldDirFromPortal(toPlane, localAngularVelocity);
+
+        Vector3 newPos = mappedPosAtCrossing;
+        Vector3 newVelocity = velocityMappedAtCrossing;
+        if (enableRigidbodyCrossingTimeCorrection && postCrossDt > 0f)
+        {
+            newPos = mappedPosAtCrossing + velocityMappedAtCrossing * postCrossDt + gravityAccel * (0.5f * postCrossDt * postCrossDt);
+            newVelocity = velocityMappedAtCrossing + gravityAccel * postCrossDt;
+        }
+
+        // 不做“出口侧保险/强推”。之前这里把刚体硬拉到出口正侧，是“吸铁石”问题的高风险来源。
+        rb.position = newPos;
+        rb.rotation = newRot;
+        rb.velocity = newVelocity;
+        rb.angularVelocity = newAngularVelocity;
         rb.gameObject.layer = rigidbodyPassThroughLayer;
 
-        // 4. 应用所有物理状态（位置 + 旋转 + 线速度 + 角速度）
-        rb.position = worldPos;
-        rb.rotation = worldRot;
-        rb.velocity = newVel;
-        rb.angularVelocity = newAngularVel;
-
-        // 如果是抓取状态，通知枪更新 held offset（无缝跨门）
         if (portalGun != null && portalGun.GetHeldRigidbody() == rb && allowHeldRigidbodyTeleport)
         {
-            portalGun.UpdateHeldAfterTeleport(worldPos, worldRot);
+            portalGun.UpdateHeldAfterTeleport(newPos, newRot, fromPlane, toPlane, useClassicHalfTurn);
         }
 
         if (debugTeleportLog)
         {
-            Debug.Log("[刚体传送] " + rb.name + " 从 " + (fromAtoB ? "A" : "B") + " -> " + (fromAtoB ? "B" : "A"));
+            Debug.Log("[刚体传送][Seb+crossingT] " + rb.name + " " + (fromAtoB ? "A->B" : "B->A") + " t=" + crossingT + " dt=" + postCrossDt + " v=" + newVelocity + " av=" + newAngularVelocity);
+        }
+    }
+
+    private int AddRigidbodyTrackerToArrays(Rigidbody rb, Vector3 previousOffset, int originalLayer, int lastSide, Rigidbody[] trackers, Vector3[] previousOffsets, int[] originalLayers, int[] lastSides, int count, bool refreshExisting)
+    {
+        if (rb == null) return count;
+
+        for (int i = 0; i < count; i++)
+        {
+            if (trackers[i] == rb)
+            {
+                if (refreshExisting)
+                {
+                    // Seb linkedPortal.OnTravellerEnterPortal 会在传送后把 previousOffset 重置为出口门当前 offset。
+                    // 但普通 OverlapBox 入口扫描不能刷新已有项，否则 previousOffset 每帧等于当前值，穿越检测会永远失效。
+                    previousOffsets[i] = previousOffset;
+                    if (originalLayer >= 0) originalLayers[i] = originalLayer;
+                    lastSides[i] = lastSide;
+                }
+                return count;
+            }
+        }
+
+        if (count >= MAX_TRACKED_RBS) return count;
+
+        trackers[count] = rb;
+        previousOffsets[count] = previousOffset;
+        originalLayers[count] = originalLayer;
+        lastSides[count] = lastSide;
+        return count + 1;
+    }
+
+    private void AddRigidbodyTracker(bool isPortalA, Rigidbody rb, Vector3 previousOffset, int originalLayer, int lastSide)
+    {
+        if (isPortalA)
+        {
+            trackedRBCountA = AddRigidbodyTrackerToArrays(rb, previousOffset, originalLayer, lastSide, trackedRigidbodiesA, rbPreviousOffsetFromPortalA, rbOriginalLayerA, rbLastPortalSideA, trackedRBCountA, true);
+        }
+        else
+        {
+            trackedRBCountB = AddRigidbodyTrackerToArrays(rb, previousOffset, originalLayer, lastSide, trackedRigidbodiesB, rbPreviousOffsetFromPortalB, rbOriginalLayerB, rbLastPortalSideB, trackedRBCountB, true);
+        }
+    }
+
+    private int RemoveRigidbodyTrackerAt(int removeIndex, Rigidbody[] trackers, Vector3[] previousOffsets, int[] originalLayers, int[] lastSides, int count)
+    {
+        if (removeIndex < 0 || removeIndex >= count) return count;
+
+        for (int j = removeIndex; j < count - 1; j++)
+        {
+            trackers[j] = trackers[j + 1];
+            previousOffsets[j] = previousOffsets[j + 1];
+            originalLayers[j] = originalLayers[j + 1];
+            lastSides[j] = lastSides[j + 1];
+        }
+
+        int last = count - 1;
+        trackers[last] = null;
+        previousOffsets[last] = Vector3.zero;
+        originalLayers[last] = -1;
+        lastSides[last] = 0;
+        return count - 1;
+    }
+
+    private int FindTrackedRigidbodyOriginalLayer(Rigidbody rb)
+    {
+        if (rb == null) return -1;
+
+        for (int i = 0; i < trackedRBCountA; i++)
+        {
+            if (trackedRigidbodiesA[i] == rb) return rbOriginalLayerA[i];
+        }
+        for (int i = 0; i < trackedRBCountB; i++)
+        {
+            if (trackedRigidbodiesB[i] == rb) return rbOriginalLayerB[i];
+        }
+        return -1;
+    }
+
+    private bool IsRigidbodyTrackedByPortal(bool isPortalA, Rigidbody rb)
+    {
+        if (rb == null) return false;
+
+        Rigidbody[] trackers = isPortalA ? trackedRigidbodiesA : trackedRigidbodiesB;
+        int count = isPortalA ? trackedRBCountA : trackedRBCountB;
+        for (int i = 0; i < count; i++)
+        {
+            if (trackers[i] == rb) return true;
+        }
+        return false;
+    }
+
+    private void RestoreRigidbodyLayerIfSafe(Rigidbody rb, int originalLayer, bool otherPortalIsA)
+    {
+        if (rb == null) return;
+        if (!restoreRigidbodyLayerOnExit) return;
+        if (IsRigidbodyTrackedByPortal(otherPortalIsA, rb)) return;
+        if (originalLayer < 0) return;
+
+        if (rb.gameObject.layer == rigidbodyPassThroughLayer)
+        {
+            rb.gameObject.layer = originalLayer;
         }
     }
 
