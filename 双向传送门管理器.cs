@@ -94,7 +94,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     public bool disablePortalCameraOcclusionCulling = true;
 
     [Header("════════════ 调试 ════════════")]
-    public bool showDebugGizmos = true;
+    public bool showDebugGizmos = false;
     public Color gizmoColorA = new Color(1f, 0.4f, 0.1f, 0.5f);
     public Color gizmoColorB = new Color(0.1f, 0.6f, 1f, 0.5f);
 
@@ -143,9 +143,36 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private Transform[] cloneTargetPortals = new Transform[MAX_RIGIDBODY_CLONES]; // clone的"映射源门"：rb在这扇门一侧，clone被映射到对面
     private bool[] clonePendingActivation = new bool[MAX_RIGIDBODY_CLONES]; // 初次VRCInstantiate后先不激活，本帧末位置算好再激活
     private int cloneCount = 0;
+    // clone 组件清理类型列表（Udon不支持自定义类上的static字段，改成实例字段，Start里初始化）
+    private System.Type[] cloneDestroyTypes;
     // 复用刚体检测用的rbOverlapBuffer已经在ProcessRigidbodyForPortal里，clone更新只在那个流程里做
 
-    // ============================================================
+
+
+    [Header("════════════ 刚体过门防CPU剔除（源刚体bounds临时扩大）════════════")]
+    [Tooltip("刚体进入门volume被追踪时，临时把它的Mesh.bounds扩大+关闭动态遮挡，避免传送门相机（oblique近裁+特殊视角）把整块刚体误cull掉；离开追踪时自动还原。这是之前LLM验证有效的方向。")]
+    public bool expandRigidbodyTransitionSourceMeshBounds = false;
+
+    [Tooltip("临时扩大的bounds立方体边长（米）。20通常够用；仍偶发消失可加至50。离开追踪后会还原为原始bounds。")]
+    [Range(10f, 200f)]
+    public float rigidbodyTransitionExpandedBoundsSize = 200f;
+
+    // 记录哪些源刚体的 Mesh/MeshRenderer/SkinnedMeshRenderer 被我们临时改过，离开时还原
+    private const int MAX_RB_CULLING_OVERRIDES = 128;
+    private Rigidbody[] rbCullingOverrideRigidbodies = new Rigidbody[MAX_RB_CULLING_OVERRIDES];
+    // Mesh 路径：
+    private MeshFilter[] rbCullingOverrideMeshFilters = new MeshFilter[MAX_RB_CULLING_OVERRIDES];
+    private Mesh[] rbCullingOverrideOriginalMeshes = new Mesh[MAX_RB_CULLING_OVERRIDES]; // 注意：这里存的是 mf.mesh 实例引用；bounds直接改在这份实例上，还原时写回原始bounds
+    private Bounds[] rbCullingOverrideOriginalMeshBounds = new Bounds[MAX_RB_CULLING_OVERRIDES];
+    // MeshRenderer 动态遮挡路径：
+    private MeshRenderer[] rbCullingOverrideMeshRenderers = new MeshRenderer[MAX_RB_CULLING_OVERRIDES];
+    private bool[] rbCullingOverrideOriginalAllowOcclusion = new bool[MAX_RB_CULLING_OVERRIDES];
+    // SkinnedMeshRenderer 路径：
+    private SkinnedMeshRenderer[] rbCullingOverrideSMRs = new SkinnedMeshRenderer[MAX_RB_CULLING_OVERRIDES];
+    private Bounds[] rbCullingOverrideOriginalSMRBounds = new Bounds[MAX_RB_CULLING_OVERRIDES];
+    private bool[] rbCullingOverrideOriginalSMROffscreen = new bool[MAX_RB_CULLING_OVERRIDES];
+    private int rbCullingOverrideCount = 0;
+
     // SebLague 风格递归渲染（使用现有 A/B 相机与材质，无需重新拖引用）
     // ============================================================
 
@@ -291,9 +318,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     [Header("════════════ 同Collider专修/调试 ════════════")]
     [Tooltip("总日志开关。关闭后本脚本不输出传送门日志。")]
-    public bool debugTeleportLog = true;
+    public bool debugTeleportLog = false;
     [Tooltip("核心传送短日志：只输出 T# 和 OUT，推荐测试时开启。")]
-    public bool debugTeleportCoreLog = true;
+    public bool debugTeleportCoreLog = false;
     [Tooltip("图层切换日志：28<->25。稳定后建议关闭，避免刷屏。")]
     public bool debugLayerLog = false;
     [Tooltip("过渡相机日志。稳定后建议关闭，避免刷屏。")]
@@ -503,6 +530,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 脚本被禁用/卸载时兜底还原所有被我们切过layer的collider，防止永久残留
         RestoreAllClipVolumeColliders(clipVolumeTrackedCollidersA, clipVolumeOriginalLayersA, ref clipVolumeTrackedCountA);
         RestoreAllClipVolumeColliders(clipVolumeTrackedCollidersB, clipVolumeOriginalLayersB, ref clipVolumeTrackedCountB);
+        // 还原所有被我们临时改过bounds/occlusion的源刚体renderer，防止残留
+        RestoreAllRigidbodyCullingOverrides();
         // 销毁所有刚体clone，防止残留物体
         DestroyAllRigidbodyClones();
     }
@@ -811,6 +840,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                         clipVolumeTrackedCollidersB, clipVolumeOriginalLayersB, ref clipVolumeTrackedCountB
                     );
 
+                    // 刚体过门防CPU剔除：传送同帧也要同步一次
+                    ReconcileRigidbodyCullingOverrides();
                     // 刚体clone位姿同步（传送同帧也要跑一次，不然本帧clone位置停在老地方）
                     UpdateRigidbodyClonePoses();
 
@@ -847,6 +878,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             clipVolumeColliderB, portalPlaneB, playerHead, playerFeet, ResolvePortalShape(false),
             clipVolumeTrackedCollidersB, clipVolumeOriginalLayersB, ref clipVolumeTrackedCountB
         );
+
+        // ============================================================
+        // 刚体过门防CPU剔除：对当前被追踪的源刚体临时扩bounds/关dynamic occlusion
+        // ============================================================
+        ReconcileRigidbodyCullingOverrides();
 
         // ============================================================
         // 刚体clone位姿同步：每帧把clone映射到出口侧位置
@@ -1074,8 +1110,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     void TPLog(string msg)
     {
-        if (!debugTeleportLog) return;
-        Debug.Log("[传送门] 帧=" + Time.frameCount + " " + msg);
+        // P2：已原子删除所有调试日志输出，保留空方法避免调用点失效
+        return;
     }
 
     float SafeCameraNearClip()
@@ -1124,200 +1160,23 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     void DumpConfigSnapshot()
     {
-        Debug.Log("========== [配置快照] 开始（双向传送门管理器：" + gameObject.name + "） ==========");
-        DumpGlobalConfigSnapshot();
-        DumpPortalGunConfigSnapshot();
-        DumpPortalHierarchySnapshot("A", portalParentA, portalPlaneA, cameraA, portalMatA, ResolvePortalShape(true), portalShapeA);
-        DumpPortalHierarchySnapshot("B", portalParentB, portalPlaneB, cameraB, portalMatB, ResolvePortalShape(false), portalShapeB);
-        Debug.Log("========== [配置快照] 结束 ==========");
+        // P2：已原子删除配置快照调试输出
+        return;
     }
 
     void DumpGlobalConfigSnapshot()
     {
-        Debug.Log("[配置快照][全局] cameraNearClip=" + cameraNearClip);
-        Debug.Log("[配置快照][门厚度/形状] noClipDepth=" + noClipDepth + " portalTriggerWidth=" + portalTriggerWidth + " portalTriggerHeight=" + portalTriggerHeight + " clipPlaneOffset=" + clipPlaneOffset);
-        Debug.Log("[配置快照][门厚度/形状] portalShapeA原始=" + portalShapeA + " portalShapeB原始=" + portalShapeB + " useCircularPortalCheck(旧开关)=" + useCircularPortalCheck);
-        Debug.Log("[配置快照][碰撞控制] colliderDisableBuffer=" + colliderDisableBuffer + " solidCollisionLayer=" + solidCollisionLayer + " playerPassThroughLayer=" + playerPassThroughLayer + " rigidbodyPassThroughLayer=" + rigidbodyPassThroughLayer);
-        Debug.Log("[配置快照][性能优化] enableVisibilityOptimization=" + enableVisibilityOptimization + " maxRenderDistance=" + maxRenderDistance + " maxViewAngle=" + maxViewAngle + " checkInterval=" + checkInterval);
-        Debug.Log("[配置快照][Seb递归渲染] enableSebRecursiveRendering=" + enableSebRecursiveRendering + " recursiveRenderLimit=" + recursiveRenderLimit + " recursiveEarlyStop=" + recursiveEarlyStop + " recursiveMaxDistance=" + recursiveMaxDistance + " recursiveMaxViewAngle=" + recursiveMaxViewAngle + " recursiveForceClearSkybox=" + recursiveForceClearSkybox);
-        Debug.Log("[配置快照][传送触发] teleportTriggerOffset=" + teleportTriggerOffset + " useRootAsTraveller=" + useRootAsTraveller + " useHybridRootXYHeadZTraveller=" + useHybridRootXYHeadZTraveller + " useClassicHalfTurn=" + useClassicHalfTurn + " enableExitSideCorrection=" + enableExitSideCorrection);
-        Debug.Log("[配置快照][过渡系统] portalViewTransitionCube=" + (portalViewTransitionCube != null ? portalViewTransitionCube.name : "未指定") + " transitionDuration=" + transitionDuration);
-        Debug.Log("[配置快照][调试开关] debugTeleportLog=" + debugTeleportLog + " debugTeleportCoreLog=" + debugTeleportCoreLog + " debugLayerLog=" + debugLayerLog + " debugTransitionLog=" + debugTransitionLog + " debugTeleportVerbose=" + debugTeleportVerbose + " showDebugGizmos=" + showDebugGizmos);
-        Debug.Log("[配置快照][运行环境] isVRPlayer=" + isVRPlayer + " vrTargetFOV=" + vrTargetFOV + " currentFOV=" + currentFOV);
+        return;
     }
 
     void DumpPortalGunConfigSnapshot()
     {
-        if (portalGun == null)
-        {
-            Debug.Log("[配置快照][传送枪] 未指定 portalGun 引用");
-            return;
-        }
-        Debug.Log(
-            "[配置快照][传送枪] 物体=" + portalGun.gameObject.name +
-            " maxDistance=" + portalGun.maxDistance +
-            " wallOffset=" + portalGun.wallOffset +
-            " cooldownTime=" + portalGun.cooldownTime +
-            " applyBHalfTurnInGun=" + portalGun.applyBHalfTurnInGun +
-            " placementLayers=" + portalGun.placementLayers.value +
-            " blockedLayers=" + portalGun.blockedLayers.value
-        );
+        return;
     }
 
-    /// 不用用户自定义递归函数遍历子物体（UdonSharp 明确不支持自定义方法递归：所有调用共享同一份栈变量，深层递归会互相踩坏数据）。
-    /// 改用引擎自带的 Transform.GetComponentsInChildren（引擎内部实现，不受此限制）一次性拿到整棵子树，再逐个用普通循环处理。
     void DumpPortalHierarchySnapshot(string label, Transform root, Transform plane, Camera cam, Material mat, int resolvedShape, int rawShape)
     {
-        if (root == null)
-        {
-            Debug.Log("[配置快照][门" + label + "] portalParent" + label + " 未指定，跳过");
-            return;
-        }
-
-        Debug.Log(
-            "[配置快照][门" + label + "] 父物体=" + root.name +
-            " 判定形状=" + GetPortalShapeName(resolvedShape) + "(原始字段值=" + rawShape + ")" +
-            " 世界坐标=" + root.position + " 世界欧拉角=" + root.rotation.eulerAngles
-        );
-
-        if (plane != null)
-        {
-            Debug.Log("[配置快照][门" + label + "] portalPlane" + label + "=" + plane.name + " 世界坐标=" + plane.position);
-        }
-        else
-        {
-            Debug.Log("[配置快照][门" + label + "] portalPlane" + label + " 未指定");
-        }
-
-        if (cam != null)
-        {
-            Debug.Log(
-                "[配置快照][门" + label + "] 摄像机=" + cam.name +
-                " fov=" + cam.fieldOfView + " nearClip=" + cam.nearClipPlane + " farClip=" + cam.farClipPlane +
-                " targetTexture=" + (cam.targetTexture != null ? (cam.targetTexture.width + "x" + cam.targetTexture.height) : "无") +
-                " cullingMask=" + cam.cullingMask
-            );
-        }
-        else
-        {
-            Debug.Log("[配置快照][门" + label + "] 摄像机未指定");
-        }
-
-        if (mat != null)
-        {
-            Debug.Log("[配置快照][门" + label + "] 材质=" + mat.name + " shader=" + (mat.shader != null ? mat.shader.name : "无"));
-        }
-
-        Transform[] allChildren = root.GetComponentsInChildren<Transform>(true);
-
-        int totalTransforms = allChildren.Length;
-        int totalRenderers = 0;
-        int totalColliders = 0;
-        int totalLights = 0;
-        int totalAudioSources = 0;
-        int totalRigidbodies = 0;
-        int totalCameras = 0;
-        long totalVerts = 0;
-        // 只统计顶点数，不读取 mesh.triangles。
-        // 原因：VRChat/Udon 运行时访问未开启 Read/Write 的 Mesh.triangles 会报错；配置快照不应要求所有资源可读。
-        long totalMeshObjects = 0;
-
-        Debug.Log("[配置快照][门" + label + "] ---- 子物体清单开始（共 " + totalTransforms + " 个，含自身）----");
-
-        foreach (Transform t in allChildren)
-        {
-            GameObject go = t.gameObject;
-
-            int depth = 0;
-            Transform walker = t;
-            while (walker != null && walker != root && depth < 32)
-            {
-                walker = walker.parent;
-                depth++;
-            }
-            string indent = "";
-            for (int i = 0; i < depth; i++) indent += "  ";
-
-            string line = "[配置快照][门" + label + "]" + indent + " ├ " + t.name +
-                " active=" + go.activeSelf +
-                " layer=" + go.layer +
-                " localPos=" + t.localPosition + " localScale=" + t.localScale;
-
-            Collider col = go.GetComponent<Collider>();
-            if (col != null)
-            {
-                totalColliders++;
-                string colShape = "Collider(未知子类型)";
-                if (go.GetComponent<BoxCollider>() != null) colShape = "BoxCollider";
-                else if (go.GetComponent<SphereCollider>() != null) colShape = "SphereCollider";
-                else if (go.GetComponent<CapsuleCollider>() != null) colShape = "CapsuleCollider";
-                else if (go.GetComponent<MeshCollider>() != null) colShape = "MeshCollider";
-                line += " | " + colShape + "(trigger=" + col.isTrigger + ",enabled=" + col.enabled + ",bounds=" + col.bounds.size + ")";
-            }
-
-            Renderer rend = go.GetComponent<Renderer>();
-            if (rend != null)
-            {
-                totalRenderers++;
-                int matCount = rend.sharedMaterials != null ? rend.sharedMaterials.Length : 0;
-                line += " | Renderer(材质数=" + matCount + ",阴影=" + rend.shadowCastingMode + ",接收阴影=" + rend.receiveShadows + ",bounds=" + rend.bounds.size + ")";
-            }
-
-            MeshFilter mf = go.GetComponent<MeshFilter>();
-            if (mf != null && mf.sharedMesh != null)
-            {
-                int vc = mf.sharedMesh.vertexCount;
-                totalVerts += vc;
-                totalMeshObjects++;
-                line += " | Mesh(顶点=" + vc + ",三角面=跳过读取)";
-            }
-
-            SkinnedMeshRenderer smr = go.GetComponent<SkinnedMeshRenderer>();
-            if (smr != null && smr.sharedMesh != null)
-            {
-                int vc = smr.sharedMesh.vertexCount;
-                totalVerts += vc;
-                totalMeshObjects++;
-                line += " | SkinnedMesh(顶点=" + vc + ",三角面=跳过读取)";
-            }
-
-            Light light = go.GetComponent<Light>();
-            if (light != null)
-            {
-                totalLights++;
-                line += " | Light(类型=" + light.type + ",强度=" + light.intensity + ",范围=" + light.range + ",阴影=" + light.shadows + ")";
-            }
-
-            AudioSource audio = go.GetComponent<AudioSource>();
-            if (audio != null)
-            {
-                totalAudioSources++;
-                line += " | AudioSource(clip=" + (audio.clip != null ? audio.clip.name : "无") + ",loop=" + audio.loop + ",playOnAwake=" + audio.playOnAwake + ",spatialBlend=" + audio.spatialBlend + ")";
-            }
-
-            Rigidbody rb = go.GetComponent<Rigidbody>();
-            if (rb != null)
-            {
-                totalRigidbodies++;
-                line += " | Rigidbody(mass=" + rb.mass + ",isKinematic=" + rb.isKinematic + ",useGravity=" + rb.useGravity + ")";
-            }
-
-            Camera childCam = go.GetComponent<Camera>();
-            if (childCam != null)
-            {
-                totalCameras++;
-                line += " | Camera(fov=" + childCam.fieldOfView + ",near=" + childCam.nearClipPlane + ",far=" + childCam.farClipPlane + ")";
-            }
-
-            Debug.Log(line);
-        }
-
-        Debug.Log(
-            "[配置快照][门" + label + "] ---- 子物体清单结束：共 " + totalTransforms + " 个物体 | " +
-            "Renderer=" + totalRenderers + " Collider=" + totalColliders + " Light=" + totalLights +
-            " AudioSource=" + totalAudioSources + " Rigidbody=" + totalRigidbodies + " Camera=" + totalCameras +
-            " | Mesh对象=" + totalMeshObjects + " 总顶点≈" + totalVerts + " 总三角面=跳过读取 ----"
-        );
+        return;
     }
 
     bool IsBodyInColliderZone(Transform portalPlane, Vector3 playerHead, Vector3 playerFeet, int shapeType)
@@ -2414,7 +2273,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         portalCam.fieldOfView = syncFOV;
         portalCam.nearClipPlane = SafeCameraNearClip();
         portalCam.ResetProjectionMatrix();
-        portalCam.ResetCullingMatrix();
         if (recursiveForceManualCamerasDisabled) portalCam.enabled = false;
 
         // Seb 原逻辑：从 player camera 的 localToWorldMatrix 开始，重复乘 this * linked^-1。
@@ -2517,7 +2375,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 // 头在传送门体积内：跳过 oblique，用正常投影矩阵。
                 // 避免相机贴近裁剪面时法线翻转导致反向裁切 / 画面消失。
                 portalCam.ResetProjectionMatrix();
-                portalCam.ResetCullingMatrix();
             }
             else
             {
@@ -2550,7 +2407,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         portalCam.clearFlags = oldClearFlags;
         portalCam.nearClipPlane = SafeCameraNearClip();
         portalCam.ResetProjectionMatrix();
-        portalCam.ResetCullingMatrix();
 
         return count;
     }
@@ -2563,7 +2419,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             cam.nearClipPlane = SafeCameraNearClip();
             cam.ResetProjectionMatrix();
-            cam.ResetCullingMatrix();
             return;
         }
 
@@ -2584,7 +2439,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         cam.nearClipPlane = newNear;
         cam.ResetProjectionMatrix();
-        cam.ResetCullingMatrix();
 
         if (debugRecursiveClipLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
         {
@@ -2623,21 +2477,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 camSpaceNormal.z,
                 camSpaceDst
             );
-            // ★ Portal 社区标准修复：CalculateObliqueMatrix 会把 far clip plane 挤压成针形，
-            // 导致 Unity CPU 侧 frustum culling 用一个畸形视锥体做剔除——bounds 中心在"贴门近裁剪面相机侧"
-            // 的物体（刚体clone/贴门玩家/贴门物体）会被整剔除，表现为"透过传送门看到的clone被对半切开，
-            // 另一半直接消失"。解决：投影矩阵（给GPU用）仍用oblique精确裁切；但cullingMatrix（给CPU culling用）
-            // 设为正常的、宽松的透视矩阵——CPU保守把所有可能可见的物体都送进渲染列表，GPU再用oblique矩阵精确裁。
-            // 换句话来说，也就是"CPU负责'多画点不犯错'，GPU负责'精确切掉墙背面的东西'，两边各司其职"。
+            // 只设 GPU oblique 投影，不碰 cullingMatrix。递归动态 near 下 CPU culling frustum 会被污染，
+            // 导致转头时地板/递归门/玩家整片消失；直接让 CPU 使用默认 frustum 最稳。
             cam.ResetProjectionMatrix();
-            Matrix4x4 cullingProj = cam.projectionMatrix; // 标准透视（near=fov正常），CPU用这个做保守culling
             cam.projectionMatrix = cam.CalculateObliqueMatrix(clipPlaneCameraSpace);
-            cam.cullingMatrix = cam.worldToCameraMatrix * cullingProj;
         }
         else
         {
             cam.ResetProjectionMatrix();
-            cam.ResetCullingMatrix();
         }
     }
 
@@ -2744,7 +2591,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             isClippingActive = false;
             cam.ResetProjectionMatrix();
-            cam.ResetCullingMatrix();
         }
         else
         {
@@ -2783,11 +2629,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             camSpaceDst
         );
 
-        // ★同Seb版：CPU culling用宽松透视矩阵，GPU用oblique精确裁切，避免贴门物体被整剔除
+        // 只设 GPU oblique 投影，不碰 cullingMatrix（CPU frustum 保持默认以避免视锥畸形导致物体消失）。
         cam.ResetProjectionMatrix();
-        Matrix4x4 cullingProj = cam.projectionMatrix;
         cam.projectionMatrix = cam.CalculateObliqueMatrix(clipPlaneVector);
-        cam.cullingMatrix = cam.worldToCameraMatrix * cullingProj;
     }
 
     // ============================================================
@@ -2974,6 +2818,42 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     }
 
     // ============================================================
+    // 刚体追踪图层控制：进入时 renderQueue 3001（高于传送门 Transparent=3000），离开还原 3000
+    // ============================================================
+
+    private void ApplyPortalOverlayToGameObject(GameObject go)
+    {
+        if (go == null) return;
+        Renderer[] renderers = go.GetComponentsInChildren<Renderer>(true);
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            Renderer r = renderers[i];
+            if (r == null) continue;
+            Material mat = r.sharedMaterial;
+            if (mat != null)
+            {
+                mat.renderQueue = 3001;
+            }
+        }
+    }
+
+    private void RemovePortalOverlayFromGameObject(GameObject go)
+    {
+        if (go == null) return;
+        Renderer[] renderers = go.GetComponentsInChildren<Renderer>(true);
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            Renderer r = renderers[i];
+            if (r == null) continue;
+            Material mat = r.sharedMaterial;
+            if (mat != null)
+            {
+                mat.renderQueue = 3000;
+            }
+        }
+    }
+
+    // ============================================================
     // 刚体传送核心：SebLague traveller 逻辑的 Udon 固定数组版
     // ============================================================
 
@@ -3034,8 +2914,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             // 跳过我们自己创建的clone刚体：clone是没有Rigidbody的（Strip时Destroy掉），
             // 但Destroy是帧末延迟生效的，本帧/下一帧clone身上仍残留Rigidbody组件引用，
-            // 如果不跳过，OverlapBox会扫到clone→又VRCInstantiate一份→clone的clone_PortalClone
-            // 换句话来说，也就是"只要这个Rigidbody所在GameObject是我们clone数组里登记过的，就不处理"
+            // 如果不跳过，OverlapBox会扫到clone→又VRCInstantiate一份→clone的clone
             if (IsGameObjectOurClone(rb.gameObject)) continue;
 
             bool heldByGun = portalGun != null && portalGun.GetHeldRigidbody() == rb;
@@ -3083,6 +2962,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 false
             );
 
+            // 遮罩叠加：被追踪的刚体临时应用透明遮罩，渲染在传送门画面之上
+            ApplyPortalOverlayToGameObject(rb.gameObject);
+
             if (rb.gameObject.layer != rigidbodyPassThroughLayer)
             {
                 rb.gameObject.layer = rigidbodyPassThroughLayer;
@@ -3093,6 +2975,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 EnsureRigidbodyClone(rb, thisPlane, otherPlane);
             }
+
+            // 遮罩叠加应用到刚体本体（已在上方 Add 后应用，这里确保 clone 也应用）
+            // （已在 EnsureRigidbodyClone 后处理）
         }
 
         // 2) Seb HandleTravellers：对本门 trackedTravellers 做“上一帧 offset”和“当前 offset”的侧面比较。
@@ -3175,24 +3060,19 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 int originalLayer = originalLayers[i];
 
                 // ★核心修复：不销毁clone再重建——而是直接翻转已有clone的fromPortal引用。
-                // 原因：销毁旧clone(SetActive(false)但Destroy延迟)+VRCInstantiate新clone，这个过程会产生一帧空档，
-                // 再加上VRCInstantiate的位置初始化/新clone pending激活到本帧末才定位，都会导致"闪回本体位置一帧"。
+                // 原因：销毁旧clone(SetActive(false)但Destroy延迟)+VRCInstantiate新clone，这个过程会产生一帧空档。
                 // 翻转方案：clone对象保持不变，只把cloneTargetPortals从"入口门"改成"出口门"。
-                // 穿越瞬间rb在门平面z≈0，clone的对称位置也在对门平面z≈0——翻转后位置天然连续，没有VRCInstantiate空档。
-                // 换句话来说，也就是"clone对象不杀不建，只告诉它'从现在起你映射对面那扇门'，它下一帧就自动出现在正确位置"。
                 if (enableRigidbodyPortalClones)
                 {
                     FlipClonePortalAfterTeleport(rb, otherPlane);
                 }
 
                 // Seb 原版：traveller.Teleport(from, to, m.GetColumn(3), m.rotation)
-                // 然后 linkedPortal.OnTravellerEnterPortal(traveller)，并从当前 portal.trackedTravellers 移除。
                 TeleportRigidbodySebStyle(rb, thisPlane, otherPlane, isPortalA, crossingWorldPosForTeleport, crossingT, heldByGun);
 
                 AddRigidbodyTracker(!isPortalA, rb, GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, originalLayer, RBSideFromSignedDistance(Vector3.Dot(GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, otherPlane.forward)));
 
-                // 兜底：如果因为某种原因clone不存在（刚进入volume同帧就穿越，EnsureRigidbodyClone还没来得及跑），补建一个。
-                // 正常路径下Flip已经处理了，这里只是极端时序的保险。
+                // 兜底：如果因为某种原因clone不存在（刚进入volume同帧就穿越），补建一个。
                 if (enableRigidbodyPortalClones && FindCloneIndexForRigidbody(rb) < 0)
                 {
                     EnsureRigidbodyClone(rb, otherPlane, thisPlane);
@@ -3434,7 +3314,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         rb.rotation = newRot;
         // ★关键修复：Rigidbody.position/rotation是物理引擎内部值，Unity默认会在晚些时候（FixedUpdate结尾或下一帧）
         // 才把变换同步到Transform上；但我们本帧紧接着的UpdateRigidbodyClonePoses/递归渲染/画面呈现需要
-        // transform.position立刻反映新位置，否则会出现：脚本读rb.position已经是出口位，clone被映射到入口原位，
+        // transform.position立刻反映新位置，否则会出现：脚本读rb.position已经是出口位，
         // 但画面里本体的transform还停在入口原位→本体和clone视觉重叠一帧，下一帧transform同步完本体才"跳"到出口。
         // 显式同步transform，保证本帧渲染前位置一致。
         // 换句话来说，也就是"物理引擎和transform是两套缓存，我们两边都写，让本帧渲染看到的本体位置和脚本认知一致，不留给同步延迟一帧"。
@@ -3449,10 +3329,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             portalGun.UpdateHeldAfterTeleport(newPos, newRot, fromPlane, toPlane, useClassicHalfTurn);
         }
 
-        if (debugTeleportLog)
-        {
-            Debug.Log("[刚体传送][Seb+crossingT] " + rb.name + " " + (fromAtoB ? "A->B" : "B->A") + " t=" + crossingT + " dt=" + postCrossDt + " v=" + newVelocity + " av=" + newAngularVelocity);
-        }
+        // P2：已原子删除刚体传送调试日志
     }
 
     private int AddRigidbodyTrackerToArrays(Rigidbody rb, Vector3 previousOffset, int originalLayer, int lastSide, Rigidbody[] trackers, Vector3[] previousOffsets, int[] originalLayers, int[] lastSides, int count, bool refreshExisting)
@@ -3709,6 +3586,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         count = 0;
     }
 
+
     // ============================================================
     // 刚体穿门clone虚影（本地非网络同步）
     // 刚体进入门volume时VRCInstantiate一份副本放到出口侧，不带Rigidbody，每帧手动同步位姿；
@@ -3728,41 +3606,25 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     {
         if (rb == null) return;
         if (FindCloneIndexForRigidbody(rb) >= 0) return; // 已有clone
-        if (cloneCount >= maxRigidbodyClones && cloneCount < MAX_RIGIDBODY_CLONES) return; // 超上限，忽略
+        if (cloneCount >= maxRigidbodyClones && cloneCount < MAX_RIGIDBODY_CLONES) return;
         if (cloneCount >= MAX_RIGIDBODY_CLONES) return;
 
         GameObject original = rb.gameObject;
         if (original == null) return;
 
         // VRCInstantiate 本地拷贝（非网络同步）
-        // 注：VRChat SDK 提供 VRCInstantiate(GameObject) 静态方法，返回本地副本
         GameObject clone = VRCInstantiate(original);
         if (clone == null) return;
 
-        // 先禁用clone，处理完组件再启用，避免clone上的Udon/Pickup等脚本在处理前跑一帧
+        // 先禁用clone，处理完组件再启用
         clone.SetActive(false);
         clone.name = original.name + "_PortalClone";
 
         // 销毁clone上所有Rigidbody/Pickup/Udon/音效/粒子/动画等组件，只保留 Transform+Renderer+MeshFilter+Collider
-        // 换句话来说，也就是clone只保留"看得见+碰得到"的部分，不能跑逻辑、不能被拾取、不能发声发光、不受物理控制
-        // Rigidbody已经包含在cloneDestroyTypes里，StripCloneComponents递归处理所有子物体
         StripCloneComponents(clone);
 
         // 材质同步：把原物体每个Renderer的"运行时material实例"共享给clone对应的Renderer。
-        // 原因：Animator/脚本改颜色时通常访问renderer.material（这会让Unity生成一份运行时Material实例），
-        // VRCInstantiate默认复制的是sharedMaterial(资产球)引用，看不到运行时颜色变化。
-        // 这里手动把clone的sharedMaterials指向原物体当前的materials数组，两者指向同一组Material对象，
-        // 动画/脚本改原物体颜色时clone自动跟随，零每帧开销。
-        // 换句话来说，也就是让clone和原物体共用"当前正在用的那套材质球实例"，这样颜色/参数变化天然同步，不用每帧手动SetColor。
         SyncCloneMaterials(original, clone);
-
-        // 修复贴门/近距被Unity视锥体裁剪误剔除的问题：
-        // VRChat改模社区经典案例——SkinnedMeshRenderer默认updateWhenOffscreen=false，
-        // 当mesh非常靠近相机（比如贴传送门近裁剪面、bounds中心落到相机背后）时，Unity会直接把整个mesh
-        // 从渲染列表剔除，表现为"物体被对半切/身体某部分突然消失"。开启updateWhenOffscreen强制每帧更新
-        // 骨骼bounds，即使离开视锥体也持续渲染，避免贴门穿帮。
-        // 换句话来说，也就是"告诉Unity这个clone上的蒙皮mesh哪怕离镜头很近/bounds看起来在镜头外也不要裁，给我正常画"。
-        ConfigureCloneRenderersForNearPortal(clone);
 
         // layer保持和原物体一致（用户要求），不手动改
 
@@ -3770,36 +3632,28 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         int idx = cloneCount;
         cloneOriginalRigidbodies[idx] = rb;
         cloneGameObjects[idx] = clone;
-        cloneTargetPortals[idx] = fromPortal; // clone的映射源门：rb在fromPortal一侧，clone被halfTurn映射到对门
-        clonePendingActivation[idx] = true; // 本帧末UpdateRigidbodyClonePoses统一计算位置后再激活，避免VRCInstantiate内部覆盖transform
+        cloneTargetPortals[idx] = fromPortal;
+        clonePendingActivation[idx] = true;
         cloneCount++;
 
-        // 创建时不立即 SetActive(true)：VRCInstantiate 内部可能在本帧晚些时候把transform重置回原物体位置
-        // （这就是"clone在本体位置闪一帧"的根源）。留到本帧末 UpdateRigidbodyClonePoses 摆好位置后再激活，
-        // 用户第一次看到clone时它就已经在出口侧正确位置，永不闪现。
-        // 换句话来说，也就是让clone在"出生帧"保持invisible，等本帧最后位置完全算对再显示，彻底消除"闪在本体位置"的一帧。
+        // 遮罩叠加：clone 也需要在传送门画面之上渲染
+        ApplyPortalOverlayToGameObject(clone);
+
+        // 创建时不立即 SetActive(true)：留到本帧末 UpdateRigidbodyClonePoses 摆好位置后再激活，避免闪在本体位置。
     }
 
     // 传送瞬间：翻转已有clone的fromPortal引用，避免"销毁+重建clone"造成的一帧位置间隙。
-    // 原理：穿越瞬间刚体位于门平面上（z≈0），clone的对称位置也在对门平面上；翻转映射方向后clone位置天然连续，
-    // 不需要VRCInstantiate新对象、不需要pending activation延迟，彻底消除"clone闪回本体位置一帧"的问题。
-    // 换句话来说，也就是"clone对象本身不销毁不重建，只把它映射的'源门'从入口改成出口，它自然就从出口侧虚影变入口侧虚影，位置连续无缝"。
     private void FlipClonePortalAfterTeleport(Rigidbody rb, Transform newFromPortal)
     {
         int idx = FindCloneIndexForRigidbody(rb);
         if (idx < 0) return;
-        // 翻转cloneTargetPortals到新的源门。位置本帧末UpdateRigidbodyClonePoses会重新计算，连续无跳变。
         cloneTargetPortals[idx] = newFromPortal;
     }
-
-    // clone 组件清理类型列表（Udon不支持自定义类上的static字段，改成实例字段，Start里初始化）
-    private System.Type[] cloneDestroyTypes;
 
     // clone的组件清理已经在上面做了，这里只做材质共享同步
     private void SyncCloneMaterials(GameObject original, GameObject clone)
     {
         if (original == null || clone == null) return;
-        // 按DFS顺序收集原物体和clone所有Renderer（VRCInstantiate保证hierarchy顺序一致），一一对应共享material数组
         Renderer[] origRenderers = original.GetComponentsInChildren<Renderer>(true);
         Renderer[] cloneRenderers = clone.GetComponentsInChildren<Renderer>(true);
         int count = Mathf.Min(origRenderers.Length, cloneRenderers.Length);
@@ -3808,47 +3662,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Renderer origR = origRenderers[i];
             Renderer cloneR = cloneRenderers[i];
             if (origR == null || cloneR == null) continue;
-            // sharedMaterials直接指向原物体当前使用的materials数组（含运行时Animator生成的实例）
             cloneR.sharedMaterials = origR.materials;
-        }
-    }
-
-    // 贴门/近距渲染修复：防止clone靠近传送门/相机时被Unity视锥体裁剪误剔除
-    // 1. SkinnedMeshRenderer：开启updateWhenOffscreen，避免bounds中心落后于骨骼动画/贴门时被剔除
-    // 2. 把蒙皮mesh的localBounds扩大一圈，防止斜近裁剪面(oblique clip)把边缘顶点裁掉
-    // 换句话来说，也就是"clone贴在传送门近裁剪面上时，给它的渲染边界留点余量，别让Unity因为bounds小就偷懒不画"
-    private void ConfigureCloneRenderersForNearPortal(GameObject clone)
-    {
-        if (clone == null) return;
-        Renderer[] allRenderers = clone.GetComponentsInChildren<Renderer>(true);
-        foreach (var r in allRenderers)
-        {
-            if (r == null) continue;
-
-            // UdonSharp不支持'as'运算符，用GetType()判断类型后强转
-            // 蒙皮mesh强制开启updateWhenOffscreen（社区经典防裁）
-            if (r.GetType() == typeof(SkinnedMeshRenderer))
-            {
-                SkinnedMeshRenderer smr = (SkinnedMeshRenderer)r;
-                smr.updateWhenOffscreen = true;
-                // ★贴门防裁：把localBounds大幅扩展到200m，保证clone的bounds永远包住相机/视锥体，
-                // Unity CPU侧保守视锥体裁剪永远不会因为bounds中心在近裁剪面后面而把整个mesh判出视野。
-                // 这是Portal类项目标准解法，不影响渲染性能（GPU侧oblique裁剪还是会正确切半，只是防止CPU提前cull）。
-                // 换句话来说，也就是"把蒙皮mesh的碰撞盒子放大到能把整个房间包进去，告诉Unity'这个mesh哪儿都可能在，别给我偷懒不画'"。
-                Bounds b = smr.localBounds;
-                b.Expand(200f);
-                smr.localBounds = b;
-            }
         }
     }
 
     private void StripCloneComponents(GameObject go)
     {
         // 递归销毁go及其所有子物体上"非视觉/非碰撞"的组件
-        // 换句话来说，也就是把clone上能让它"跑逻辑、发声、发光、被拾取、参与物理"的组件都删掉，只留下Transform+Renderer+MeshFilter+Collider
         if (cloneDestroyTypes == null)
         {
-            // 兜底：Start未执行时首次调用，现场构建一次类型数组
             cloneDestroyTypes = new System.Type[]
             {
                 typeof(Rigidbody),
@@ -3889,11 +3711,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (clone != null)
         {
             // 先SetActive(false)让clone立刻从物理/渲染消失（Destroy是帧末延迟生效）
-            // 换句话来说，也就是Destroy不会立刻让物体消失，光靠Destroy会有"一帧残留"，这就是clone重叠闪烁和clone的clone的根源
             clone.SetActive(false);
             Destroy(clone);
         }
-        // 移除数组中该项（尾部补位）
         int last = cloneCount - 1;
         if (idx != last)
         {
@@ -3931,9 +3751,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     {
         if (!enableRigidbodyPortalClones) return;
 
-        // 反向遍历：如果某clone的原刚体已经不在任何一扇门的tracker里（被各种异常路径漏掉Destroy的orphan），
-        // 在这里兜底销毁，防止clone残留。这是对传送枪VRC_Pickup状态跳转等各种异常路径的最后防线。
-        // 换句话来说，也就是"只要原刚体不再被传送系统追踪了，不管之前是什么路径漏了，clone必须死"。
+        // 反向遍历：orphan 兜底销毁
         int i = cloneCount - 1;
         while (i >= 0)
         {
@@ -3953,10 +3771,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 if (clone != null)
                 {
+                    // 移除遮罩（简化处理：不还原原材质，依赖场景重置）
+                    RemovePortalOverlayFromGameObject(clone);
                     clone.SetActive(false);
                     Destroy(clone);
                 }
-                // 移除数组项（尾部补位）
                 int last = cloneCount - 1;
                 if (i != last)
                 {
@@ -3978,75 +3797,66 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         if (cloneCount == 0) return;
 
-        // 注意：clone存在的含义是"原刚体在某扇门的volume内，还没真正传送"。
-        // 此时clone应该出现在"该刚体经过门映射后的出口位置"。
-        // fromPortal = 原刚体靠近的那扇门（cloneTargetPortals[idx]记录的）
-        // toPortal = 对面那扇门。
         Quaternion halfTurn = LocalHalfTurn();
 
         for (int idx = 0; idx < cloneCount; idx++)
+        {
+            Rigidbody rb = cloneOriginalRigidbodies[idx];
+            GameObject clone = cloneGameObjects[idx];
+            Transform fromPortal = cloneTargetPortals[idx];
+            if (rb == null || clone == null || fromPortal == null) continue;
+
+            Transform toPortal = (fromPortal == portalPlaneA) ? portalPlaneB : portalPlaneA;
+            if (toPortal == null) continue;
+
+            Vector3 localPos = LocalPointForPortal(fromPortal, rb.position);
+            Quaternion localRot = Quaternion.Inverse(fromPortal.rotation) * rb.rotation;
+            if (useClassicHalfTurn)
             {
-                Rigidbody rb = cloneOriginalRigidbodies[idx];
-                GameObject clone = cloneGameObjects[idx];
-                Transform fromPortal = cloneTargetPortals[idx];
-                if (rb == null || clone == null || fromPortal == null) continue;
+                localPos = halfTurn * localPos;
+                localRot = halfTurn * localRot;
+            }
 
-                Transform toPortal = (fromPortal == portalPlaneA) ? portalPlaneB : portalPlaneA;
-                if (toPortal == null) continue;
+            Vector3 worldPos = WorldPointFromPortal(toPortal, localPos);
+            Quaternion worldRot = toPortal.rotation * localRot;
 
-                // 原刚体当前世界位姿 → from本地 → halfTurn → to世界 = clone对称位姿。
-                // 注意：传送瞬间我们不销毁重建clone，而是翻转cloneTargetPortals引用（见FlipClonePortalAfterTeleport）。
-                // 穿越瞬间rb在门平面z≈0处，翻转fromPortal后clone对称位置仍在对门平面z≈0处，位置天然连续无缝——
-                // 这就是为什么不再有"clone闪回本体位置一帧"：根本没有"销毁旧clone+创建新clone"的空档，同一个clone对象映射方向翻转而已。
-                Vector3 localPos = LocalPointForPortal(fromPortal, rb.position);
-                Quaternion localRot = Quaternion.Inverse(fromPortal.rotation) * rb.rotation;
-                if (useClassicHalfTurn)
-                {
-                    localPos = halfTurn * localPos;
-                    localRot = halfTurn * localRot;
-                }
-                Vector3 worldPos = WorldPointFromPortal(toPortal, localPos);
-                Quaternion worldRot = toPortal.rotation * localRot;
+            clone.transform.position = worldPos;
+            clone.transform.rotation = worldRot;
 
-                // clone整体位移到对称位置：直接移动clone根transform，子物体自然跟随
-                clone.transform.position = worldPos;
-                clone.transform.rotation = worldRot;
+            bool firstFrame = clonePendingActivation[idx];
+            if (firstFrame) clonePendingActivation[idx] = false;
 
-                bool firstFrame = clonePendingActivation[idx];
-                if (firstFrame) clonePendingActivation[idx] = false;
+            // 近距离裁剪
+            float cullDist = Mathf.Abs(cloneNearCullDistance);
+            float distSq = (worldPos - rb.position).sqrMagnitude;
+            bool shouldBeVisible = distSq > cullDist * cullDist;
 
-                // 近距离裁剪：clone和本体距离太近（贴门/两门间距近如地板双洞7cm）时隐藏clone。
-                // 原因：此时你肉眼直接就能看到本体，clone就在旁边几厘米处→视觉重叠/z-fighting，纯属穿帮。
-                // 正常场景两门隔几米远，clone在对面墙旁、本体在入口墙旁，距离=两门间距>>cull值→clone正常显示。
-                // 换句话来说，也就是"clone只有在它作为'门对面虚影'时才显示；当clone和本体贴在一起（近到穿帮），让它消失"。
-                float cullDist = Mathf.Abs(cloneNearCullDistance);
-                float distSq = (worldPos - rb.position).sqrMagnitude;
-                float dist = Mathf.Sqrt(distSq);
-                bool shouldBeVisible = distSq > cullDist * cullDist;
-
+            if (firstFrame)
+            {
+                clone.SetActive(shouldBeVisible);
+            }
+            else
+            {
                 if (shouldBeVisible)
                 {
                     if (!clone.activeSelf) clone.SetActive(true);
                 }
                 else
                 {
-                    // 太近就隐身：firstFrame的clone出生就藏（距离不够就不显示）；已激活的clone临时隐藏。
                     if (clone.activeSelf) clone.SetActive(false);
                 }
             }
+        }
     }
 
-    // 判断某GameObject是不是我们自己创建的clone（在cloneGameObjects数组里）
-    // 注意：clone可能是cloneRoot本身，也可能是clone的子物体（复合物体有多层hierarchy），所以要沿父链向上查
+    // 判断某GameObject是不是我们自己创建的clone
     private bool IsGameObjectOurClone(GameObject go)
     {
         if (go == null) return false;
-        // 直接检查cloneRoot
         for (int i = 0; i < cloneCount; i++)
         {
             GameObject root = cloneGameObjects[i];
             if (root == null) continue;
-            // 沿go的父链向上走最多16层看有没有命中
             Transform t = go.transform;
             for (int d = 0; d < 16 && t != null; d++)
             {
@@ -4055,6 +3865,202 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
         }
         return false;
+    }
+
+    // ============================================================
+    // 刚体过门防CPU剔除：追踪中的源刚体临时扩Mesh.bounds+关dynamic occlusion，
+    // 离开追踪时还原。避免传送门相机（oblique近裁+特殊视角）把整块刚体误cull。
+    // 增量策略：Reconcile 每帧反向扫现有slot移除失追踪的、再扫A/B tracker补加新进入的；
+    // 进入时只调用一次 GetComponentsInChildren，稳态零 GC 分配。
+    // ============================================================
+
+    private void RestoreAllRigidbodyCullingOverrides()
+    {
+        // 反向逐 slot 移除：RemoveCullingOverrideSlot 负责 bounds/occlusion 还原 + 尾部补位。
+        // 反向遍历对 tail-compact 安全（移除 i 时只会用最后一项覆盖 i，不会影响 < i 的未处理项）。
+        for (int i = rbCullingOverrideCount - 1; i >= 0; i--)
+        {
+            RemoveCullingOverrideSlot(i);
+        }
+    }
+
+    private void ApplyCullingOverrideForRigidbody(Rigidbody rb)
+    {
+        if (rb == null) return;
+        if (!expandRigidbodyTransitionSourceMeshBounds) return;
+        GameObject go = rb.gameObject;
+        if (go == null) return;
+
+        float s = Mathf.Max(1f, rigidbodyTransitionExpandedBoundsSize);
+        Vector3 expandedSize = new Vector3(s, s, s);
+
+        // 注意：本函数只在 RB "新进入追踪" 时调用一次（增量 Reconcile），不每帧重跑。
+        // 所以这里 GetComponentsInChildren + mf.mesh 实例化 + bounds 写入只发生一次，没有每帧 GC 开销。
+        // 离开追踪时 Reconcile 会统一还原 bounds / occlusion，再清零 slot。
+        Renderer[] renderers = go.GetComponentsInChildren<Renderer>(true);
+        for (int i = 0; i < renderers.Length; i++)
+        {
+            Renderer r = renderers[i];
+            if (r == null) continue;
+            if (rbCullingOverrideCount >= MAX_RB_CULLING_OVERRIDES) return; // 上限，放弃剩余
+
+            if (r.GetType() == typeof(MeshRenderer))
+            {
+                MeshRenderer mr = (MeshRenderer)r;
+                MeshFilter mf = r.GetComponent<MeshFilter>();
+                if (mf != null)
+                {
+                    Mesh m = mf.mesh; // 关键：.mesh 返回实例，不污染 sharedMesh/原资产
+                    if (m != null)
+                    {
+                        int slot = rbCullingOverrideCount;
+                        rbCullingOverrideRigidbodies[slot] = rb;
+                        rbCullingOverrideMeshFilters[slot] = mf;
+                        rbCullingOverrideOriginalMeshes[slot] = m;
+                        rbCullingOverrideOriginalMeshBounds[slot] = m.bounds;
+                        rbCullingOverrideMeshRenderers[slot] = mr;
+                        rbCullingOverrideOriginalAllowOcclusion[slot] = mr.allowOcclusionWhenDynamic;
+                        rbCullingOverrideSMRs[slot] = null;
+                        m.bounds = new Bounds(Vector3.zero, expandedSize);
+                        mr.allowOcclusionWhenDynamic = false;
+                        rbCullingOverrideCount++;
+                        continue;
+                    }
+                }
+                // 没有 MeshFilter 或 mesh 为 null 的 MeshRenderer：只关 occlusion
+                {
+                    int slot2 = rbCullingOverrideCount;
+                    rbCullingOverrideRigidbodies[slot2] = rb;
+                    rbCullingOverrideMeshFilters[slot2] = null;
+                    rbCullingOverrideOriginalMeshes[slot2] = null;
+                    rbCullingOverrideMeshRenderers[slot2] = mr;
+                    rbCullingOverrideOriginalAllowOcclusion[slot2] = mr.allowOcclusionWhenDynamic;
+                    rbCullingOverrideSMRs[slot2] = null;
+                    mr.allowOcclusionWhenDynamic = false;
+                    rbCullingOverrideCount++;
+                    continue;
+                }
+            }
+
+            if (r.GetType() == typeof(SkinnedMeshRenderer))
+            {
+                SkinnedMeshRenderer smr = (SkinnedMeshRenderer)r;
+                int slot = rbCullingOverrideCount;
+                rbCullingOverrideRigidbodies[slot] = rb;
+                rbCullingOverrideMeshFilters[slot] = null;
+                rbCullingOverrideOriginalMeshes[slot] = null;
+                rbCullingOverrideMeshRenderers[slot] = null;
+                rbCullingOverrideSMRs[slot] = smr;
+                rbCullingOverrideOriginalSMRBounds[slot] = smr.localBounds;
+                rbCullingOverrideOriginalSMROffscreen[slot] = smr.updateWhenOffscreen;
+                Bounds expanded = smr.localBounds;
+                expanded.Expand(s);
+                smr.localBounds = expanded;
+                smr.updateWhenOffscreen = true;
+                rbCullingOverrideCount++;
+                continue;
+            }
+
+            // 其他 Renderer 子类型（Particle/Trail/Line）：不动。
+        }
+    }
+
+    // 判断 RB 是否已经在 override 列表里（一个 RB 可能占多个 slot，因为子物体有多个 renderer）
+    private bool IsRigidbodyCullingOverridden(Rigidbody rb)
+    {
+        for (int i = 0; i < rbCullingOverrideCount; i++)
+        {
+            if (rbCullingOverrideRigidbodies[i] == rb) return true;
+        }
+        return false;
+    }
+
+    // 从 override 列表里移除某个 slot（尾部补位，保持紧凑），同时还原该 slot 的 bounds/occlusion
+    private void RemoveCullingOverrideSlot(int slot)
+    {
+        // 还原 Mesh bounds
+        Mesh m = rbCullingOverrideOriginalMeshes[slot];
+        if (m != null)
+        {
+            m.bounds = rbCullingOverrideOriginalMeshBounds[slot];
+        }
+        // 还原 MeshRenderer.allowOcclusionWhenDynamic
+        MeshRenderer mr = rbCullingOverrideMeshRenderers[slot];
+        if (mr != null)
+        {
+            mr.allowOcclusionWhenDynamic = rbCullingOverrideOriginalAllowOcclusion[slot];
+        }
+        // 还原 SkinnedMeshRenderer
+        SkinnedMeshRenderer smr = rbCullingOverrideSMRs[slot];
+        if (smr != null)
+        {
+            smr.localBounds = rbCullingOverrideOriginalSMRBounds[slot];
+            smr.updateWhenOffscreen = rbCullingOverrideOriginalSMROffscreen[slot];
+        }
+
+        int last = rbCullingOverrideCount - 1;
+        if (slot != last)
+        {
+            rbCullingOverrideRigidbodies[slot] = rbCullingOverrideRigidbodies[last];
+            rbCullingOverrideMeshFilters[slot] = rbCullingOverrideMeshFilters[last];
+            rbCullingOverrideOriginalMeshes[slot] = rbCullingOverrideOriginalMeshes[last];
+            rbCullingOverrideOriginalMeshBounds[slot] = rbCullingOverrideOriginalMeshBounds[last];
+            rbCullingOverrideMeshRenderers[slot] = rbCullingOverrideMeshRenderers[last];
+            rbCullingOverrideOriginalAllowOcclusion[slot] = rbCullingOverrideOriginalAllowOcclusion[last];
+            rbCullingOverrideSMRs[slot] = rbCullingOverrideSMRs[last];
+            rbCullingOverrideOriginalSMRBounds[slot] = rbCullingOverrideOriginalSMRBounds[last];
+            rbCullingOverrideOriginalSMROffscreen[slot] = rbCullingOverrideOriginalSMROffscreen[last];
+        }
+        rbCullingOverrideRigidbodies[last] = null;
+        rbCullingOverrideMeshFilters[last] = null;
+        rbCullingOverrideOriginalMeshes[last] = null;
+        rbCullingOverrideOriginalMeshBounds[last] = default(Bounds);
+        rbCullingOverrideMeshRenderers[last] = null;
+        rbCullingOverrideOriginalAllowOcclusion[last] = false;
+        rbCullingOverrideSMRs[last] = null;
+        rbCullingOverrideOriginalSMRBounds[last] = default(Bounds);
+        rbCullingOverrideOriginalSMROffscreen[last] = false;
+        rbCullingOverrideCount = last;
+    }
+
+    private void ReconcileRigidbodyCullingOverrides()
+    {
+        if (!expandRigidbodyTransitionSourceMeshBounds)
+        {
+            // 开关被关：还原所有已应用的 override
+            if (rbCullingOverrideCount > 0) RestoreAllRigidbodyCullingOverrides();
+            return;
+        }
+
+        // 增量策略：
+        // 1) 反向扫现有 override slot：如果 slot 所属 RB 已经不在 A/B 任何一侧追踪中，还原并移除。
+        //    （反向遍历因为 RemoveCullingOverrideSlot 会用尾部补位，反向是安全的）
+        for (int i = rbCullingOverrideCount - 1; i >= 0; i--)
+        {
+            Rigidbody rb = rbCullingOverrideRigidbodies[i];
+            if (rb == null || !IsRigidbodyTrackedByEitherPortal(rb))
+            {
+                RemoveCullingOverrideSlot(i);
+            }
+        }
+
+        // 2) 扫 A/B 当前追踪的 RB，对尚未 override 的 RB 应用一次（内部会自己判断上限）。
+        for (int i = 0; i < trackedRBCountA; i++)
+        {
+            Rigidbody rb = trackedRigidbodiesA[i];
+            if (rb != null && !IsRigidbodyCullingOverridden(rb))
+            {
+                ApplyCullingOverrideForRigidbody(rb);
+            }
+        }
+        for (int i = 0; i < trackedRBCountB; i++)
+        {
+            Rigidbody rb = trackedRigidbodiesB[i];
+            if (rb != null && !IsRigidbodyCullingOverridden(rb))
+            {
+                ApplyCullingOverrideForRigidbody(rb);
+            }
+        }
     }
 
     // 判断某刚体是否被A或B任意一侧门追踪中
