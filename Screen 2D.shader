@@ -264,9 +264,9 @@ Shader "Destruction/Portal_Skybox_TrueSync_RecursiveSebOverlay"
 
  if(_Transition >= 0.999)
  {
- if(portalUV.x < 0 || portalUV.x > 1 || portalUV.y < 0 || portalUV.y > 1)
- return fixed4(0,0,0,1);
- return tex2D(_MainTex, portalUV);
+     // 防止刚体穿越时传送门底部越界直接黑掉，改为边缘延伸采样
+     float2 clampedPortalUV = clamp(portalUV, float2(0.0, 0.0), float2(1.0, 1.0));
+     return tex2D(_MainTex, clampedPortalUV);
  }
 
  float effect = 1.0 - _Transition;
@@ -296,17 +296,20 @@ Shader "Destruction/Portal_Skybox_TrueSync_RecursiveSebOverlay"
  bgColor.rgb *= lerp(darkenZone, 1.0, 1.0 - effect);
  bgColor.rgb = lerp(bgColor.rgb, float3(0,0,0), coreMask);
 
- fixed4 portalColor = fixed4(0,0,0,1);
  bool inBounds = (portalUV.x >= 0 && portalUV.x <= 1 && portalUV.y >= 0 && portalUV.y <= 1);
- if(inBounds) portalColor = tex2D(_MainTex, portalUV);
+ float2 sampleUV = inBounds ? portalUV : clamp(portalUV, float2(0.0, 0.0), float2(1.0, 1.0));
+ fixed4 portalColor = tex2D(_MainTex, sampleUV);
 
  fixed4 finalColor = lerp(bgColor, portalColor, _Transition);
  float alphaMask = smoothstep(_DistortionRadius * 1.2, _DistortionRadius * 0.3, worldDist);
  finalColor.a = lerp(alphaMask * effect, 1.0, _Transition);
 
- if(!inBounds && _Transition > 0.5)
+ // 越界区域不直接黑掉，而是用边缘延伸的递归画面混合，避免刚体穿越时底部出现断裂黑块
+ if(!inBounds && _Transition > 0.8)
  {
- finalColor = fixed4(0,0,0,1);
+     float2 edgeUV = clamp(portalUV, float2(0.01, 0.01), float2(0.99, 0.99));
+     finalColor = tex2D(_MainTex, edgeUV);
+     finalColor.a = 1.0;
  }
 
  return finalColor;
