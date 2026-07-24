@@ -1,7 +1,6 @@
 using UdonSharp;
 using UnityEngine;
 using VRC.SDKBase;
-using VRC.Udon;
 
 // ============================================================
 // 合法放置检测 —— 设计说明（写给以后维护这段代码的人，包括未来的你自己）
@@ -215,16 +214,25 @@ public class 传送枪 : UdonSharpBehaviour
     // 刚体抓取状态
     private Rigidbody heldRigidbody;
     private float originalHeldMass = 1f;
-    private Vector3 heldLocalOffset;
-    private Quaternion heldLocalRotationOffset;
+    // Portal 原著手感：手持物体直接锁定在 shootPoint 正前方 1m 处（硬编码 targetPos = shootPoint.position + forward*1），
+    // 不使用 grab 时的相对偏移，因此 heldLocalOffset/heldLocalRotationOffset 字段已移除。
     private bool isGrabbing = false;
     private bool heldTargetMappedThroughPortal = false;
     private Transform heldTargetFromPortal;
     private Transform heldTargetToPortal;
     private bool heldTargetUseClassicHalfTurn = true;
 
+    // 物理查询 NonAlloc 缓冲区（预分配，避免 RaycastAll/OverlapBox 每次调用 new 数组产生 GC）
+    private const int PLACEMENT_RAYCAST_BUFFER_SIZE = 128;
+    private const int PLACEMENT_OVERLAP_BUFFER_SIZE = 64;
+    private RaycastHit[] placementRaycastBuffer;
+    private Collider[] placementOverlapBuffer;
+
     void Start()
     {
+        placementRaycastBuffer = new RaycastHit[PLACEMENT_RAYCAST_BUFFER_SIZE];
+        placementOverlapBuffer = new Collider[PLACEMENT_OVERLAP_BUFFER_SIZE];
+
         localPlayer = Networking.LocalPlayer;
         if (debugPlayerPhysicsOnStart && localPlayer != null && localPlayer.IsValid())
         {
@@ -441,13 +449,7 @@ public class 传送枪 : UdonSharpBehaviour
         rb.isKinematic = true;
 
         // 【Portal 原著严格手感】
-        // 相对位置固定为 shootPoint 本地 (0,0,1)
-        Vector3 desiredLocalOffset = new Vector3(0f, 0f, 1f);
-        Vector3 worldGrabPoint = shootPoint.TransformPoint(desiredLocalOffset);
-        heldLocalOffset = rb.transform.InverseTransformPoint(worldGrabPoint);
-
-        // 旋转严格跟随 shootPoint
-        heldLocalRotationOffset = Quaternion.Inverse(rb.transform.rotation) * shootPoint.rotation;
+        // 手持物位置/旋转由 Update() 每帧强制设为 shootPoint 正前方 1m 处，不使用相对偏移缓存
 
         isGrabbing = true;
         SetGrabAnimator(true);
@@ -525,8 +527,7 @@ public class 传送枪 : UdonSharpBehaviour
         heldRigidbody.position = newWorldPos;
         heldRigidbody.rotation = newWorldRot;
 
-        heldLocalOffset = heldRigidbody.transform.InverseTransformPoint(newWorldPos);
-        heldLocalRotationOffset = Quaternion.Inverse(heldRigidbody.transform.rotation) * newWorldRot;
+        // 注意：手持物位置由 Update() 每帧从 shootPoint 重新硬算，不需要在这里保存偏移
     }
 
     public Rigidbody GetHeldRigidbody()
@@ -648,9 +649,10 @@ public class 传送枪 : UdonSharpBehaviour
             Vector3 targetPos = shootPoint.position + shootPoint.forward * 1f;
             Quaternion targetRot = shootPoint.rotation;
 
-            if (heldTargetMappedThroughPortal && heldTargetFromPortal != null && heldTargetToPortal != null)
+            if (heldTargetMappedThroughPortal && heldTargetFromPortal != null && heldTargetToPortal != null && portalManager != null)
             {
-                Vector3 localTargetPos = heldTargetFromPortal.InverseTransformPoint(targetPos);
+                // 统一使用管理器的 scale-free 坐标变换，避免 portal Transform 缩放影响手持物映射
+                Vector3 localTargetPos = portalManager.LocalPointForPortal(heldTargetFromPortal, targetPos);
                 Quaternion localTargetRot = Quaternion.Inverse(heldTargetFromPortal.rotation) * targetRot;
 
                 if (heldTargetUseClassicHalfTurn)
@@ -660,7 +662,7 @@ public class 传送枪 : UdonSharpBehaviour
                     localTargetRot = halfTurn * localTargetRot;
                 }
 
-                targetPos = heldTargetToPortal.TransformPoint(localTargetPos);
+                targetPos = portalManager.WorldPointFromPortal(heldTargetToPortal, localTargetPos);
                 targetRot = heldTargetToPortal.rotation * localTargetRot;
             }
 
@@ -710,7 +712,7 @@ public class 传送枪 : UdonSharpBehaviour
         // 绝不能把另一扇门也一起忽略——A、B 两扇门必须互相视为实体障碍物，
         // 否则瞄A门时激光会直接穿过B门命中B门背后的墙，导致"A把自己放到了B的位置上"这种
         // 两门重叠的bug（这是本轮修复的一个真实回归问题，改这段代码前一定要意识到这一点）。
-        // 用 RaycastAll 拿到射线路径上的全部命中，过滤掉：
+        // 用 RaycastNonAlloc(预分配 buffer)拿到射线路径上的全部命中，过滤掉：
         // 1) 属于"自己"这条 Transform 链路下的碰撞体；
         // 2) 默认过滤所有 attachedRigidbody != null 的动态刚体/方块（Portal 原著手感：放门射线穿过方块，命中后方墙/地板）。
         // 再从剩下的里面手动找最近的一个，等价于"这一扇门对射线不可见，刚体对放门射线不可见，但另一扇门可见"。
@@ -1108,11 +1110,13 @@ public class 传送枪 : UdonSharpBehaviour
         Vector3 boxCenter = portalPos + forward * placementObstructionOffset;
         Vector3 halfExtents = new Vector3(halfWidth, halfHeight, Mathf.Max(0.001f, placementObstructionDepth * 0.5f));
 
-        Collider[] overlaps = Physics.OverlapBox(boxCenter, halfExtents, portalRot, placementObstructionLayers);
+        // 使用 NonAlloc 避免每次 OverlapBox 分配 Collider[] 数组导致 GC 卡顿
+        if (placementOverlapBuffer == null) placementOverlapBuffer = new Collider[PLACEMENT_OVERLAP_BUFFER_SIZE];
+        int overlapCount = Physics.OverlapBoxNonAlloc(boxCenter, halfExtents, placementOverlapBuffer, portalRot, placementObstructionLayers);
 
-        for (int i = 0; i < overlaps.Length; i++)
+        for (int i = 0; i < overlapCount; i++)
         {
-            Collider col = overlaps[i];
+            Collider col = placementOverlapBuffer[i];
             if (col == null) continue;
             if (ShouldIgnoreColliderForPortalPlacement(col)) continue;
 
@@ -1191,14 +1195,17 @@ public class 传送枪 : UdonSharpBehaviour
 
     bool FindNearestPlacementRayHit(Vector3 origin, Vector3 direction, float distance, LayerMask layerMask, Transform selfPortal, out RaycastHit hit)
     {
-        RaycastHit[] allHits = Physics.RaycastAll(origin, direction, distance, layerMask);
         hit = default(RaycastHit);
         bool foundHit = false;
         float closestDistance = float.MaxValue;
 
-        for (int i = 0; i < allHits.Length; i++)
+        // 使用 NonAlloc 避免每次 Raycast 分配 RaycastHit[] 数组导致 GC 卡顿
+        if (placementRaycastBuffer == null) placementRaycastBuffer = new RaycastHit[PLACEMENT_RAYCAST_BUFFER_SIZE];
+        int hitCount = Physics.RaycastNonAlloc(origin, direction, placementRaycastBuffer, distance, layerMask);
+
+        for (int i = 0; i < hitCount; i++)
         {
-            RaycastHit candidate = allHits[i];
+            RaycastHit candidate = placementRaycastBuffer[i];
             if (candidate.collider == null) continue;
             if (ShouldIgnoreColliderForPortalPlacement(candidate.collider)) continue;
 
