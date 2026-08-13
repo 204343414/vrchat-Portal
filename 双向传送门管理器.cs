@@ -396,6 +396,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private const int MAX_TRACKED_RBS = 32;
     private Rigidbody[] trackedRigidbodiesA = new Rigidbody[MAX_TRACKED_RBS];
     private Rigidbody[] trackedRigidbodiesB = new Rigidbody[MAX_TRACKED_RBS];
+
+    // 手持刚体上一帧位置缓存：用于判断"新收录的手持刚体"是【这一帧真的穿过了门平面】
+    // （快速捅入的隧穿，要立即补传送），还是【上一帧本来就住在平面后侧】（跨门映射握持等
+    // 合法状态，只正常追踪、绝不能传送——判错会造成传送拔河死循环/鬼畜）。
+    // ProcessRigidbodyTravellers 每帧末尾更新；本帧的 A/B 扫描用的都是上一帧的缓存值。
+    private Rigidbody lastHeldRigidbody;
+    private Vector3 lastHeldRigidbodyPosition;
     private Vector3[] rbPreviousOffsetFromPortalA = new Vector3[MAX_TRACKED_RBS];
     private Vector3[] rbPreviousOffsetFromPortalB = new Vector3[MAX_TRACKED_RBS];
     private int[] rbOriginalLayerA = new int[MAX_TRACKED_RBS];
@@ -2913,6 +2920,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 等价于 Seb 原版每个 Portal 在 LateUpdate 里 HandleTravellers。
         ProcessRigidbodyForPortal(true);
         ProcessRigidbodyForPortal(false);
+
+        // 更新手持刚体上一帧位置缓存：本帧 A/B 扫描里的隧穿判定用的是更新前的旧值（上一帧位置）。
+        Rigidbody currentHeld = portalGun != null ? portalGun.GetHeldRigidbody() : null;
+        lastHeldRigidbody = currentHeld;
+        lastHeldRigidbodyPosition = currentHeld != null ? currentHeld.transform.position : Vector3.zero;
     }
 
     private void ProcessRigidbodyForPortal(bool isPortalA)
@@ -3025,24 +3037,33 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 // 快速一捅时，刚体可能一帧内从门槛外直接跳到门平面后侧——此时追踪器才首次收录，
                 // previousOffset 记录的已经是"后面"的位置，后续前后侧比较永远没有前侧记录，
                 // 穿越判定永远不触发；松手后刚体就留在A平面后面，而不是出现在B门出口。
-                // 对新收录且已在后侧(initialSide==-1)的手持刚体，按"本帧完成穿越"处理：
-                // 当前位置沿法线投影到平面作为穿越点，立即传送。双向门语义下，就算是
-                // 穿门抓取拿在平面后的物体，传送结果与枪的映射握持也一致。
-                // 只限手持刚体：避免误传送恰好停在门后结构上的普通刚体（如剪刀穿模斜坡上的物体）。
+                // 判据必须是【这一帧真的穿过了平面】（管理器缓存的手持刚体上一帧位置在前侧、
+                // 这一帧在后侧，线段真实穿过），而绝不能是"现在在后侧"：
+                // 跨门映射握持（刚体传送后枪的映射把它悬停在出口侧）合法地常驻平面后侧，
+                // 追踪器移除又重新收录时若误判传送，会形成传送拔河死循环（塞不进去+鬼畜）。
+                // 穿越点用前后帧插值精确算出，并做门框XY校验（可能从门框角落外侧隧穿）。
                 // 前侧(initialSide==1)刚体正常开始追踪，不传送。
-                if (heldByGun && initialSide == -1)
+                if (heldByGun && initialSide == -1 && lastHeldRigidbody == rb)
                 {
-                    float dotToPlane = Vector3.Dot(rbWorldPos - thisPlane.position, thisPlane.forward);
-                    Vector3 crossingWorldPosGuess = rbWorldPos - thisPlane.forward * dotToPlane;
-                    TeleportRigidbodySebStyle(rb, thisPlane, otherPlane, isPortalA, crossingWorldPosGuess, 1f, true);
-                    AddRigidbodyTracker(!isPortalA, rb, GetRigidbodyTravellerPosition(rb, true) - otherPlane.position, originalLayer, RBSideFromSignedDistance(Vector3.Dot(GetRigidbodyTravellerPosition(rb, true) - otherPlane.position, otherPlane.forward)));
-                    // 兜底：同主穿越路径，穿越后若clone缺失则按新方向补建
-                    if (enableRigidbodyPortalClones && FindCloneIndexForRigidbody(rb) < 0)
+                    float heldPrevDot = Vector3.Dot(lastHeldRigidbodyPosition - thisPlane.position, thisPlane.forward);
+                    float heldCurrDot = Vector3.Dot(rbWorldPos - thisPlane.position, thisPlane.forward);
+                    if (heldPrevDot > 0f && heldCurrDot < 0f)
                     {
-                        EnsureRigidbodyClone(rb, otherPlane, thisPlane);
+                        float heldT = Mathf.Clamp01(heldPrevDot / (heldPrevDot - heldCurrDot));
+                        Vector3 crossingWorldPosGuess = Vector3.Lerp(lastHeldRigidbodyPosition, rbWorldPos, heldT);
+                        if (LocalPointInPortalRect(LocalPointForPortal(thisPlane, crossingWorldPosGuess), thisShape))
+                        {
+                            TeleportRigidbodySebStyle(rb, thisPlane, otherPlane, isPortalA, crossingWorldPosGuess, 1f, true);
+                            AddRigidbodyTracker(!isPortalA, rb, GetRigidbodyTravellerPosition(rb, true) - otherPlane.position, originalLayer, RBSideFromSignedDistance(Vector3.Dot(GetRigidbodyTravellerPosition(rb, true) - otherPlane.position, otherPlane.forward)));
+                            // 兜底：同主穿越路径，穿越后若clone缺失则按新方向补建
+                            if (enableRigidbodyPortalClones && FindCloneIndexForRigidbody(rb) < 0)
+                            {
+                                EnsureRigidbodyClone(rb, otherPlane, thisPlane);
+                            }
+                            count = RemoveRigidbodyTrackerAt(countBeforeAdd, trackers, previousOffsets, originalLayers, lastSides, count);
+                            continue;
+                        }
                     }
-                    count = RemoveRigidbodyTrackerAt(countBeforeAdd, trackers, previousOffsets, originalLayers, lastSides, count);
-                    continue;
                 }
             }
 
