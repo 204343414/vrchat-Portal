@@ -143,6 +143,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private Transform[] cloneTargetPortals = new Transform[MAX_RIGIDBODY_CLONES]; // clone的"映射源门"：rb在这扇门一侧，clone被映射到对面
     private bool[] clonePendingActivation = new bool[MAX_RIGIDBODY_CLONES]; // 初次VRCInstantiate后先不激活，本帧末位置算好再激活
     private int cloneCount = 0;
+    // 材质跟随缓存：每个clone的渲染器配对（本体渲染器数组 <-> clone渲染器数组）。
+    // 创建时由 SyncCloneMaterials 写入，UpdateRigidbodyClonePoses 每帧用 RepointCloneMaterials 校正，
+    // 保证clone渲染器永远指向本体当前的材质实例（含动画控制器正在驱动的动画值，比如材质变色）。
+    // 为什么必须每帧校正而不是只在创建时赋值一次：StripCloneComponents 对clone身上的 Animator 调用的
+    // Destroy() 是【帧末延迟生效】的；Animator 真正被销毁时，Unity 会把被它动画过的渲染器材质
+    // 还原回文件夹里的默认资产，clone创建时那次材质赋值会被这次还原静默撤销。
+    private Renderer[][] cloneMaterialSyncOriginalRenderers = new Renderer[MAX_RIGIDBODY_CLONES][];
+    private Renderer[][] cloneMaterialSyncCloneRenderers = new Renderer[MAX_RIGIDBODY_CLONES][];
     // clone 组件清理类型列表（Udon不支持自定义类上的static字段，改成实例字段，Start里初始化）
     private System.Type[] cloneDestroyTypes;
     // 复用刚体检测用的rbOverlapBuffer已经在ProcessRigidbodyForPortal里，clone更新只在那个流程里做
@@ -3612,6 +3620,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         GameObject original = rb.gameObject;
         if (original == null) return;
 
+        // 先分配slot号：材质跟随缓存（SyncCloneMaterials）要挂在这个slot下，
+        // 必须在 VRCInstantiate 可能提前 return 之前确定。
+        int idx = cloneCount;
+
         // VRCInstantiate 本地拷贝（非网络同步）
         GameObject clone = VRCInstantiate(original);
         if (clone == null) return;
@@ -3623,13 +3635,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 销毁clone上所有Rigidbody/Pickup/Udon/音效/粒子/动画等组件，只保留 Transform+Renderer+MeshFilter+Collider
         StripCloneComponents(clone);
 
-        // 材质同步：把原物体每个Renderer的"运行时material实例"共享给clone对应的Renderer。
-        SyncCloneMaterials(original, clone);
+        // 材质同步 + 跟随缓存：把原物体每个Renderer当前引用的材质实例（含动画控制器正在驱动的
+        // 动画值，比如材质变色）赋给clone对应Renderer，并缓存渲染器配对供每帧校正。
+        // 注意：这一次赋值可能被帧末的"clone Animator销毁还原"撤销，真正兜底靠 RepointCloneMaterials。
+        SyncCloneMaterials(original, clone, idx);
 
         // layer保持和原物体一致（用户要求），不手动改
 
-        // 记录clone映射
-        int idx = cloneCount;
+        // 记录clone映射（slot号 idx 已在 VRCInstantiate 之前分配，材质跟随缓存依赖它）
         cloneOriginalRigidbodies[idx] = rb;
         cloneGameObjects[idx] = clone;
         cloneTargetPortals[idx] = fromPortal;
@@ -3650,19 +3663,56 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         cloneTargetPortals[idx] = newFromPortal;
     }
 
-    // clone的组件清理已经在上面做了，这里只做材质共享同步
-    private void SyncCloneMaterials(GameObject original, GameObject clone)
+    // 材质同步 + 跟随缓存：把本体渲染器当前引用的材质（sharedMaterials 读取不会强制实例化，
+    // 不会对本体产生副作用；若本体材质正被动画控制器实例化驱动，这里拿到的就是带当前动画值的实例）
+    // 赋给clone对应渲染器，同时把渲染器配对缓存下来，供 UpdateRigidbodyClonePoses 每帧校正。
+    private void SyncCloneMaterials(GameObject original, GameObject clone, int cloneIdx)
     {
         if (original == null || clone == null) return;
         Renderer[] origRenderers = original.GetComponentsInChildren<Renderer>(true);
         Renderer[] cloneRenderers = clone.GetComponentsInChildren<Renderer>(true);
+
+        if (cloneIdx >= 0 && cloneIdx < MAX_RIGIDBODY_CLONES)
+        {
+            cloneMaterialSyncOriginalRenderers[cloneIdx] = origRenderers;
+            cloneMaterialSyncCloneRenderers[cloneIdx] = cloneRenderers;
+        }
+
         int count = Mathf.Min(origRenderers.Length, cloneRenderers.Length);
         for (int i = 0; i < count; i++)
         {
             Renderer origR = origRenderers[i];
             Renderer cloneR = cloneRenderers[i];
             if (origR == null || cloneR == null) continue;
-            cloneR.sharedMaterials = origR.materials;
+            cloneR.sharedMaterials = origR.sharedMaterials;
+        }
+    }
+
+    // 材质实时跟随：把clone渲染器的材质引用重新指回本体渲染器当前持有的材质实例。
+    // 覆盖三种"材质引用漂移"场景：
+    //   1) clone的Animator被Destroy（帧末延迟生效）真正销毁时，Unity把clone渲染器材质还原回资产默认材质；
+    //   2) 本体的动画系统后续又实例化了新的材质引用；
+    //   3) 其他系统替换了本体渲染器的材质。
+    // 用 slot0 的 sharedMaterial 做廉价探针（单引用读取，无数组分配）；引用真的变了才整体重写。
+    // 已知边界：通过 MaterialPropertyBlock 改材质不会跟着传播（Udon 无法操作 PropertyBlock），
+    // 本修复覆盖的是"动画控制器/Animation 直接动画材质"这条主路径。
+    private void RepointCloneMaterials(int cloneIdx)
+    {
+        if (cloneIdx < 0 || cloneIdx >= MAX_RIGIDBODY_CLONES) return;
+        Renderer[] origRenderers = cloneMaterialSyncOriginalRenderers[cloneIdx];
+        Renderer[] cloneRenderers = cloneMaterialSyncCloneRenderers[cloneIdx];
+        if (origRenderers == null || cloneRenderers == null) return;
+
+        int count = Mathf.Min(origRenderers.Length, cloneRenderers.Length);
+        for (int i = 0; i < count; i++)
+        {
+            Renderer origR = origRenderers[i];
+            Renderer cloneR = cloneRenderers[i];
+            if (origR == null || cloneR == null) continue;
+            if (cloneR.sharedMaterial != origR.sharedMaterial)
+            {
+                cloneR.sharedMaterials = origR.sharedMaterials;
+            }
         }
     }
 
@@ -3721,11 +3771,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             cloneGameObjects[idx] = cloneGameObjects[last];
             cloneTargetPortals[idx] = cloneTargetPortals[last];
             clonePendingActivation[idx] = clonePendingActivation[last];
+            cloneMaterialSyncOriginalRenderers[idx] = cloneMaterialSyncOriginalRenderers[last];
+            cloneMaterialSyncCloneRenderers[idx] = cloneMaterialSyncCloneRenderers[last];
         }
         cloneOriginalRigidbodies[last] = null;
         cloneGameObjects[last] = null;
         cloneTargetPortals[last] = null;
         clonePendingActivation[last] = false;
+        cloneMaterialSyncOriginalRenderers[last] = null;
+        cloneMaterialSyncCloneRenderers[last] = null;
         cloneCount = last;
     }
 
@@ -3743,6 +3797,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             cloneGameObjects[i] = null;
             cloneTargetPortals[i] = null;
             clonePendingActivation[i] = false;
+            cloneMaterialSyncOriginalRenderers[i] = null;
+            cloneMaterialSyncCloneRenderers[i] = null;
         }
         cloneCount = 0;
     }
@@ -3783,11 +3839,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     cloneGameObjects[i] = cloneGameObjects[last];
                     cloneTargetPortals[i] = cloneTargetPortals[last];
                     clonePendingActivation[i] = clonePendingActivation[last];
+                    cloneMaterialSyncOriginalRenderers[i] = cloneMaterialSyncOriginalRenderers[last];
+                    cloneMaterialSyncCloneRenderers[i] = cloneMaterialSyncCloneRenderers[last];
                 }
                 cloneOriginalRigidbodies[last] = null;
                 cloneGameObjects[last] = null;
                 cloneTargetPortals[last] = null;
                 clonePendingActivation[last] = false;
+                cloneMaterialSyncOriginalRenderers[last] = null;
+                cloneMaterialSyncCloneRenderers[last] = null;
                 cloneCount = last;
                 i--;
                 continue;
@@ -3822,6 +3882,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             clone.transform.position = worldPos;
             clone.transform.rotation = worldRot;
+
+            // 材质实时跟随（含动画控制器驱动的变色等）：为什么需要每帧校正见 RepointCloneMaterials 注释。
+            // 放在激活判定之前，保证clone首次可见时材质就已经是对的。
+            RepointCloneMaterials(idx);
 
             bool firstFrame = clonePendingActivation[idx];
             if (firstFrame) clonePendingActivation[idx] = false;

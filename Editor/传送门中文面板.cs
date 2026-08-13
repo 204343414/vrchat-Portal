@@ -106,6 +106,14 @@
 //   - 视觉：完整传送（相对坐标保持），无需新 Shader。性能优先（复用 checkInterval）。
 //   - 泛用性：可直接做 Prefab，无需新组件。networking 留空（本地优先）。
 //   - 交接注意：刚体传送完全复用现有 traveller/halfTurn/形状系统，极高鲁棒性。
+//
+// 【clone材质动画跟随修复（2026-08-13）】
+//   症状：本体刚体的材质被动画控制器动画（如变色）时，穿门clone显示的是文件夹里的默认材质，不跟随变色。
+//   根因：StripCloneComponents 对clone的Animator调用Destroy()是帧末延迟生效的；Animator真正销毁时
+//         Unity会把被它动画过的渲染器材质还原回默认资产，创建时那次材质赋值被静默撤销。
+//   方案：每帧在 UpdateRigidbodyClonePoses 里用 RepointCloneMaterials 把clone渲染器材质引用
+//         校正回本体渲染器当前持有的材质实例（slot0 sharedMaterial做廉价探针，引用变了才重写，近零开销）。
+//   已知边界：MaterialPropertyBlock 方式改材质不会跟着传播（Udon无法操作PropertyBlock）。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;
