@@ -644,25 +644,69 @@ public class 传送枪 : UdonSharpBehaviour
         if (heldRigidbody != null && isHeld)
         {
             // 更稳定、更符合原著的写法：默认直接用 shootPoint 的世界坐标 + forward * 1。
-            // 如果刚体已经穿过传送门，而枪还在入口侧，则把这个“手持目标点”也映射到出口侧，避免物体被拉回入口。
+            // 握持点与传送门的关系全部按"射线折射"几何实时判定（和抓取射线的两段折射同一套数学），
+            // 不再无条件信任映射状态：
+            //   - 未映射时：握持射线穿过某扇门 → 刚体直接放到折射后的位置（塞入过程平滑、A/B方向对称）；
+            //   - 已映射时：只有"枪身已过门平面"或"握持射线仍穿过该门"才继续应用映射；
+            //     一旦拉回/移开就清除映射、刚体回到直接握持点。绝不能把位于门前的握持点镜像到
+            //     出口平面后方——那会把刚体拖进出口侧的墙体/虚空（B方向鬼畜塞不进、松手掉虚空
+            //     消失的共同根源，例如A是地板门时镜像点在地板下方）。
             Vector3 targetPos = shootPoint.position + shootPoint.forward * 1f;
             Quaternion targetRot = shootPoint.rotation;
 
             if (heldTargetMappedThroughPortal && heldTargetFromPortal != null && heldTargetToPortal != null && portalManager != null)
             {
-                // 统一使用管理器的 scale-free 坐标变换，避免 portal Transform 缩放影响手持物映射
-                Vector3 localTargetPos = portalManager.LocalPointForPortal(heldTargetFromPortal, targetPos);
-                Quaternion localTargetRot = Quaternion.Inverse(heldTargetFromPortal.rotation) * targetRot;
+                Vector3 gunLocalFrom = portalManager.LocalPointForPortal(heldTargetFromPortal, shootPoint.position);
+                Transform crossedFrom;
+                Transform crossedTo;
+                bool stillRefracting = gunLocalFrom.z < 0f
+                    || (portalManager.TryGetPortalCrossingForSegment(shootPoint.position, targetPos, out crossedFrom, out crossedTo) && crossedFrom == heldTargetFromPortal);
 
-                if (heldTargetUseClassicHalfTurn)
+                if (stillRefracting)
                 {
-                    Quaternion halfTurn = Quaternion.AngleAxis(180f, Vector3.up);
-                    localTargetPos = halfTurn * localTargetPos;
-                    localTargetRot = halfTurn * localTargetRot;
-                }
+                    // 统一使用管理器的 scale-free 坐标变换，避免 portal Transform 缩放影响手持物映射
+                    Vector3 localTargetPos = portalManager.LocalPointForPortal(heldTargetFromPortal, targetPos);
+                    Quaternion localTargetRot = Quaternion.Inverse(heldTargetFromPortal.rotation) * targetRot;
 
-                targetPos = portalManager.WorldPointFromPortal(heldTargetToPortal, localTargetPos);
-                targetRot = heldTargetToPortal.rotation * localTargetRot;
+                    if (heldTargetUseClassicHalfTurn)
+                    {
+                        Quaternion halfTurn = Quaternion.AngleAxis(180f, Vector3.up);
+                        localTargetPos = halfTurn * localTargetPos;
+                        localTargetRot = halfTurn * localTargetRot;
+                    }
+
+                    targetPos = portalManager.WorldPointFromPortal(heldTargetToPortal, localTargetPos);
+                    targetRot = heldTargetToPortal.rotation * localTargetRot;
+                }
+                else
+                {
+                    // 折射断开（枪拉回门前且握持射线不再穿过该门）：清除映射，刚体回到玩家侧直接握持点。
+                    ClearHeldPortalTargetMapping();
+                }
+            }
+            else if (portalManager != null)
+            {
+                // 折射握持：握持射线穿过某扇门（落在门框内）时，把刚体直接放到另一侧的折射位置并建立映射。
+                // 这让"把刚体塞进传送门"不依赖管理器先检测穿越再传送（那条路容易和MovePosition
+                // 形成往返拉扯），手过平面刚体即出现在另一侧镜像位置，也永远不会被拖进门的墙体几何。
+                Transform crossedFrom;
+                Transform crossedTo;
+                if (portalManager.TryGetPortalCrossingForSegment(shootPoint.position, targetPos, out crossedFrom, out crossedTo))
+                {
+                    Vector3 localTargetPos = portalManager.LocalPointForPortal(crossedFrom, targetPos);
+                    Quaternion localTargetRot = Quaternion.Inverse(crossedFrom.rotation) * targetRot;
+
+                    if (portalManager.useClassicHalfTurn)
+                    {
+                        Quaternion halfTurn = Quaternion.AngleAxis(180f, Vector3.up);
+                        localTargetPos = halfTurn * localTargetPos;
+                        localTargetRot = halfTurn * localTargetRot;
+                    }
+
+                    targetPos = portalManager.WorldPointFromPortal(crossedTo, localTargetPos);
+                    targetRot = crossedTo.rotation * localTargetRot;
+                    SetHeldPortalTargetMapping(crossedFrom, crossedTo, portalManager.useClassicHalfTurn);
+                }
             }
 
             heldRigidbody.MovePosition(targetPos);

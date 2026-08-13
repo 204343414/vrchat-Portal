@@ -3297,6 +3297,45 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return LocalPointInPortalRect(local, shapeType);
     }
 
+    /// 判定线段 [rayOrigin, endPoint] 是否穿过 A/B 某扇门的平面（穿越点落在门框形状内），
+    /// 返回被穿过的门(fromPortal)和它的对面门(toPortal)。两门都穿过时取较近的。
+    /// 供传送枪的"折射握持"使用：手（握持点）过了门平面时，把刚体放到对面镜像位置，
+    /// 保证刚体永远不会被拖进门后墙体几何（鬼畜/塞不进去/松手消失的共同根源）。
+    public bool TryGetPortalCrossingForSegment(Vector3 rayOrigin, Vector3 endPoint, out Transform fromPortal, out Transform toPortal)
+    {
+        fromPortal = null;
+        toPortal = null;
+        if (portalPlaneA == null || portalPlaneB == null) return false;
+
+        Vector3 segDir = endPoint - rayOrigin;
+        float segLength = segDir.magnitude;
+        if (segLength < 0.001f) return false;
+        segDir = segDir / segLength;
+        // +0.01f 容差：TryRayPortalIntersection 要求 t < maxDistance，确保线段端点刚好在平面后也能命中
+        float maxDistance = segLength + 0.01f;
+
+        float tA;
+        Vector3 hitA;
+        bool hitPortalA = TryRayPortalIntersection(rayOrigin, segDir, maxDistance, portalPlaneA, ResolvePortalShape(true), out tA, out hitA);
+        float tB;
+        Vector3 hitB;
+        bool hitPortalB = TryRayPortalIntersection(rayOrigin, segDir, maxDistance, portalPlaneB, ResolvePortalShape(false), out tB, out hitB);
+
+        if (hitPortalA && (!hitPortalB || tA <= tB))
+        {
+            fromPortal = portalPlaneA;
+            toPortal = portalPlaneB;
+            return true;
+        }
+        if (hitPortalB)
+        {
+            fromPortal = portalPlaneB;
+            toPortal = portalPlaneA;
+            return true;
+        }
+        return false;
+    }
+
     private int RBSideFromSignedDistance(float signedDistance)
     {
         float eps = Mathf.Max(Mathf.Abs(crossingEpsilon), 0.0001f);
