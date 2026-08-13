@@ -378,12 +378,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("传送 traveller 使用根骨/玩家位置而不是头部。推荐开启：歪头不会触发传送，TeleportTo 也不再从头部反推 root；关闭则回到旧头部模式。")]
     public bool useRootAsTraveller = true;
 
-    [Tooltip("混合 traveller：门平面内 XY 使用根骨/root，穿越深度 Z 使用头部/head。推荐开启：避免歪头横向影响，又避免地板/天花板门脚先触发导致头卡天花板。")]
+    [Tooltip("混合 traveller（推荐开启）：用【头部】判定是否穿过了门平面（检测点），用【根骨】计算实际传送落点（映射点）。所有门朝向统一标准：头穿过门平面→传送。关闭则退回检测与落点都用root的旧模式（脚过平面就触发，斜门下落易漏检）。")]
     public bool useHybridRootXYHeadZTraveller = true;
-
-    [Tooltip("朝上门判定阈值（门法线与竖直方向夹角的余弦）。门斜放（如45°斜坡）且法线有明显竖直分量时，穿越深度Z改用【头部】判定——头真正落到门面以下才传送，防止'走上斜向门靠近就传送'（root/脚先过平面导致）。地板/天花板(余弦≈1)恒为朝上门不受影响；竖直墙(余弦≈0)不受影响仍用root。值越小，越陡的斜坡也算朝上门。")]
-    [Range(0.1f, 0.95f)]
-    public float upwardFacingPortalDotThreshold = 0.5f;
 
     [Tooltip("出口侧保险：如果计算出的出口 traveller 落在入口侧/门背面，则只沿出口法线拉回到正确侧一点点。主要防45度斜面/角色控制器误差导致来回鬼畜。")]
     public bool enableExitSideCorrection = true;
@@ -1363,15 +1359,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return isPortalA ? previousTeleportLocalA : previousTeleportLocalB;
     }
 
-    /// "朝上门"判定：法线有明显竖直分量（地板/天花板/45°斜坡等）。
-    /// 注意与 flatPortalDotThreshold（0.9925，约6°以内，只用于 ApplyOptionalMomentumSnapping
-    /// 等要求严格水平的动量吸附旧逻辑）的分工：本函数用于 traveller 穿越深度模式选择——
-    /// 朝上门必须"头落到门面以下"(Z用head)才触发传送，否则走上斜坡时 root 先过平面，
-    /// 表现为"靠近斜向门就直接传送"。
+    /// "朝上门"判定（仅供内部使用）：法线有明显竖直分量（地板/天花板/45°斜坡等）。
+    /// 重要：本函数只用于 TeleportSebStyle 里选择【传送落点映射配方】，完全不参与触发判定
+    /// （触发检测点永远是 head，见 TravellerLocalForPortal），所以不需要也不提供可调阈值。
+    /// 0.5 常量（坡度约≤60°算朝上门）即使分类有偏差，也只影响落点微调的配方选择，
+    /// 出口侧保险(enableExitSideCorrection)会兜底，不会造成漏传/方向错误。
     bool IsUpwardFacingPortal(Transform portal)
     {
         if (portal == null) return false;
-        return Mathf.Abs(Vector3.Dot(portal.forward, Vector3.up)) > upwardFacingPortalDotThreshold;
+        return Mathf.Abs(Vector3.Dot(portal.forward, Vector3.up)) > 0.5f;
     }
 
     Vector3 TravellerLocalForPortal(Transform portal, Vector3 rootWorld, Vector3 headWorld)
@@ -1389,18 +1385,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         Vector3 headLocal = LocalPointForPortal(portal, headWorld);
 
-        if (IsUpwardFacingPortal(portal))
-        {
-            // 地板/天花板/斜坡（朝上门）：门面内 XY 用 root，穿越深度 Z 用 head。
-            // 这样不会脚先传导致头卡天花板，也不会歪头改变门面内落点；
-            // 斜坡上必须头真正落下面才传送，不会"靠近就传"。
-            return new Vector3(rootLocal.x, rootLocal.y, headLocal.z);
-        }
-
-        // 墙面：门面横向 X 用 root，门面高度 Y 用 head，穿越深度 Z 用 root。
-        // 原因：VRCPlayerApi.GetPosition() 更像脚底/胶囊底部；若墙面门 localY 用 root，普通走门会因 y 太低而在门框外。
-        // 但深度 Z 仍用 root，避免玩家只把头探过墙就触发整个人传送。
-        return new Vector3(rootLocal.x, headLocal.y, rootLocal.z);
+        // 统一检测规则（与门朝向无关）：穿越检测点恒为【head】——头穿过门平面即传送，
+        // 与玩家视角一致（SebLague 原版也是相机过平面触发）。地板/天花板/斜坡/墙面同一标准，
+        // 不存在"按门的角度决定提前/延后传送"的机制。
+        // 刻意不做 root XY + head Z 之类的混搭：斜向门（如45°斜坡）上 head 与 root 的
+        // 门平面内 XY 会相差"玩家竖直身高在门平面上的投影"（45°约1.1米）；混搭点不在身体上，
+        // 直直下落穿斜门时检测 XY 会偏离头部实际穿平面位置约1.1米 → 门框检查失败 → 穿模漏检。
+        // 纯 head 点在任何朝向下都无歧义：XY=头穿平面的位置，Z=头的深度。
+        // 实际传送落点由 TeleportPointLocalForPortal(root) 单独计算：头判定穿越、根骨算落点。
+        return headLocal;
     }
 
     Vector3 TeleportPointLocalForPortal(Transform portal, Vector3 rootWorld, Vector3 headWorld)
