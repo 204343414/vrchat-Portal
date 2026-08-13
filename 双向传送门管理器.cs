@@ -3019,6 +3019,31 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (count != countBeforeAdd)
             {
                 ApplyPortalOverlayToGameObject(rb.gameObject);
+
+                // 手持刚体隧穿补洞：手持刚体被枪用 MovePosition 驱动，rb.velocity≈0，
+                // 动态追踪深度扩展（靠法线速度把门槛从1.1米最高扩到8米）对它永远不生效。
+                // 快速一捅时，刚体可能一帧内从门槛外直接跳到门平面后侧——此时追踪器才首次收录，
+                // previousOffset 记录的已经是"后面"的位置，后续前后侧比较永远没有前侧记录，
+                // 穿越判定永远不触发；松手后刚体就留在A平面后面，而不是出现在B门出口。
+                // 对新收录且已在后侧(initialSide==-1)的手持刚体，按"本帧完成穿越"处理：
+                // 当前位置沿法线投影到平面作为穿越点，立即传送。双向门语义下，就算是
+                // 穿门抓取拿在平面后的物体，传送结果与枪的映射握持也一致。
+                // 只限手持刚体：避免误传送恰好停在门后结构上的普通刚体（如剪刀穿模斜坡上的物体）。
+                // 前侧(initialSide==1)刚体正常开始追踪，不传送。
+                if (heldByGun && initialSide == -1)
+                {
+                    float dotToPlane = Vector3.Dot(rbWorldPos - thisPlane.position, thisPlane.forward);
+                    Vector3 crossingWorldPosGuess = rbWorldPos - thisPlane.forward * dotToPlane;
+                    TeleportRigidbodySebStyle(rb, thisPlane, otherPlane, isPortalA, crossingWorldPosGuess, 1f, true);
+                    AddRigidbodyTracker(!isPortalA, rb, GetRigidbodyTravellerPosition(rb, true) - otherPlane.position, originalLayer, RBSideFromSignedDistance(Vector3.Dot(GetRigidbodyTravellerPosition(rb, true) - otherPlane.position, otherPlane.forward)));
+                    // 兜底：同主穿越路径，穿越后若clone缺失则按新方向补建
+                    if (enableRigidbodyPortalClones && FindCloneIndexForRigidbody(rb) < 0)
+                    {
+                        EnsureRigidbodyClone(rb, otherPlane, thisPlane);
+                    }
+                    count = RemoveRigidbodyTrackerAt(countBeforeAdd, trackers, previousOffsets, originalLayers, lastSides, count);
+                    continue;
+                }
             }
 
             if (rb.gameObject.layer != rigidbodyPassThroughLayer)
