@@ -381,6 +381,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("混合 traveller：门平面内 XY 使用根骨/root，穿越深度 Z 使用头部/head。推荐开启：避免歪头横向影响，又避免地板/天花板门脚先触发导致头卡天花板。")]
     public bool useHybridRootXYHeadZTraveller = true;
 
+    [Tooltip("朝上门判定阈值（门法线与竖直方向夹角的余弦）。门斜放（如45°斜坡）且法线有明显竖直分量时，穿越深度Z改用【头部】判定——头真正落到门面以下才传送，防止'走上斜向门靠近就传送'（root/脚先过平面导致）。地板/天花板(余弦≈1)恒为朝上门不受影响；竖直墙(余弦≈0)不受影响仍用root。值越小，越陡的斜坡也算朝上门。")]
+    [Range(0.1f, 0.95f)]
+    public float upwardFacingPortalDotThreshold = 0.5f;
+
     [Tooltip("出口侧保险：如果计算出的出口 traveller 落在入口侧/门背面，则只沿出口法线拉回到正确侧一点点。主要防45度斜面/角色控制器误差导致来回鬼畜。")]
     public bool enableExitSideCorrection = true;
 
@@ -1359,10 +1363,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return isPortalA ? previousTeleportLocalA : previousTeleportLocalB;
     }
 
-    bool IsFlatPortal(Transform portal)
+    /// "朝上门"判定：法线有明显竖直分量（地板/天花板/45°斜坡等）。
+    /// 注意与 flatPortalDotThreshold（0.9925，约6°以内，只用于 ApplyOptionalMomentumSnapping
+    /// 等要求严格水平的动量吸附旧逻辑）的分工：本函数用于 traveller 穿越深度模式选择——
+    /// 朝上门必须"头落到门面以下"(Z用head)才触发传送，否则走上斜坡时 root 先过平面，
+    /// 表现为"靠近斜向门就直接传送"。
+    bool IsUpwardFacingPortal(Transform portal)
     {
         if (portal == null) return false;
-        return Mathf.Abs(Vector3.Dot(portal.forward, Vector3.up)) > flatPortalDotThreshold;
+        return Mathf.Abs(Vector3.Dot(portal.forward, Vector3.up)) > upwardFacingPortalDotThreshold;
     }
 
     Vector3 TravellerLocalForPortal(Transform portal, Vector3 rootWorld, Vector3 headWorld)
@@ -1380,10 +1389,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         Vector3 headLocal = LocalPointForPortal(portal, headWorld);
 
-        if (IsFlatPortal(portal))
+        if (IsUpwardFacingPortal(portal))
         {
-            // 地板/天花板：门面内 XY 用 root，穿越深度 Z 用 head。
-            // 这样不会脚先传导致头卡天花板，也不会歪头改变门面内落点。
+            // 地板/天花板/斜坡（朝上门）：门面内 XY 用 root，穿越深度 Z 用 head。
+            // 这样不会脚先传导致头卡天花板，也不会歪头改变门面内落点；
+            // 斜坡上必须头真正落下面才传送，不会"靠近就传"。
             return new Vector3(rootLocal.x, rootLocal.y, headLocal.z);
         }
 
@@ -1764,15 +1774,26 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
             else
             {
-                // 2. 扫掠补救：线段与 z=±triggerOffset 平面求交，防止高速隧穿漏检
+                // 2. 扫掠补救：线段与 z=±triggerOffset 平面求交，防止高速隧穿漏检。
+                // 除了"从平面外侧进入"的经典情况，还覆盖【死区穿越完成】情况：
+                // 上一帧 traveller 恰好落在死区(|z|<=offset，side=0)时，经典路径(oldSide!=0)
+                // 和"必须从外侧进入"的旧扫掠门槛都哑火，玩家能整段穿过门而不触发（下落穿过
+                // 斜向门时高发：穿越点XY在门框外、滑进死区后XY才进门框）。此时只要 lastBodySide
+                // 明确记录了来向，就承认这次"从死区穿出触发平面"是一次完整穿越。
+                // lastBodySide 门槛同时防误触发：传送出口恰好落在触发平面边界时，
+                // TeleportSebStyle 会把 lastBodySide 种成出口侧方向，朝远离门的方向运动
+                // 不会满足"来向相反"，不会立刻反向重传。
                 float prevZ = previousTravellerLocal.z;
                 float currZ = currentTravellerLocal.z;
                 float dz = currZ - prevZ;
                 if (Mathf.Abs(dz) > 0.0001f)
                 {
-                    // 检查 z = +triggerOffset（从正侧进入）
+                    // 检查 z = +triggerOffset：a) 从正侧外侧进入；b) 死区内穿出且来向是负侧(lastBodySide==-1)
+                    bool prevInDeadZone = prevZ > -teleportTriggerOffset && prevZ < teleportTriggerOffset;
+                    bool plusFromOutside = prevZ > teleportTriggerOffset;
+                    bool plusFromDeadZone = prevInDeadZone && lastBodySide == -1;
                     float tPlus = (teleportTriggerOffset - prevZ) / dz;
-                    if (tPlus >= 0f && tPlus <= 1f && prevZ > teleportTriggerOffset)
+                    if (tPlus >= 0f && tPlus <= 1f && (plusFromOutside || plusFromDeadZone))
                     {
                         crossingT = Mathf.Clamp01(tPlus);
                         crossingLocal = Vector3.Lerp(previousTravellerLocal, currentTravellerLocal, crossingT);
@@ -1783,11 +1804,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                             newSide = currZ < -teleportTriggerOffset ? -1 : 0;
                         }
                     }
-                    // 检查 z = -triggerOffset（从负侧进入）
+                    // 检查 z = -triggerOffset：a) 从负侧外侧进入；b) 死区内穿出且来向是正侧(lastBodySide==1)
                     if (!crossedPlane)
                     {
+                        bool minusFromOutside = prevZ < -teleportTriggerOffset;
+                        bool minusFromDeadZone = prevInDeadZone && lastBodySide == 1;
                         float tMinus = (-teleportTriggerOffset - prevZ) / dz;
-                        if (tMinus >= 0f && tMinus <= 1f && prevZ < -teleportTriggerOffset)
+                        if (tMinus >= 0f && tMinus <= 1f && (minusFromOutside || minusFromDeadZone))
                         {
                             crossingT = Mathf.Clamp01(tMinus);
                             crossingLocal = Vector3.Lerp(previousTravellerLocal, currentTravellerLocal, crossingT);
@@ -1878,7 +1901,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Vector3 localVelAtCrossing = LocalDirForPortal(fromPlane, velAtCrossing);
         localVelAtCrossing = ApplyOptionalMomentumSnapping(fromPlane, toPlane, velAtCrossing, localVelAtCrossing);
 
-        bool flatHybridTraveller = useRootAsTraveller && useHybridRootXYHeadZTraveller && IsFlatPortal(fromPlane);
+        bool flatHybridTraveller = useRootAsTraveller && useHybridRootXYHeadZTraveller && IsUpwardFacingPortal(fromPlane);
 
         // flat hybrid：用 root XY（无漂移）+ head Z（正确穿越深度）构造混合映射点。
         //   旧版全用 crossingLocal（head 点）→ XY 有 headFromRoot 漂移。
@@ -1944,9 +1967,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 // mappedCrossingLocal = rootXY + headZ → 混合点。
                 // newMappedPointPos 是混合点的世界坐标：门面内位置来自 root（无漂移），深度来自 head。
-                if (IsFlatPortal(toPlane))
+                if (IsUpwardFacingPortal(toPlane))
                 {
-                    // 出口也是平面门：沿出口法线把深度从 head 调整到 root。
+                    // 出口也是朝上门（地板/天花板/斜坡）：沿出口法线把深度从 head 调整到 root。
                     // headFromRoot 在出口法线方向的分量 = head 和 root 的深度差。
                     float hfrDepth = Vector3.Dot(headFromRoot, toPlane.forward);
                     newTeleportPos = newMappedPointPos - toPlane.forward * hfrDepth;
@@ -2062,7 +2085,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             Vector3 localToB_afterTeleport = TravellerLocalForPortal(portalPlaneB, newTeleportPos, cameraHeadAfterTeleport);
             Vector3 teleportLocalToB_afterTeleport = TeleportPointLocalForPortal(portalPlaneB, newTeleportPos, cameraHeadAfterTeleport);
-            lastBodySideB = SideFromLocalZ(localToB_afterTeleport.z);
+            // 出口修正可能把落点精确推到触发平面边界上，SideFromLocalZ 边界返回 0；
+            // 此时必须用预期出口侧种子兜底，否则下一帧经典检测 oldSide==0 哑火，
+            // 玩家可能直接穿过出口门所在平面而不触发（下落/低速场景高发）。
+            int spawnSideB = SideFromLocalZ(localToB_afterTeleport.z);
+            lastBodySideB = spawnSideB != 0 ? spawnSideB : (entryOldSide == 0 ? 1 : entryOldSide);
             SetTravellerTracking(true, false, TravellerLocalForPortal(portalPlaneA, playerRoot, playerHead));
             SetTeleportTrackingLocal(true, TeleportPointLocalForPortal(portalPlaneA, playerRoot, playerHead));
             SetTravellerTracking(false, true, localToB_afterTeleport);
@@ -2087,7 +2114,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             Vector3 localToA_afterTeleport = TravellerLocalForPortal(portalPlaneA, newTeleportPos, cameraHeadAfterTeleport);
             Vector3 teleportLocalToA_afterTeleport = TeleportPointLocalForPortal(portalPlaneA, newTeleportPos, cameraHeadAfterTeleport);
-            lastBodySideA = SideFromLocalZ(localToA_afterTeleport.z);
+            // 同 fromAtoB 分支：边界落点 side==0 时用预期出口侧种子兜底。
+            int spawnSideA = SideFromLocalZ(localToA_afterTeleport.z);
+            lastBodySideA = spawnSideA != 0 ? spawnSideA : (entryOldSide == 0 ? 1 : entryOldSide);
             SetTravellerTracking(false, false, TravellerLocalForPortal(portalPlaneB, playerRoot, playerHead));
             SetTeleportTrackingLocal(false, TeleportPointLocalForPortal(portalPlaneB, playerRoot, playerHead));
             SetTravellerTracking(true, true, localToA_afterTeleport);

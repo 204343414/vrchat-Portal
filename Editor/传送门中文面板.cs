@@ -127,6 +127,22 @@
 //   方案：新增 FindClipVolumeOriginalLayer 查clipVolume追踪表（它只在非穿透层时接管记录，
 //         表里必是真原始值）；在 ApplyPassThroughLayer 记录时（根治，共两处）和
 //         RestorePassThroughLayer 还原时（防御兜底）都用它纠正被污染的穿透层记录。
+//
+// 【斜向门触发语义 + 下落穿透修复（2026-08-13）】
+//   症状1：门打在45°斜坡上时"靠近就传送"，不是头落下去才传送。
+//   根因：IsFlatPortal 阈值0.9925只认6°以内的纯平门，45°斜坡被归成"墙面"，
+//         穿越深度Z用root(脚)，脚先过平面就触发。
+//   方案：新增 IsUpwardFacingPortal + 可调阈值 upwardFacingPortalDotThreshold（默认0.5，
+//         即坡度≤60°算朝上门）；TravellerLocalForPortal / TeleportSebStyle 的 flatHybridTraveller
+//         和出口分支全部改用它。严格水平判定(flatPortalDotThreshold)仅保留给动量吸附旧逻辑；
+//         改造后零调用的 IsFlatPortal 已按死代码删除。
+//   症状2：下落穿过斜向门有时不触发传送。
+//   根因：死区洞——上一帧traveller落在±triggerOffset死区内(side=0)时，经典路径(要求oldSide!=0)
+//         和旧扫掠门槛(要求上一帧在平面外侧)同时哑火。斜向门下落高发：穿越点XY在门框外、
+//         滑进死区后XY才进门框。
+//   方案：扫掠判定放宽为"上一帧在死区内 + lastBodySide记录了相反来向"也承认穿越
+//         （与刚体侧 rbLastPortalSide 同款思路）；TeleportSebStyle 出口把 lastBodySide
+//         在边界落点(side=0)时种成预期出口侧，既保证后续检测不哑火，又不会反向重传。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;
@@ -229,6 +245,7 @@ public static class 传送门中文面板_标签表
         { "teleportTriggerOffset", "传送触发面偏移" },
         { "useRootAsTraveller", "使用根骨追踪" },
         { "useHybridRootXYHeadZTraveller", "混合根骨/头部追踪" },
+        { "upwardFacingPortalDotThreshold", "朝上门判定阈值(斜坡头落才传)" },
         { "enableExitSideCorrection", "出口侧保险修正" },
         { "exitSideMinDistance", "出口最小安全距离" },
         { "useVRCTrackingRootTeleport", "旧版-头部反推根骨" },
