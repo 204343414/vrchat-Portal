@@ -1495,27 +1495,46 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         if (!alreadyActive || oldCollider != markedCollider)
         {
-            // 如果传送门重新打到了新物体，先尽量把旧物体恢复，避免旧物体永久停在 29。
+            // 如果传送门重新打到了新物体，先尽量把旧物体恢复，避免旧物体永久停在穿透层。
             if (alreadyActive && oldCollider != null && oldCollider != markedCollider)
             {
                 GameObject oldObj = oldCollider.gameObject;
-                if (oldObj != null && rememberedLayer >= 0 && oldObj.layer == playerPassThroughLayer)
+                // rememberedLayer 万一被污染成穿透层本身，优先用 clip volume 追踪表里的真原始值兜底
+                int restoreTo = rememberedLayer;
+                if (restoreTo == playerPassThroughLayer)
                 {
-                    oldObj.layer = rememberedLayer;
+                    int clipOriginal = FindClipVolumeOriginalLayer(oldCollider);
+                    if (clipOriginal >= 0 && clipOriginal != playerPassThroughLayer) restoreTo = clipOriginal;
+                }
+                if (oldObj != null && restoreTo >= 0 && oldObj.layer == playerPassThroughLayer)
+                {
+                    oldObj.layer = restoreTo;
                 }
             }
 
             int original = obj.layer;
-            // 共享 Collider 时，后进入的一侧可能看到的已经是 29；这时沿用另一侧记录的原始 layer。
+            // 看到的已经是穿透层：真正的原始 layer 在"当初切它的那个系统"手里，按可信度依次取回：
+            // 1) 另一侧 markedCollider 的记录（共享 Collider 场景：A/B 打在同一个碰撞体上）；
+            // 2) Clip Volume 追踪表（剪刀穿模场景：本门 markedCollider 被对面门的 clipVolume 先切了，
+            //    典型：A门clipVolume包住穿模过来的、B门所在的斜面；传送同帧的 afterTeleport
+            //    调用发生在 clipVolume 还原之前，必然读到穿透层）。
+            // 都取不到才退而记录穿透层本身（此时场景里它大概率本来就是穿透层）。
+            // 历史教训：把穿透层误记成"原始layer"，离开时"还原"成穿透层，物体永远回不到默认层。
             if (original == playerPassThroughLayer)
             {
-                if (isPortalA && layerOverrideBActive && layerOverrideColliderB == markedCollider && originalLayerB >= 0)
+                if (isPortalA && layerOverrideBActive && layerOverrideColliderB == markedCollider && originalLayerB >= 0 && originalLayerB != playerPassThroughLayer)
                 {
                     original = originalLayerB;
                 }
-                else if (!isPortalA && layerOverrideAActive && layerOverrideColliderA == markedCollider && originalLayerA >= 0)
+                else if (!isPortalA && layerOverrideAActive && layerOverrideColliderA == markedCollider && originalLayerA >= 0 && originalLayerA != playerPassThroughLayer)
                 {
                     original = originalLayerA;
+                }
+
+                if (original == playerPassThroughLayer)
+                {
+                    int clipOriginal = FindClipVolumeOriginalLayer(markedCollider);
+                    if (clipOriginal >= 0 && clipOriginal != playerPassThroughLayer) original = clipOriginal;
                 }
             }
             SetLayerOverrideState(isPortalA, true, original, markedCollider);
@@ -1556,6 +1575,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         int restoreLayer = GetOriginalLayer(isPortalA);
         if (restoreLayer < 0) restoreLayer = solidCollisionLayer;
+
+        // 防御兜底：记录值万一被污染成穿透层本身（"还原"等于没还原、物体永远卡在穿透层），
+        // 再查一次 clip volume 追踪表里的真原始值。正常路径下记录时已修正，这里防的是残余竞态。
+        if (restoreLayer == playerPassThroughLayer)
+        {
+            int clipOriginal = FindClipVolumeOriginalLayer(markedCollider);
+            if (clipOriginal >= 0 && clipOriginal != playerPassThroughLayer) restoreLayer = clipOriginal;
+        }
 
         if (obj.layer == playerPassThroughLayer)
         {
@@ -3569,6 +3596,25 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (tracked[i] == col) return true;
         }
         return false;
+    }
+
+    // 查 Clip Volume 追踪表：col 若正被 A/B 任一侧 clip volume 追踪，返回当时记录的原始 layer；否则 -1。
+    // 语义："谁切的谁记录了真原始值"——clip volume 只在 layer != 穿透层时才接管并记录，
+    // 所以表里的值一定是切换前的真实 layer，可作为 markedCollider 系统被污染时的真值来源。
+    // 剪刀穿模场景：A门clipVolume包住穿模过来的、B门所在的斜面，B的markedCollider逻辑
+    // 第一次读到斜面时它已经在穿透层，必须靠这张表找回真原始层。
+    private int FindClipVolumeOriginalLayer(Collider col)
+    {
+        if (col == null) return -1;
+        for (int i = 0; i < clipVolumeTrackedCountA; i++)
+        {
+            if (clipVolumeTrackedCollidersA[i] == col) return clipVolumeOriginalLayersA[i];
+        }
+        for (int i = 0; i < clipVolumeTrackedCountB; i++)
+        {
+            if (clipVolumeTrackedCollidersB[i] == col) return clipVolumeOriginalLayersB[i];
+        }
+        return -1;
     }
 
     private void AddColliderToTracked(Collider col, int originalLayer, Collider[] tracked, int[] originalLayers, ref int count)

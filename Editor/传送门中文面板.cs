@@ -117,6 +117,16 @@
 //         1) 材质引用校正：slot0 sharedMaterial做廉价探针，引用漂移才重写；
 //         2) PropertyBlock同步：本体 GetPropertyBlock -> clone SetPropertyBlock
 //            （官方API，UdonSharp支持已联网查证：有多个真实VRChat世界用例）。
+//
+// 【剪刀穿模结构图层还原修复（2026-08-13）】
+//   症状：A打地板、B打在穿模过来的斜面上，A的clipVolume把斜面切到穿透层；从A穿到B后，
+//         斜面永远卡在穿透层，不还原默认层。
+//   根因：传送同帧的 afterTeleport 会对B的markedCollider(斜面)执行 ApplyPassThroughLayer，
+//         此时斜面已被A的clipVolume切到穿透层（clipVolume还原发生在LateUpdate更后面），
+//         旧代码查不到真原始层就把穿透层本身误记为"原始layer"，离开时"还原"成穿透层=永不还原。
+//   方案：新增 FindClipVolumeOriginalLayer 查clipVolume追踪表（它只在非穿透层时接管记录，
+//         表里必是真原始值）；在 ApplyPassThroughLayer 记录时（根治，共两处）和
+//         RestorePassThroughLayer 还原时（防御兜底）都用它纠正被污染的穿透层记录。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;
