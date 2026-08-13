@@ -1156,38 +1156,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     }
 
     // ============================================================
-    // 配置快照导出：把当前 Inspector 关键配置 + A/B 门下所有子物体信息打印到控制台。
-    // 只在 Start() 里按 dumpConfigSnapshotOnStart 开关跑一次，不影响运行时（LateUpdate）性能。
-    // 不用 TPLog（会被 debugTeleportLog 总开关吃掉），直接 Debug.Log，保证这个开关独立生效。
+    // 配置快照导出（已停用）：历史上的调试输出已在 P2 清理中原子删除。
+    // dumpConfigSnapshotOnStart 字段保留（公共序列化字段，场景里可能存有值，删字段有风险），
+    // 对应调用链保留为一个显式的空实现。
+    // 原有的 DumpGlobalConfigSnapshot / DumpPortalGunConfigSnapshot / DumpPortalHierarchySnapshot /
+    // GetPortalShapeName 四个函数经排查全工程无任何调用点，已作为死代码删除。
     // ============================================================
-
-    string GetPortalShapeName(int shape)
-    {
-        if (shape == PORTAL_SHAPE_CIRCLE) return "圆形(0)";
-        if (shape == PORTAL_SHAPE_TRIANGLE) return "三角形(1)";
-        if (shape == PORTAL_SHAPE_BOX) return "方框(2)";
-        if (shape == PORTAL_SHAPE_UNSET) return "未设置(-1，跟随旧开关)";
-        return "未知值(" + shape + ")";
-    }
 
     void DumpConfigSnapshot()
     {
         // P2：已原子删除配置快照调试输出
-        return;
-    }
-
-    void DumpGlobalConfigSnapshot()
-    {
-        return;
-    }
-
-    void DumpPortalGunConfigSnapshot()
-    {
-        return;
-    }
-
-    void DumpPortalHierarchySnapshot(string label, Transform root, Transform plane, Camera cam, Material mat, int resolvedShape, int rawShape)
-    {
         return;
     }
 
@@ -2865,6 +2843,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
+    // 刚体彻底离开 A/B 两侧追踪时，把材质 renderQueue 还原回 3000（兑现本小节"离开还原"的注释承诺）。
+    // 之前只进不出：刚体离开门区域后 renderQueue 永远停在 3001，直到世界重载。
+    // 另一扇门仍在追踪时（比如刚体刚穿门、对面门已接管）不能还原，否则遮罩效果断裂。
+    private void RestorePortalOverlayIfUntracked(Rigidbody rb)
+    {
+        if (rb == null) return;
+        if (IsRigidbodyTrackedByEitherPortal(rb)) return;
+        RemovePortalOverlayFromGameObject(rb.gameObject);
+    }
+
     // ============================================================
     // 刚体传送核心：SebLague traveller 逻辑的 Udon 固定数组版
     // ============================================================
@@ -2961,6 +2949,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 else if (normalSpeed > rbPostCrossNormalSpeedEpsilon) initialSide = -1;
             }
 
+            int countBeforeAdd = count;
             count = AddRigidbodyTrackerToArrays(
                 rb,
                 rbOffsetFromPortal,
@@ -2974,8 +2963,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 false
             );
 
-            // 遮罩叠加：被追踪的刚体临时应用透明遮罩，渲染在传送门画面之上
-            ApplyPortalOverlayToGameObject(rb.gameObject);
+            // 遮罩叠加：被追踪的刚体临时应用透明遮罩，渲染在传送门画面之上。
+            // 必须只在刚体【新加入追踪】那一帧执行：AddRigidbodyTrackerToArrays 对已在追踪的刚体原样返回，
+            // 不加这道门会导致每个被追踪刚体每帧都跑一次 GetComponentsInChildren<Renderer>（纯浪费+GC）。
+            // 离开追踪后由下方 RestorePortalOverlayIfUntracked 还原 renderQueue。
+            if (count != countBeforeAdd)
+            {
+                ApplyPortalOverlayToGameObject(rb.gameObject);
+            }
 
             if (rb.gameObject.layer != rigidbodyPassThroughLayer)
             {
@@ -3010,6 +3005,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                RestorePortalOverlayIfUntracked(rb);
                 continue;
             }
             if (heldByGun && !allowHeldRigidbodyTeleport)
@@ -3017,6 +3013,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                RestorePortalOverlayIfUntracked(rb);
                 continue;
             }
 
@@ -3091,6 +3088,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 }
 
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                // 穿门交接路径：上面已把刚体加入对面门的追踪，RestorePortalOverlayIfUntracked 内部会
+                // 因"仍被追踪"而跳过还原——这里调用只为保持所有移除路径的统一不变式。
+                RestorePortalOverlayIfUntracked(rb);
                 continue;
             }
 
@@ -3102,6 +3102,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                RestorePortalOverlayIfUntracked(rb);
                 continue;
             }
 

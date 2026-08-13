@@ -209,7 +209,6 @@ public static class 传送门中文面板_标签表
         { "debugLogIntervalFrames", "调试-日志间隔帧数" },
         { "playerCapsuleRadius", "玩家胶囊体半径" },
         { "playerCapsuleHeight", "玩家胶囊体高度" },
-        { "portalSideEpsilon", "门侧判定死区" },
         { "teleportBlockFrames", "传送后屏蔽帧数" },
         { "stopAfterTeleportSameFrame", "传送后结束本帧" },
         { "protectSharedMarkedCollider", "保护共享碰撞体" },
