@@ -151,6 +151,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // 还原回文件夹里的默认资产，clone创建时那次材质赋值会被这次还原静默撤销。
     private Renderer[][] cloneMaterialSyncOriginalRenderers = new Renderer[MAX_RIGIDBODY_CLONES][];
     private Renderer[][] cloneMaterialSyncCloneRenderers = new Renderer[MAX_RIGIDBODY_CLONES][];
+    // MaterialPropertyBlock 同步缓冲：联网查证（Unity官方文档/论坛）确认，Animator 对材质属性的动画
+    // 不写进材质本身，而是通过渲染器的 MaterialPropertyBlock 应用——只共享材质引用永远拿不到动画值。
+    // 每帧对本体渲染器 GetPropertyBlock 进这个 block、再 SetPropertyBlock 到 clone 渲染器；block 复用，零GC。
+    private MaterialPropertyBlock clonePropertyBlockSyncBuffer;
     // clone 组件清理类型列表（Udon不支持自定义类上的static字段，改成实例字段，Start里初始化）
     private System.Type[] cloneDestroyTypes;
     // 复用刚体检测用的rbOverlapBuffer已经在ProcessRigidbodyForPortal里，clone更新只在那个流程里做
@@ -3688,14 +3692,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
-    // 材质实时跟随：把clone渲染器的材质引用重新指回本体渲染器当前持有的材质实例。
-    // 覆盖三种"材质引用漂移"场景：
-    //   1) clone的Animator被Destroy（帧末延迟生效）真正销毁时，Unity把clone渲染器材质还原回资产默认材质；
-    //   2) 本体的动画系统后续又实例化了新的材质引用；
-    //   3) 其他系统替换了本体渲染器的材质。
-    // 用 slot0 的 sharedMaterial 做廉价探针（单引用读取，无数组分配）；引用真的变了才整体重写。
-    // 已知边界：通过 MaterialPropertyBlock 改材质不会跟着传播（Udon 无法操作 PropertyBlock），
-    // 本修复覆盖的是"动画控制器/Animation 直接动画材质"这条主路径。
+    // 材质实时跟随（双层校正）：
+    // 第一层 - 材质引用校正：把clone渲染器的材质重新指回本体渲染器当前持有的实例，
+    //   覆盖"clone的Animator被Destroy(帧末延迟)时材质被还原回资产"、"本体换了材质实例"等场景。
+    // 第二层 - MaterialPropertyBlock 同步（动画值真正所在的地方）：联网查证（Unity官方文档/论坛）确认，
+    //   Animator 对材质属性的动画不写进材质本身，而是通过渲染器的 MaterialPropertyBlock 应用；
+    //   因此只做材质共享/复制永远同步不到动画值（这就是第一版修复无效的根因）。
+    //   每帧对本体渲染器 GetPropertyBlock（官方文档：传入的block会被完全覆盖，无残留），
+    //   再 SetPropertyBlock 到clone渲染器。GetPropertyBlock/SetPropertyBlock/new MaterialPropertyBlock()
+    //   均为官方API，且已联网查证 UdonSharp 支持（有多个真实VRChat世界用例）。
+    //   注意：不使用 HasPropertyBlock 做门控——它只认 SetPropertyBlock 写入的块，可能漏掉动画驱动的块。
     private void RepointCloneMaterials(int cloneIdx)
     {
         if (cloneIdx < 0 || cloneIdx >= MAX_RIGIDBODY_CLONES) return;
@@ -3703,16 +3709,25 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Renderer[] cloneRenderers = cloneMaterialSyncCloneRenderers[cloneIdx];
         if (origRenderers == null || cloneRenderers == null) return;
 
+        if (clonePropertyBlockSyncBuffer == null) clonePropertyBlockSyncBuffer = new MaterialPropertyBlock();
+
         int count = Mathf.Min(origRenderers.Length, cloneRenderers.Length);
         for (int i = 0; i < count; i++)
         {
             Renderer origR = origRenderers[i];
             Renderer cloneR = cloneRenderers[i];
             if (origR == null || cloneR == null) continue;
+
+            // 第一层：材质引用校正（slot0 sharedMaterial做廉价探针，单引用读取无数组分配；引用真变了才整体重写）
             if (cloneR.sharedMaterial != origR.sharedMaterial)
             {
                 cloneR.sharedMaterials = origR.sharedMaterials;
             }
+
+            // 第二层：PropertyBlock 同步。无条件每帧取+写：动画每一帧都可能改block里的值，
+            // 且clone首次可见前本函数必定先跑一次（UpdateRigidbodyClonePoses 在激活clone前调用）。
+            origR.GetPropertyBlock(clonePropertyBlockSyncBuffer);
+            cloneR.SetPropertyBlock(clonePropertyBlockSyncBuffer);
         }
     }
 
