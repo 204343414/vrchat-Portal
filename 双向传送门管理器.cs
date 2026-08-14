@@ -99,14 +99,26 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("粒子系统离两扇门都超过这个距离时整体跳过（性能闸门）。")]
     public float particleTeleportMaxDistance = 30f;
 
-    [Tooltip("自动收集粒子系统（泛用预制件模式）：开启后每隔 particleDiscoveryRefreshInterval 秒自动扫描两扇门 particleDiscoveryRadius 范围内的粒子系统参与传送，无需手动拖白名单。手动白名单里的系统依然额外保留。")]
+    [Tooltip("自动收集粒子系统：开启后每隔 particleDiscoveryRefreshInterval 秒，从下方'收集根'物体下递归收集离两扇门 particleDiscoveryRadius 以内的粒子系统。" +
+             "Udon 沙箱禁止全场景枚举API（FindObjectsOfType 编译报错），所以需要指定收集根：把地图特效物件放在一个容器物体下拖进来——一张地图拖一次，不用每个粒子系统单独拖。")]
     public bool autoDiscoverParticleSystems = true;
+
+    [Tooltip("收集根：拖入一个或多个 GameObject（如地图的特效容器），递归收集它们下面离两扇门足够近的粒子系统。")]
+    public GameObject[] particleDiscoveryRoots;
 
     [Tooltip("自动收集半径：粒子系统原点离任一门在这个距离内就自动加入参与列表。")]
     public float particleDiscoveryRadius = 25f;
 
     [Tooltip("自动收集刷新间隔（秒）。门可以被传送枪移动，定期重新扫描保证参与列表跟上。")]
     public float particleDiscoveryRefreshInterval = 5f;
+
+    [Tooltip("粒子传送平面外推距离：检测平面沿门法线向外推这么多。门贴在墙/地板上且粒子带碰撞时，" +
+             "粒子会在到达门平面之前先被墙体碰撞体弹走、数学上永远不穿过门平面；把检测面推出墙面，让粒子在撞墙前就传送。")]
+    public float particleTeleportPlaneOffset = 0.05f;
+
+    [Tooltip("穿越回溯窗（以'帧位移线段长度'为单位）。粒子碰撞/模拟子步会让速度反推线段偏离真实路径，回溯窗补漏；高速粒子仍隧穿就把这个值调大。")]
+    [Range(0f, 2f)]
+    public float particleTeleportRetroWindow = 0.5f;
 
     private ParticleSystem.Particle[] particleTeleportBuffer;
     private ParticleSystem[] discoveredParticleSystems;
@@ -2972,9 +2984,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // - 一帧至多一次穿越：两扇门都命中时取 t 更大（更晚）的一次，与粒子终点位置一致。
     // - 矩阵每帧只构造4次（A/B各一套worldToLocal/localToWorld，与 useScaleFreePortalMatrix
     //   的数学完全一致），粒子循环里只有 MultiplyPoint/MultiplyVector，无 TRS/inverse。
-    // - 性能闸门：白名单/自动收集 + 距离闸门 + 每系统每帧读取上限（缓冲区大小）。
-    // - 穿越窗口放宽到 t∈[-0.5,1]：粒子碰撞模块/模拟子步会让速度反推线段与真实路径错位，
-    //   回溯窗补上这类被算漏的穿越（高速隧穿修复）；已传送粒子远离出口平面不会被二次捕获。
+    // - 性能闸门：白名单/收集根自动收集 + 距离闸门 + 每系统每帧读取上限（缓冲区大小）。
+    // - 检测面沿法线外推 particleTeleportPlaneOffset：贴墙/地板门 + 带碰撞粒子的场景，
+    //   粒子会被墙体在门平面处弹走永远穿不过平面，外推检测面让粒子撞墙前就传送。
+    // - 只收"朝门飞"的穿越(denom<0)；穿越窗口放宽到 t∈[-回溯窗,1]补碰撞子步错位漏检。
     // - 限制：要求粒子系统 Simulation Space = World（Local空间语义不同）。
     // ============================================================
 
@@ -3074,48 +3087,59 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
-    // 自动收集：扫描场景全部粒子系统，保留原点离任一门 particleDiscoveryRadius 以内的。
+    // 自动收集：从收集根递归取粒子系统，保留原点离任一门 particleDiscoveryRadius 以内的。
     // Start 与每 particleDiscoveryRefreshInterval 秒各跑一次（门可被传送枪移动，需要定期重扫）。
+    // 备注：FindObjectsOfType 不在 Udon 白名单（安全沙箱禁止全场景枚举），只能走收集根方式。
     private void DiscoverParticleSystems()
     {
         if (portalPlaneA == null || portalPlaneB == null) return;
-
-        ParticleSystem[] allSystems = FindObjectsOfType<ParticleSystem>();
-        if (allSystems == null || allSystems.Length == 0)
+        if (particleDiscoveryRoots == null || particleDiscoveryRoots.Length == 0)
         {
             discoveredParticleSystems = null;
             return;
         }
 
         float radiusSqr = particleDiscoveryRadius * particleDiscoveryRadius;
-        int count = 0;
-        for (int i = 0; i < allSystems.Length; i++)
+
+        // 两遍式（Udon无动态数组）：第一遍数总数，第二遍填充
+        int total = 0;
+        for (int r = 0; r < particleDiscoveryRoots.Length; r++)
         {
-            ParticleSystem ps = allSystems[i];
-            if (ps == null) continue;
-            Vector3 sysPos = ps.transform.position;
-            if ((sysPos - portalPlaneA.position).sqrMagnitude <= radiusSqr ||
-                (sysPos - portalPlaneB.position).sqrMagnitude <= radiusSqr)
-            {
-                count++;
-            }
+            GameObject root = particleDiscoveryRoots[r];
+            if (root == null) continue;
+            ParticleSystem[] under = root.GetComponentsInChildren<ParticleSystem>(true);
+            if (under == null) continue;
+            total += under.Length;
+        }
+        if (total == 0)
+        {
+            discoveredParticleSystems = null;
+            return;
         }
 
-        ParticleSystem[] found = new ParticleSystem[count];
+        ParticleSystem[] collected = new ParticleSystem[total];
         int idx = 0;
-        for (int i = 0; i < allSystems.Length; i++)
+        for (int r = 0; r < particleDiscoveryRoots.Length; r++)
         {
-            ParticleSystem ps = allSystems[i];
-            if (ps == null) continue;
-            Vector3 sysPos = ps.transform.position;
-            if ((sysPos - portalPlaneA.position).sqrMagnitude <= radiusSqr ||
-                (sysPos - portalPlaneB.position).sqrMagnitude <= radiusSqr)
+            GameObject root = particleDiscoveryRoots[r];
+            if (root == null) continue;
+            ParticleSystem[] under = root.GetComponentsInChildren<ParticleSystem>(true);
+            if (under == null) continue;
+            for (int i = 0; i < under.Length; i++)
             {
-                found[idx] = ps;
-                idx++;
+                ParticleSystem ps = under[i];
+                if (ps == null) continue;
+                Vector3 sysPos = ps.transform.position;
+                if ((sysPos - portalPlaneA.position).sqrMagnitude <= radiusSqr ||
+                    (sysPos - portalPlaneB.position).sqrMagnitude <= radiusSqr)
+                {
+                    collected[idx] = ps;
+                    idx++;
+                }
             }
         }
-        discoveredParticleSystems = found;
+        // 尾部可能有null，遍历端已有null检查
+        discoveredParticleSystems = collected;
     }
 
     // 粒子本帧线段与门平面求交：交点落在线段上且位于门框形状内才算穿越。
@@ -3127,13 +3151,17 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         Vector3 segDir = segEnd - segStart;
         float denom = Vector3.Dot(segDir, portalPlane.forward);
-        if (Mathf.Abs(denom) < 0.000001f) return false;
+        // 只收"朝门平面飞"的穿越：撞墙反弹后向外飞的粒子、从门面喷出的粒子不应触发传送
+        if (denom >= -0.000001f) return false;
 
-        t = Vector3.Dot(portalPlane.position - segStart, portalPlane.forward) / denom;
-        // t∈[0,1]是本帧线段；放宽到[-0.5,1]作为回溯窗——粒子碰撞模块/模拟子步会让
-        // "速度反推线段"与真实路径错位，回溯窗补上这类"实际穿过但被算漏"的穿越。
-        // 已传送的粒子正在远离出口平面，不会再被回溯窗捕获，无二次传送风险。
-        if (t < -0.5f || t > 1f) return false;
+        // 检测平面沿法线外推：门贴墙/地板且粒子带碰撞时，墙体碰撞体在门平面处就把粒子弹走，
+        // 粒子数学上永远穿不过门平面；把检测面推出墙面，粒子在撞墙前就传送。
+        Vector3 planePoint = portalPlane.position + portalPlane.forward * particleTeleportPlaneOffset;
+        t = Vector3.Dot(planePoint - segStart, portalPlane.forward) / denom;
+        // t∈[0,1]是本帧线段；回溯窗(-particleTeleportRetroWindow)补粒子碰撞/模拟子步
+        // 造成的速度反推线段错位（高速隧穿修复，窗口随速度等比放大）。
+        // 已传送的粒子正在远离出口平面，不会被回溯窗二次捕获。
+        if (t < -particleTeleportRetroWindow || t > 1f) return false;
 
         hitPoint = segStart + segDir * t;
         Vector3 local = worldToLocal.MultiplyPoint(hitPoint);

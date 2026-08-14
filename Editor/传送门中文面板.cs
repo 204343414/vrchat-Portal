@@ -167,14 +167,16 @@
 //       (particleTeleportBufferSize，GetParticles只读缓冲大小颗)。
 //     - 一帧至多穿越一次：两门都命中取t更大的（更晚的），与粒子终点一致。
 //   使用要求：参与系统 Simulation Space 必须是 World（Local空间语义不同，暂不支持）。
-//   泛用化迭代（同日）：autoDiscoverParticleSystems 默认开启——每 particleDiscoveryRefreshInterval
-//     秒自动扫描两扇门 particleDiscoveryRadius 内的粒子系统加入参与列表，预制件落地零配置；
-//     手动白名单依然保留且额外生效（重复系统被第二遍处理时已是传送后状态，无二次传送）。
-//   高速隧穿修复（同日）：缓冲区默认256→512 + 穿越窗口放宽到 t∈[-0.5,1]——
-//     粒子碰撞模块/模拟子步会使速度反推线段与真实路径错位，回溯窗补上被算漏的穿越；
-//     已传送粒子正远离出口平面，不会被回溯窗二次捕获。
-//   风险预案：GetParticles/SetParticles/FindObjectsOfType 若在 Udon 白名单外，
-//     编译会直接报错，届时按报错逐项降级（镜像发射器方案只用已证实暴露的Emit）。
+//   泛用化迭代：autoDiscoverParticleSystems 从收集根(particleDiscoveryRoots)递归收集
+//     两扇门半径内的粒子系统。FindObjectsOfType 不在 Udon 白名单（安全沙箱禁止全场景枚举，
+//     实测编译报错），故采用收集根方案：一张地图拖一次容器，不用每个系统单独拖。
+//   贴墙门+碰撞粒子修复：粒子带碰撞时被墙体碰撞体在门平面处弹走，数学上永远穿不过门平面。
+//     particleTeleportPlaneOffset 把检测面沿法线推出墙面（默认5cm），粒子撞墙前即传送；
+//     同时只收"朝门飞"的穿越（denom<0），反弹向外飞的粒子不误传。
+//   高速隧穿修复：缓冲区默认512 + 穿越回溯窗 t∈[-particleTeleportRetroWindow,1]（可调）——
+//     粒子碰撞子步使速度反推线段偏离真实路径，回溯窗随速度等比放大补漏；
+//     理论边界：逐帧采样无法保证任意速度零隧穿（帧间无数据），但窗口可调到覆盖任意现实速度。
+//   风险预案：GetParticles/SetParticles 若在 Udon 白名单外，编译报错后按报错逐项降级。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;
@@ -217,8 +219,11 @@ public static class 传送门中文面板_标签表
         { "particleTeleportBufferSize", "粒子传送-每系统每帧上限" },
         { "particleTeleportMaxDistance", "粒子传送-距离闸门" },
         { "autoDiscoverParticleSystems", "粒子传送-自动收集开关" },
+        { "particleDiscoveryRoots", "粒子传送-收集根(拖容器)" },
         { "particleDiscoveryRadius", "粒子传送-自动收集半径" },
         { "particleDiscoveryRefreshInterval", "粒子传送-收集刷新间隔" },
+        { "particleTeleportPlaneOffset", "粒子传送-检测面外推(防墙弹)" },
+        { "particleTeleportRetroWindow", "粒子传送-高速回溯窗" },
 
         { "enableVisibilityOptimization", "启用可见性优化" },
         { "maxRenderDistance", "最大渲染距离" },
