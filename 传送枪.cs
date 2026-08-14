@@ -473,6 +473,13 @@ public class 传送枪 : UdonSharpBehaviour
         // 还原 Kinematic（允许物理）
         rb.isKinematic = false;
 
+        // 松手提交：刚体若已伸进传送门（有活跃clone镜像在另一侧），把本体对齐到clone位置。
+        // 必须在清映射之前调用，且只此一次——握持期间不做任何跨门重定位，避免与MovePosition拉扯。
+        if (portalManager != null)
+        {
+            portalManager.CommitHeldRigidbodyToClone(rb);
+        }
+
         heldTargetMappedThroughPortal = false;
         heldTargetFromPortal = null;
         heldTargetToPortal = null;

@@ -3837,6 +3837,43 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
+    // 手持刚体"松手提交"：握持期间枪独占刚体位置、传送门系统只显示clone镜像，
+    // 松手瞬间若刚体有活跃clone（= 已经伸进门里、镜像出现在另一侧），把本体一次性
+    // 对齐到clone的位姿（clone每帧由 UpdateRigidbodyClonePoses 用与传送完全相同的
+    // from→to+半转数学镜像出来，位置即正确的出口位置），然后销毁clone。
+    // 只在释放时调用一次、不参与每帧定位，因此不会与枪的 MovePosition 形成拉扯（无鬼畜）。
+    // 闸门：本体必须真在 fromPortal 平面【后侧】（伸进去了）才提交。排除"握持中已穿越、
+    // clone已翻转、本体正被映射握持在出口侧"的状态——那种状态clone在入口侧，
+    // 无闸门会把本体错误拽回去。本体没伸进门（无clone/在前侧）时空操作，正常松手不受影响。
+    public void CommitHeldRigidbodyToClone(Rigidbody rb)
+    {
+        if (rb == null) return;
+        int idx = FindCloneIndexForRigidbody(rb);
+        if (idx < 0) return;
+
+        GameObject clone = cloneGameObjects[idx];
+        Transform fromPortal = cloneTargetPortals[idx];
+        if (clone == null || fromPortal == null) return;
+
+        // 本体不在平面后侧（没伸进去/已在出口侧）：不提交
+        if (LocalPointForPortal(fromPortal, rb.position).z >= 0f) return;
+
+        Vector3 targetPos = clone.transform.position;
+        Quaternion targetRot = clone.transform.rotation;
+
+        // 与 TeleportRigidbodySebStyle 同款双写：rb.position 是物理引擎内部值，
+        // transform 不同步的话本帧渲染会看到旧位置。
+        rb.position = targetPos;
+        rb.rotation = targetRot;
+        rb.transform.position = targetPos;
+        rb.transform.rotation = targetRot;
+        // 手持期间是kinematic，velocity无意义；清零避免释放瞬间带着脏速度飞出去。
+        rb.velocity = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+
+        DestroyRigidbodyClone(rb);
+    }
+
     private void DestroyRigidbodyClone(Rigidbody rb)
     {
         int idx = FindCloneIndexForRigidbody(rb);
