@@ -149,11 +149,13 @@
 //   最终方案（职责分离，只在松手瞬间动一次）：
 //         握持期间：枪独占刚体位置；传送门系统只显示 clone 镜像（UpdateRigidbodyClonePoses
 //         每帧用与传送相同的 from→to+半转数学镜像本体，clone位置=正确的出口位置）。
-//         松手瞬间：传送枪 ReleaseHeldRigidbody 调用管理器 CommitHeldRigidbodyToClone——
-//         若刚体有活跃clone且本体真在 fromPortal 平面后侧（伸进去了），把本体一次性
-//         对齐到clone位姿、速度清零、销毁clone。闸门排除了"握持中已穿越、clone已翻转"
-//         的状态（那种状态本体在出口侧，无闸门会被错误拽回）。
-//         没有clone（没伸进门）时空操作，正常松手行为不变。
+//         松手瞬间：传送枪 ReleaseHeldRigidbody 调用管理器 CommitHeldRigidbodyToClone，两级判定：
+//         1) 有活跃clone且本体真在fromPortal平面后侧 → 对齐到clone位姿、清速度、销毁clone；
+//         2) 无clone（深捅超过追踪深度1.1米导致追踪移除、clone销毁——这正是早期版本
+//            松手提交失效、刚体留在门后的根因）→ 纯几何直判：本体过某门平面且在门框内
+//            → 按同款镜像数学传送到另一侧。
+//         防拽回闸门：clone路径要求本体在平面后侧；几何路径额外要求本体不在另一扇门的
+//         门前区域内（"已经出来了"的状态不提交）。没伸进门时空操作，正常松手行为不变。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;

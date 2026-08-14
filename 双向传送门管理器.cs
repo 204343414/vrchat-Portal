@@ -3837,29 +3837,74 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
-    // 手持刚体"松手提交"：握持期间枪独占刚体位置、传送门系统只显示clone镜像，
-    // 松手瞬间若刚体有活跃clone（= 已经伸进门里、镜像出现在另一侧），把本体一次性
-    // 对齐到clone的位姿（clone每帧由 UpdateRigidbodyClonePoses 用与传送完全相同的
-    // from→to+半转数学镜像出来，位置即正确的出口位置），然后销毁clone。
-    // 只在释放时调用一次、不参与每帧定位，因此不会与枪的 MovePosition 形成拉扯（无鬼畜）。
-    // 闸门：本体必须真在 fromPortal 平面【后侧】（伸进去了）才提交。排除"握持中已穿越、
-    // clone已翻转、本体正被映射握持在出口侧"的状态——那种状态clone在入口侧，
-    // 无闸门会把本体错误拽回去。本体没伸进门（无clone/在前侧）时空操作，正常松手不受影响。
+    // 手持刚体"松手提交"：握持期间枪独占刚体位置、传送门系统只显示clone镜像；
+    // 松手瞬间若刚体伸进了某扇门，一次性把它传送到另一侧（镜像位置）。
+    // 只在释放时调用一次、不参与每帧定位，不会与枪的 MovePosition 拉扯（无鬼畜）。
+    // 两级判定：
+    //   优先级1：有活跃clone → 映射方向明确，本体在该门平面后侧 → 对齐到clone位姿。
+    //   优先级2：无clone → 纯几何判定（本体过某门平面且落在门框内 → 镜像传送到另一侧）。
+    //     这一级必不可少：深捅（枪几乎贴到/穿过门面）时握持点(枪口前1米)会超过
+    //     追踪深度(noClipDepth+rbTriggerDepthExtension≈1.1米)，追踪被移除、clone被销毁；
+    //     只靠clone就会在松手时漏提交，刚体留在门后墙体里——正是"松手出现在门后面"的根因。
+    // 防拽回闸门：本体已在另一扇门的门前区域内（"已经出来了"的状态）→ 不提交，
+    // 防止门位靠近/交叠的场景里把本体错误拽回。
     public void CommitHeldRigidbodyToClone(Rigidbody rb)
     {
         if (rb == null) return;
+        if (!enableRigidbodyTeleport) return;
+
+        // 优先级1：有活跃clone
         int idx = FindCloneIndexForRigidbody(rb);
-        if (idx < 0) return;
+        if (idx >= 0)
+        {
+            GameObject clone = cloneGameObjects[idx];
+            Transform fromPortal = cloneTargetPortals[idx];
+            if (clone == null || fromPortal == null) return;
+            // 本体不在该门平面后侧（正常握持/已出出口的状态）：不提交
+            if (LocalPointForPortal(fromPortal, rb.position).z >= 0f) return;
 
-        GameObject clone = cloneGameObjects[idx];
-        Transform fromPortal = cloneTargetPortals[idx];
-        if (clone == null || fromPortal == null) return;
+            Vector3 targetPos = clone.transform.position;
+            Quaternion targetRot = clone.transform.rotation;
+            rb.position = targetPos;
+            rb.rotation = targetRot;
+            rb.transform.position = targetPos;
+            rb.transform.rotation = targetRot;
+            rb.velocity = Vector3.zero;
+            rb.angularVelocity = Vector3.zero;
+            DestroyRigidbodyClone(rb);
+            return;
+        }
 
-        // 本体不在平面后侧（没伸进去/已在出口侧）：不提交
-        if (LocalPointForPortal(fromPortal, rb.position).z >= 0f) return;
+        // 优先级2：无clone（深捅掉出追踪），几何直判
+        if (portalPlaneA != null && TryCommitInsertedHeldBody(rb, portalPlaneA, portalPlaneB)) return;
+        if (portalPlaneB != null) TryCommitInsertedHeldBody(rb, portalPlaneB, portalPlaneA);
+    }
 
-        Vector3 targetPos = clone.transform.position;
-        Quaternion targetRot = clone.transform.rotation;
+    // 松手提交优先级2：本体已过 fromPlane 平面且落在门框内 → 按 clone/传送同款数学镜像到 toPlane 侧。
+    private bool TryCommitInsertedHeldBody(Rigidbody rb, Transform fromPlane, Transform toPlane)
+    {
+        if (fromPlane == null || toPlane == null) return false;
+
+        Vector3 localPos = LocalPointForPortal(fromPlane, rb.position);
+        if (localPos.z >= 0f) return false;
+        if (!LocalPointInPortalRect(localPos, ResolvePortalShape(fromPlane == portalPlaneA))) return false;
+
+        // 防拽回：本体已处于另一扇门的门前追踪区域内（大概率是"已经出来了"的状态）→ 不提交
+        Vector3 localAtExit = LocalPointForPortal(toPlane, rb.position);
+        float exitTrackDepth = noClipDepth + rbTriggerDepthExtension;
+        if (localAtExit.z >= 0f && localAtExit.z <= exitTrackDepth && LocalPointInPortalRect(localAtExit, ResolvePortalShape(toPlane == portalPlaneA))) return false;
+
+        // 镜像位姿：与 clone/TeleportRigidbodySebStyle 完全相同的数学（from→to + 经典半转）
+        Vector3 mappedLocal = localPos;
+        Quaternion mappedRot = Quaternion.Inverse(fromPlane.rotation) * rb.rotation;
+        if (useClassicHalfTurn)
+        {
+            Quaternion halfTurn = LocalHalfTurn();
+            mappedLocal = halfTurn * mappedLocal;
+            mappedRot = halfTurn * mappedRot;
+        }
+        Vector3 targetPos = WorldPointFromPortal(toPlane, mappedLocal);
+        Quaternion targetRot = toPlane.rotation * mappedRot;
 
         // 与 TeleportRigidbodySebStyle 同款双写：rb.position 是物理引擎内部值，
         // transform 不同步的话本帧渲染会看到旧位置。
@@ -3870,8 +3915,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 手持期间是kinematic，velocity无意义；清零避免释放瞬间带着脏速度飞出去。
         rb.velocity = Vector3.zero;
         rb.angularVelocity = Vector3.zero;
-
-        DestroyRigidbodyClone(rb);
+        return true;
     }
 
     private void DestroyRigidbodyClone(Rigidbody rb)
