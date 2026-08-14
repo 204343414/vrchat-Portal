@@ -84,6 +84,23 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("Clip Volume 穿透逻辑开关。关闭则完全不做批量切换，回退到只切单markedCollider的旧行为。")]
     public bool enableClipVolumePassThrough = true;
 
+    [Header("════════════ 粒子传送 ════════════")]
+    [Tooltip("启用粒子传送：白名单粒子系统里穿过A/B门平面的粒子会被映射到另一侧（位置+速度同门映射）。" +
+             "【重要】参与系统的 Simulation Space 必须是 World（ParticleSystem主模块设置），Local空间暂不支持。")]
+    public bool enableParticleTeleport = true;
+
+    [Tooltip("参与传送的粒子系统白名单：只处理明确挂进来的系统，防止误挂超大粒子量的系统拖垮帧率。不挂任何系统时本功能零开销。")]
+    public ParticleSystem[] portalParticleSystems;
+
+    [Tooltip("每个系统每帧最多读取/处理的粒子数（缓冲区大小）。活粒子多于此数时只处理前N颗，其余下一帧再说——Quest性能预算。")]
+    [Range(32, 2048)]
+    public int particleTeleportBufferSize = 256;
+
+    [Tooltip("粒子系统离两扇门都超过这个距离时整体跳过（性能闸门）。")]
+    public float particleTeleportMaxDistance = 30f;
+
+    private ParticleSystem.Particle[] particleTeleportBuffer;
+
     [Header("════════════ 性能优化 ════════════")]
     public bool enableVisibilityOptimization = true;
     public float maxRenderDistance = 50f;
@@ -674,6 +691,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (enableRigidbodyTeleport)
         {
             ProcessRigidbodyTravellers();
+        }
+
+        // 粒子传送（只处理白名单里离门足够近的系统）
+        if (enableParticleTeleport)
+        {
+            ProcessParticleTeleports();
         }
 
         // PATCH: 延迟速度重发，防止 VRChat 接地吃速度
@@ -2913,6 +2936,139 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 等价于 Seb 原版每个 Portal 在 LateUpdate 里 HandleTravellers。
         ProcessRigidbodyForPortal(true);
         ProcessRigidbodyForPortal(false);
+    }
+
+    // ============================================================
+    // 粒子传送：白名单系统里穿过门平面的粒子，位置+速度按门映射传到另一侧。
+    // 设计要点：
+    // - 无状态穿越判定：用粒子自身速度反推本帧线段 [pos - vel*dt, pos] 做平面求交，
+    //   不维护"上一帧位置"缓存——Unity粒子缓冲槽位会被死亡粒子复用，按序号对齐不可靠。
+    // - 一帧至多一次穿越：两扇门都命中时取 t 更大（更晚）的一次，与粒子终点位置一致。
+    // - 矩阵每帧只构造4次（A/B各一套worldToLocal/localToWorld，与 useScaleFreePortalMatrix
+    //   的数学完全一致），粒子循环里只有 MultiplyPoint/MultiplyVector，无 TRS/inverse。
+    // - 性能闸门：白名单 + 距离闸门 + 每系统每帧读取上限（缓冲区大小）。
+    // - 限制：要求粒子系统 Simulation Space = World（Local空间的position/velocity语义不同）。
+    // ============================================================
+
+    private void ProcessParticleTeleports()
+    {
+        if (portalParticleSystems == null || portalParticleSystems.Length == 0) return;
+        if (portalPlaneA == null || portalPlaneB == null) return;
+
+        int bufferSize = Mathf.Max(32, particleTeleportBufferSize);
+        if (particleTeleportBuffer == null || particleTeleportBuffer.Length != bufferSize)
+        {
+            particleTeleportBuffer = new ParticleSystem.Particle[bufferSize];
+        }
+
+        float dt = Time.deltaTime;
+        if (dt <= 0f) return;
+
+        // 本帧门户矩阵缓存（scale-free，与 LocalPointForPortal 的默认数学一致）
+        Matrix4x4 worldToLocalA = Matrix4x4.TRS(portalPlaneA.position, portalPlaneA.rotation, Vector3.one).inverse;
+        Matrix4x4 localToWorldA = Matrix4x4.TRS(portalPlaneA.position, portalPlaneA.rotation, Vector3.one);
+        Matrix4x4 worldToLocalB = Matrix4x4.TRS(portalPlaneB.position, portalPlaneB.rotation, Vector3.one).inverse;
+        Matrix4x4 localToWorldB = Matrix4x4.TRS(portalPlaneB.position, portalPlaneB.rotation, Vector3.one);
+        int shapeA = ResolvePortalShape(true);
+        int shapeB = ResolvePortalShape(false);
+        float maxDistSqr = particleTeleportMaxDistance * particleTeleportMaxDistance;
+
+        for (int s = 0; s < portalParticleSystems.Length; s++)
+        {
+            ParticleSystem ps = portalParticleSystems[s];
+            if (ps == null) continue;
+
+            // 距离闸门：离两扇门都太远 → 整个系统跳过
+            Vector3 sysPos = ps.transform.position;
+            if ((sysPos - portalPlaneA.position).sqrMagnitude > maxDistSqr &&
+                (sysPos - portalPlaneB.position).sqrMagnitude > maxDistSqr)
+            {
+                continue;
+            }
+
+            int aliveCount = ps.GetParticles(particleTeleportBuffer);
+            if (aliveCount <= 0) continue;
+
+            bool changed = false;
+            for (int i = 0; i < aliveCount; i++)
+            {
+                ParticleSystem.Particle p = particleTeleportBuffer[i];
+                Vector3 vel = p.velocity;
+                // 静止粒子不会穿越
+                if (vel.sqrMagnitude < 0.000001f) continue;
+
+                Vector3 segEnd = p.position;
+                Vector3 segStart = segEnd - vel * dt;
+
+                float tA;
+                Vector3 hitA;
+                bool crossA = ParticleSegmentCrossesPortal(segStart, segEnd, portalPlaneA, worldToLocalA, shapeA, out tA, out hitA);
+                float tB;
+                Vector3 hitB;
+                bool crossB = ParticleSegmentCrossesPortal(segStart, segEnd, portalPlaneB, worldToLocalB, shapeB, out tB, out hitB);
+
+                // 一帧至多一次穿越：两门都命中取更晚的一次
+                bool doA = crossA && (!crossB || tA >= tB);
+                bool doB = crossB && !doA;
+
+                if (doA)
+                {
+                    TeleportParticleThroughPortal(ref p, hitA, vel, tA, dt, worldToLocalA, localToWorldB);
+                    particleTeleportBuffer[i] = p;
+                    changed = true;
+                }
+                else if (doB)
+                {
+                    TeleportParticleThroughPortal(ref p, hitB, vel, tB, dt, worldToLocalB, localToWorldA);
+                    particleTeleportBuffer[i] = p;
+                    changed = true;
+                }
+            }
+
+            // 只有真的改过才写回，省掉无穿越帧的 SetParticles 开销
+            if (changed)
+            {
+                ps.SetParticles(particleTeleportBuffer, aliveCount);
+            }
+        }
+    }
+
+    // 粒子本帧线段与门平面求交：交点落在线段上且位于门框形状内才算穿越。
+    private bool ParticleSegmentCrossesPortal(Vector3 segStart, Vector3 segEnd, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, out float t, out Vector3 hitPoint)
+    {
+        t = 0f;
+        hitPoint = Vector3.zero;
+        if (portalPlane == null) return false;
+
+        Vector3 segDir = segEnd - segStart;
+        float denom = Vector3.Dot(segDir, portalPlane.forward);
+        if (Mathf.Abs(denom) < 0.000001f) return false;
+
+        t = Vector3.Dot(portalPlane.position - segStart, portalPlane.forward) / denom;
+        if (t < 0f || t > 1f) return false;
+
+        hitPoint = segStart + segDir * t;
+        Vector3 local = worldToLocal.MultiplyPoint(hitPoint);
+        return LocalPointInPortalRect(local, shapeType);
+    }
+
+    // 把单颗粒子映射到另一侧：穿越点 from→to+经典半转，速度同映射，
+    // 再把穿越后剩余的那段时间按映射后速度继续积分（与刚体穿越的 postCross 思路一致）。
+    private void TeleportParticleThroughPortal(ref ParticleSystem.Particle p, Vector3 hitPoint, Vector3 vel, float t, float dt, Matrix4x4 worldToLocalFrom, Matrix4x4 localToWorldTo)
+    {
+        Vector3 localHit = worldToLocalFrom.MultiplyPoint(hitPoint);
+        Vector3 localVel = worldToLocalFrom.MultiplyVector(vel);
+        if (useClassicHalfTurn)
+        {
+            localHit = LocalHalfTurn(localHit);
+            localVel = LocalHalfTurn(localVel);
+        }
+        Vector3 exitPos = localToWorldTo.MultiplyPoint(localHit);
+        Vector3 exitVel = localToWorldTo.MultiplyVector(localVel);
+
+        float remainingTime = (1f - t) * dt;
+        p.position = exitPos + exitVel * remainingTime;
+        p.velocity = exitVel;
     }
 
     private void ProcessRigidbodyForPortal(bool isPortalA)

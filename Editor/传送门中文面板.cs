@@ -156,6 +156,20 @@
 //            → 按同款镜像数学传送到另一侧。
 //         防拽回闸门：clone路径要求本体在平面后侧；几何路径额外要求本体不在另一扇门的
 //         门前区域内（"已经出来了"的状态不提交）。没伸进门时空操作，正常松手行为不变。
+//
+// 【粒子传送（2026-08-14，1.0后的首个新功能）】
+//   功能：白名单粒子系统里穿过门平面的粒子被映射到另一侧（位置+速度同款 from→to+半转数学）。
+//   关键设计：
+//     - 无状态穿越判定：用粒子速度反推本帧线段 [pos-vel*dt, pos] 求交，不存上一帧位置——
+//       Unity粒子缓冲槽位会被死亡粒子复用，按序号对齐不可靠（这是不做prev缓存的原因）。
+//     - 矩阵每帧只构造4次（A/B各一套），粒子循环内只有 MultiplyPoint/MultiplyVector。
+//     - 性能闸门：白名单 + 距离闸门(particleTeleportMaxDistance) + 每系统每帧读取上限
+//       (particleTeleportBufferSize，GetParticles只读缓冲大小颗)。
+//     - 一帧至多穿越一次：两门都命中取t更大的（更晚的），与粒子终点一致。
+//   使用要求：参与系统 Simulation Space 必须是 World（Local空间语义不同，暂不支持）；
+//     把粒子系统拖进 portalParticleSystems 白名单即生效。
+//   风险预案：GetParticles/SetParticles 若在 Udon 白名单外（Class Exposure Tree 红色），
+//     编译会直接报错，届时降级为"镜像发射器"方案（出口侧配对发射器，只用已证实暴露的Emit）。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;
@@ -192,6 +206,11 @@ public static class 传送门中文面板_标签表
         { "colliderDisableBuffer", "碰撞穿透缓冲距离" },
         { "solidCollisionLayer", "实体碰撞层" },
         { "playerPassThroughLayer", "玩家穿透层" },
+
+        { "enableParticleTeleport", "启用粒子传送" },
+        { "portalParticleSystems", "粒子传送白名单" },
+        { "particleTeleportBufferSize", "粒子传送-每系统每帧上限" },
+        { "particleTeleportMaxDistance", "粒子传送-距离闸门" },
 
         { "enableVisibilityOptimization", "启用可见性优化" },
         { "maxRenderDistance", "最大渲染距离" },
