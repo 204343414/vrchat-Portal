@@ -167,9 +167,11 @@
 //       (particleTeleportBufferSize，GetParticles只读缓冲大小颗)。
 //     - 一帧至多穿越一次：两门都命中取t更大的（更晚的），与粒子终点一致。
 //   使用要求：参与系统 Simulation Space 必须是 World（Local空间语义不同，暂不支持）。
-//   泛用化迭代：autoDiscoverParticleSystems 从收集根(particleDiscoveryRoots)递归收集
-//     两扇门半径内的粒子系统。FindObjectsOfType 不在 Udon 白名单（安全沙箱禁止全场景枚举，
-//     实测编译报错），故采用收集根方案：一张地图拖一次容器，不用每个系统单独拖。
+//   泛用化迭代：自动收集两个来源——1) transform.root 子树（预制件自带特效零配置生效，
+//     联网查证确认：FindObjectsOfType 实测编译报错、Scene.GetRootGameObjects 在 VRChat
+//     官方反馈板有请求但至今未开放，全场景枚举类API整体被 Udon 沙箱禁用；
+//     沿层级树 GetComponentsInChildren 是白名单内最优路径）；
+//     2) particleDiscoveryRoots 收集根（特效挂在别的根下时手动拖容器，可选）。
 //   贴墙门+碰撞粒子修复：粒子带碰撞时被墙体碰撞体在门平面处弹走，数学上永远穿不过门平面。
 //     particleTeleportPlaneOffset 把检测面沿法线推出墙面（默认5cm），粒子撞墙前即传送；
 //     同时只收"朝门飞"的穿越（denom<0），反弹向外飞的粒子不误传。

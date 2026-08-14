@@ -99,11 +99,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("粒子系统离两扇门都超过这个距离时整体跳过（性能闸门）。")]
     public float particleTeleportMaxDistance = 30f;
 
-    [Tooltip("自动收集粒子系统：开启后每隔 particleDiscoveryRefreshInterval 秒，从下方'收集根'物体下递归收集离两扇门 particleDiscoveryRadius 以内的粒子系统。" +
-             "Udon 沙箱禁止全场景枚举API（FindObjectsOfType 编译报错），所以需要指定收集根：把地图特效物件放在一个容器物体下拖进来——一张地图拖一次，不用每个粒子系统单独拖。")]
+    [Tooltip("自动收集粒子系统：开启后除了手动白名单，还会自动收集两类来源——" +
+             "1) 本物体 transform.root 子树内离两扇门足够近的粒子系统（预制件自带特效零配置生效）；" +
+             "2) 下方'收集根'物体子树内的粒子系统（特效挂在别的根节点下时才需要拖，可选）。" +
+             "Udon 沙箱禁止全场景枚举API，这是白名单内能做到的最大自动范围。")]
     public bool autoDiscoverParticleSystems = true;
 
-    [Tooltip("收集根：拖入一个或多个 GameObject（如地图的特效容器），递归收集它们下面离两扇门足够近的粒子系统。")]
+    [Tooltip("收集根（可选）：特效物件没挂在传送门同一根节点下时，把它们的容器物体拖进来。不拖也有 transform.root 自动扫描兜底。")]
     public GameObject[] particleDiscoveryRoots;
 
     [Tooltip("自动收集半径：粒子系统原点离任一门在这个距离内就自动加入参与列表。")]
@@ -3087,23 +3089,31 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
-    // 自动收集：从收集根递归取粒子系统，保留原点离任一门 particleDiscoveryRadius 以内的。
+    // 自动收集：从两类根收集粒子系统，保留原点离任一门 particleDiscoveryRadius 以内的：
+    //   1) transform.root 子树（零配置来源）：预制件落地后，自带特效以及与门户挂在同一根
+    //      节点下的所有粒子系统自动纳入。Udon 沙箱禁止全场景枚举API（FindObjectsOfType、
+    //      Scene.GetRootGameObjects 均不在白名单——后者在 VRChat 官方反馈板有创作者请求，
+    //      至今未开放），沿层级树 GetComponentsInChildren 是白名单内的最优路径。
+    //   2) particleDiscoveryRoots（用户指定的收集根，可选）：特效挂在别的根节点下时手动拖入。
     // Start 与每 particleDiscoveryRefreshInterval 秒各跑一次（门可被传送枪移动，需要定期重扫）。
-    // 备注：FindObjectsOfType 不在 Udon 白名单（安全沙箱禁止全场景枚举），只能走收集根方式。
     private void DiscoverParticleSystems()
     {
         if (portalPlaneA == null || portalPlaneB == null) return;
-        if (particleDiscoveryRoots == null || particleDiscoveryRoots.Length == 0)
-        {
-            discoveredParticleSystems = null;
-            return;
-        }
 
         float radiusSqr = particleDiscoveryRadius * particleDiscoveryRadius;
 
+        // transform.root 子树（零配置来源）
+        Transform selfRoot = transform.root;
+        ParticleSystem[] rootSystems = null;
+        if (selfRoot != null)
+        {
+            rootSystems = selfRoot.GetComponentsInChildren<ParticleSystem>(true);
+        }
+
         // 两遍式（Udon无动态数组）：第一遍数总数，第二遍填充
-        int total = 0;
-        for (int r = 0; r < particleDiscoveryRoots.Length; r++)
+        int total = rootSystems != null ? rootSystems.Length : 0;
+        int manualRoots = particleDiscoveryRoots != null ? particleDiscoveryRoots.Length : 0;
+        for (int r = 0; r < manualRoots; r++)
         {
             GameObject root = particleDiscoveryRoots[r];
             if (root == null) continue;
@@ -3118,28 +3128,40 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
 
         ParticleSystem[] collected = new ParticleSystem[total];
-        int idx = 0;
-        for (int r = 0; r < particleDiscoveryRoots.Length; r++)
+        int idx = CollectParticleSystemsNearPortals(rootSystems, collected, 0, radiusSqr);
+        for (int r = 0; r < manualRoots; r++)
         {
             GameObject root = particleDiscoveryRoots[r];
             if (root == null) continue;
             ParticleSystem[] under = root.GetComponentsInChildren<ParticleSystem>(true);
             if (under == null) continue;
-            for (int i = 0; i < under.Length; i++)
+            idx = CollectParticleSystemsNearPortals(under, collected, idx, radiusSqr);
+        }
+        // 尾部可能有null（距离过滤掉的），遍历端已有null检查；
+        // 与手动白名单重复的系统被二次处理时已是传送后状态，无二次传送。
+        discoveredParticleSystems = collected;
+    }
+
+    // 把系统中离任一门足够近的粒子系统填入 dest，返回新的写入下标。
+    private int CollectParticleSystemsNearPortals(ParticleSystem[] systems, ParticleSystem[] dest, int idx, float radiusSqr)
+    {
+        if (systems == null) return idx;
+        for (int i = 0; i < systems.Length; i++)
+        {
+            ParticleSystem ps = systems[i];
+            if (ps == null) continue;
+            Vector3 sysPos = ps.transform.position;
+            if ((sysPos - portalPlaneA.position).sqrMagnitude <= radiusSqr ||
+                (sysPos - portalPlaneB.position).sqrMagnitude <= radiusSqr)
             {
-                ParticleSystem ps = under[i];
-                if (ps == null) continue;
-                Vector3 sysPos = ps.transform.position;
-                if ((sysPos - portalPlaneA.position).sqrMagnitude <= radiusSqr ||
-                    (sysPos - portalPlaneB.position).sqrMagnitude <= radiusSqr)
+                if (idx < dest.Length)
                 {
-                    collected[idx] = ps;
+                    dest[idx] = ps;
                     idx++;
                 }
             }
         }
-        // 尾部可能有null，遍历端已有null检查
-        discoveredParticleSystems = collected;
+        return idx;
     }
 
     // 粒子本帧线段与门平面求交：交点落在线段上且位于门框形状内才算穿越。
