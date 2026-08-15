@@ -382,12 +382,30 @@ public static class 传送门中文面板_标签表
 [CustomEditor(typeof(双向传送门管理器))]
 public class 双向传送门管理器_中文面板 : Editor
 {
+    // 置顶字段：显式画在 Inspector 最顶部，不依赖遍历顺序。
+    private static readonly HashSet<string> 置顶字段 = new HashSet<string> { "obliqueClipWhenHeadInsideVolume" };
+
     public override void OnInspectorGUI()
     {
         if (UdonSharpEditorGUIHelper.尝试绘制默认头部(serializedObject, target)) return;
 
         serializedObject.Update();
-        UdonSharpEditorGUIHelper.绘制中文字段(serializedObject, 传送门中文面板_标签表.门管理器标签);
+
+        // 置顶诊断开关 + 编译状态探测：字段找不到说明 Unity 还没用新脚本完成重编译
+        SerializedProperty obliqueProp = serializedObject.FindProperty("obliqueClipWhenHeadInsideVolume");
+        if (obliqueProp != null)
+        {
+            EditorGUILayout.PropertyField(obliqueProp, new GUIContent(
+                "【诊断】贴门时仍斜裁剪(修遮罩伪影)",
+                "站在伪影位置切换此开关对比验证：开启后贴门时递归相机恢复斜裁剪，门后墙背面几何不再漏进传送门画面。确认无副作用后应改为默认开启。"), true);
+            EditorGUILayout.Space();
+        }
+        else
+        {
+            EditorGUILayout.HelpBox("诊断开关字段未被 Unity 识别：脚本尚未重新编译。请检查 Console 是否有编译错误，或 Ctrl+R / 切换窗口焦点强制刷新。若文件确为新版仍如此，检查工程里是否存在该脚本的第二份拷贝。", MessageType.Warning);
+        }
+
+        UdonSharpEditorGUIHelper.绘制中文字段(serializedObject, 传送门中文面板_标签表.门管理器标签, 置顶字段);
         serializedObject.ApplyModifiedProperties();
     }
 }
@@ -436,13 +454,16 @@ public static class UdonSharpEditorGUIHelper
         return null;
     }
 
-    public static void 绘制中文字段(SerializedObject so, Dictionary<string, string> 标签表)
+    public static void 绘制中文字段(SerializedObject so, Dictionary<string, string> 标签表, HashSet<string> 跳过字段 = null)
     {
         SerializedProperty prop = so.GetIterator();
         bool enterChildren = true;
         while (prop.NextVisible(enterChildren))
         {
             enterChildren = false;
+
+            // 已置顶显式绘制的字段跳过，避免重复出现
+            if (跳过字段 != null && 跳过字段.Contains(prop.name)) continue;
 
             if (prop.name == "m_Script")
             {
