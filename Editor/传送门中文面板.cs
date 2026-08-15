@@ -178,7 +178,14 @@
 //   高速隧穿修复：缓冲区默认512 + 穿越回溯窗 t∈[-particleTeleportRetroWindow,1]（可调）——
 //     粒子碰撞子步使速度反推线段偏离真实路径，回溯窗随速度等比放大补漏；
 //     理论边界：逐帧采样无法保证任意速度零隧穿（帧间无数据），但窗口可调到覆盖任意现实速度。
-//   风险预案：GetParticles/SetParticles 若在 Udon 白名单外，编译报错后按报错逐项降级。
+// 【遮罩伪影修复（2026-08-14，用户实测验证通过）】
+//   现象：极近距离站在门框内未传送时，门面里能看到门后墙背面几何（'遮罩'伪影）。
+//   根因：头进门体积 → skipAllOblique，递归相机彻底关掉斜裁剪；递归相机物理位置在
+//         门平面背后的镜像位置，斜裁剪正是裁掉'相机与门平面之间'区域的——关掉即漏渲染。
+//   修复：obliqueClipWhenHeadInsideVolume 默认开启，贴门时递归相机保持斜裁剪
+//         （ApplyObliqueClippingSebStyle 内置按相机侧自动翻转法线，即Seb原版做法）。
+//   连带修复（用户报告的'人在B门却闪过一帧A门后面画面'）：传送同帧的递归渲染用的是
+//         LateUpdate顶部捕获的传送前旧视角 → 改为重取传送后的 GetTrackingData 新值。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;
@@ -267,7 +274,7 @@ public static class 传送门中文面板_标签表
         { "recursivePauseDuringTransition", "过渡时暂停递归(旧)" },
         { "recursiveDynamicNearClipMax", "动态近裁剪最大值" },
         { "debugRecursiveClipLog", "递归裁剪调试日志" },
-        { "obliqueClipWhenHeadInsideVolume", "诊断-贴门时仍斜裁剪(修遮罩伪影)" },
+        { "obliqueClipWhenHeadInsideVolume", "贴门时仍斜裁剪(遮罩伪影修复)" },
 
         { "portalViewTransitionCube", "过渡视角立方体" },
         { "transitionDuration", "过渡时长" },
@@ -396,8 +403,8 @@ public class 双向传送门管理器_中文面板 : Editor
         if (obliqueProp != null)
         {
             EditorGUILayout.PropertyField(obliqueProp, new GUIContent(
-                "【诊断】贴门时仍斜裁剪(修遮罩伪影)",
-                "站在伪影位置切换此开关对比验证：开启后贴门时递归相机恢复斜裁剪，门后墙背面几何不再漏进传送门画面。确认无副作用后应改为默认开启。"), true);
+                "贴门时仍斜裁剪(遮罩伪影修复·默认开)",
+                "开启（默认）：贴门时递归相机保持斜裁剪，门后墙背面几何不会漏进传送门画面（已实测验证）。关闭：回到旧行为对比排查用。"), true);
             EditorGUILayout.Space();
         }
         else

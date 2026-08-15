@@ -339,12 +339,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [HideInInspector]
     public bool debugRecursiveClipLog = false;
 
-    [Tooltip("诊断/修复开关：头部在门体积内时，递归相机是否仍做 oblique 斜裁剪。" +
-             "关闭(默认)=历史行为：跳过斜裁剪——副作用是递归相机把'相机与门平面之间'的墙背面区域渲进传送门画面，" +
-             "极近距离站在门框内会看到门后墙的背面几何（'遮罩伪影'）。" +
-             "开启=Seb原版做法：始终斜裁剪（ApplyObliqueClippingSebStyle 已内置按相机所在侧自动翻转法线）。" +
-             "站在伪影位置切换此开关对比验证；确认无副作用后应作为默认。")]
-    public bool obliqueClipWhenHeadInsideVolume = false;
+    [Tooltip("头部在门体积内时，递归相机是否仍做 oblique 斜裁剪（Seb原版做法，默认开启）。" +
+             "开启=贴门时门后墙背面几何不会漏进传送门画面（'遮罩伪影'修复，已实测验证）；" +
+             "关闭=历史行为（跳过裁剪，贴门时有伪影），仅保留用于对比排查。")]
+    public bool obliqueClipWhenHeadInsideVolume = true;
 
     // ============================================================
     // 新增：过渡系统（极简）
@@ -930,7 +928,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     // 传送发生同帧优先交给过渡系统。递归手动渲染延后一帧，避免抢过渡 Cube/相机的显示状态。
                     if (enableSebRecursiveRendering && !(recursivePauseDuringTransition && isTeleporting))
                     {
-                        RenderSebRecursivePortals(playerHead, playerWorldRot, syncFOV);
+                        // 关键修复：LateUpdate 顶部捕获的 playerHead/playerWorldRot 是【传送前】的旧值。
+                        // 用旧视角渲染会让刚落地到新出口的玩家看到一帧"为旧位置计算"的门画面——
+                        // 即用户报告的"人在B门位置却闪过一帧A门后面画面"（旧视角下头在A门体积内，
+                        // 恰好叠加旧版跳过斜裁剪的漏渲染状态）。重取传送后的头部数据再渲染。
+                        VRCPlayerApi.TrackingData freshHead = localPlayer.GetTrackingData(VRCPlayerApi.TrackingDataType.Head);
+                        RenderSebRecursivePortals(freshHead.position, freshHead.rotation, syncFOV);
                     }
                     return;
                 }
