@@ -267,6 +267,7 @@ public static class 传送门中文面板_标签表
         { "recursivePauseDuringTransition", "过渡时暂停递归(旧)" },
         { "recursiveDynamicNearClipMax", "动态近裁剪最大值" },
         { "debugRecursiveClipLog", "递归裁剪调试日志" },
+        { "obliqueClipWhenHeadInsideVolume", "诊断-贴门时仍斜裁剪(修遮罩伪影)" },
 
         { "portalViewTransitionCube", "过渡视角立方体" },
         { "transitionDuration", "过渡时长" },

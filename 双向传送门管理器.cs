@@ -339,6 +339,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [HideInInspector]
     public bool debugRecursiveClipLog = false;
 
+    [Tooltip("诊断/修复开关：头部在门体积内时，递归相机是否仍做 oblique 斜裁剪。" +
+             "关闭(默认)=历史行为：跳过斜裁剪——副作用是递归相机把'相机与门平面之间'的墙背面区域渲进传送门画面，" +
+             "极近距离站在门框内会看到门后墙的背面几何（'遮罩伪影'）。" +
+             "开启=Seb原版做法：始终斜裁剪（ApplyObliqueClippingSebStyle 已内置按相机所在侧自动翻转法线）。" +
+             "站在伪影位置切换此开关对比验证；确认无副作用后应作为默认。")]
+    public bool obliqueClipWhenHeadInsideVolume = false;
+
     // ============================================================
     // 新增：过渡系统（极简）
     // ============================================================
@@ -2287,9 +2294,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         SyncPortalRenderTextureBindings();
 
-        // 头在传送门体积内时：跳过 oblique 裁剪 + 强制渲染（Seb 风格直接算，不用可调阈值）。
+        // 头在传送门体积内时的 oblique 裁剪策略：
+        // 默认(旧行为)跳过斜裁剪——历史修复"贴近裁剪面法线翻转导致画面消失"的补丁，
+        // 但副作用是递归相机把墙背面区域渲进传送门画面（极近距离的'遮罩伪影'）；
+        // obliqueClipWhenHeadInsideVolume=true 时恢复 Seb 原版做法：始终斜裁剪
+        // （法线按相机所在侧自动翻转的逻辑 ApplyObliqueClippingSebStyle 里已实现）。
         bool headInsideVolumeA = IsHeadInsidePortalVolume(portalPlaneA, viewerPos, ResolvePortalShape(true));
         bool headInsideVolumeB = IsHeadInsidePortalVolume(portalPlaneB, viewerPos, ResolvePortalShape(false));
+        bool skipObliqueA = headInsideVolumeA && !obliqueClipWhenHeadInsideVolume;
+        bool skipObliqueB = headInsideVolumeB && !obliqueClipWhenHeadInsideVolume;
 
         // A 门表面显示 B 侧视角：严格对应 Seb 中 thisPortal=B, linkedPortal=A。
         // 头在 A 门体积内 → 镜像相机贴近 B 门 → 跳过 B 门侧 oblique。
@@ -2309,7 +2322,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             syncFOV,
             recursivePositionsA,
             recursiveRotationsA,
-            headInsideVolumeA
+            skipObliqueA
         );
 
         // B 门表面显示 A 侧视角：严格对应 Seb 中 thisPortal=A, linkedPortal=B。
@@ -2330,7 +2343,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             syncFOV,
             recursivePositionsB,
             recursiveRotationsB,
-            headInsideVolumeB
+            skipObliqueB
         );
 
         if (debugRecursiveRenderLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
