@@ -130,8 +130,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private int particleDebugFrameCounter = 0;
     private int particleDebugTestedCount = 0;
     private int particleDebugTeleportCount = 0;
+    private int particleDebugStuckCount = 0;
 
     private ParticleSystem.Particle[] particleTeleportBuffer;
+    // 实测位移三件套（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命（配对校验用）+ 槽位归属系统。
+    private Vector3[] particlePrevPositions;
+    private float[] particlePrevLifetimes;
+    private ParticleSystem[] particlePrevOwners;
     private ParticleSystem[] discoveredParticleSystems;
     private float particleDiscoveryTimer = 0f;
 
@@ -3032,6 +3037,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (particleTeleportBuffer == null || particleTeleportBuffer.Length != bufferSize)
         {
             particleTeleportBuffer = new ParticleSystem.Particle[bufferSize];
+            particlePrevPositions = new Vector3[bufferSize];
+            particlePrevLifetimes = new float[bufferSize];
+            particlePrevOwners = new ParticleSystem[bufferSize];
         }
 
         float dt = Time.deltaTime;
@@ -3075,9 +3083,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 particleDebugFrameCounter = 0;
                 int rootListCount = discoveredParticleSystems != null ? discoveredParticleSystems.Length : 0;
-                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（已注册系统：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲上限" + particleTeleportBufferSize + "）");
+                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次，过平面未传送滞留 " + particleDebugStuckCount + " 颗次（已注册系统：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲上限" + particleTeleportBufferSize + "）");
                 particleDebugTestedCount = 0;
                 particleDebugTeleportCount = 0;
+                particleDebugStuckCount = 0;
             }
         }
     }
@@ -3102,40 +3111,75 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         for (int i = 0; i < aliveCount; i++)
         {
             ParticleSystem.Particle p = particleTeleportBuffer[i];
-            Vector3 vel = p.velocity;
-            // 静止粒子不会穿越
-            if (vel.sqrMagnitude < 0.000001f) continue;
+            Vector3 curPos = p.position;
+            float curLife = p.remainingLifetime;
+
+            // 实测位移（优先）：本槽位的上帧数据若属于同一系统且寿命连续（配对校验通过），
+            // 用真实位移当本帧线段——彻底消除速度重建误差（碰撞子步/力模块/模拟步长与渲染帧长
+            // 不一致等，误差随速度等比放大，正是高速隧穿的病灶）。
+            // 配对校验：粒子死亡后槽位会被新粒子复用、GetParticles压缩顺序会漂移，不能裸信下标；
+            // 剩余寿命与上帧差≈dt 才算同一颗粒子。校验失败/新粒子 → 回退速度重建（旧行为，无回归）。
+            bool paired = particlePrevOwners != null && particlePrevOwners[i] == ps;
+            if (paired)
+            {
+                float lifeDelta = particlePrevLifetimes[i] - curLife;
+                paired = lifeDelta > dt * 0.25f && lifeDelta < dt * 1.75f;
+            }
+            Vector3 segStart = paired ? particlePrevPositions[i] : (curPos - p.velocity * dt);
+
+            // 无位移粒子不测试，但仍记录本帧数据供下帧配对
+            if ((curPos - segStart).sqrMagnitude < 0.000001f)
+            {
+                particlePrevPositions[i] = curPos;
+                particlePrevLifetimes[i] = curLife;
+                particlePrevOwners[i] = ps;
+                continue;
+            }
 
             if (debugParticleTeleportLog) particleDebugTestedCount++;
 
-            Vector3 segEnd = p.position;
-            Vector3 segStart = segEnd - vel * dt;
-
             float tA;
             Vector3 hitA;
-            bool crossA = ParticleSegmentCrossesPortal(segStart, segEnd, portalPlaneA, worldToLocalA, shapeA, out tA, out hitA);
+            bool crossA = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneA, worldToLocalA, shapeA, out tA, out hitA);
             float tB;
             Vector3 hitB;
-            bool crossB = ParticleSegmentCrossesPortal(segStart, segEnd, portalPlaneB, worldToLocalB, shapeB, out tB, out hitB);
+            bool crossB = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneB, worldToLocalB, shapeB, out tB, out hitB);
 
             // 一帧至多一次穿越：两门都命中取更晚的一次
             bool doA = crossA && (!crossB || tA >= tB);
             bool doB = crossB && !doA;
+            bool wasTeleported = false;
 
             if (doA)
             {
-                TeleportParticleThroughPortal(ref p, hitA, vel, tA, dt, worldToLocalA, localToWorldB);
+                TeleportParticleThroughPortal(ref p, hitA, p.velocity, tA, dt, worldToLocalA, localToWorldB);
                 particleTeleportBuffer[i] = p;
                 changed = true;
+                wasTeleported = true;
                 if (debugParticleTeleportLog) particleDebugTeleportCount++;
             }
             else if (doB)
             {
-                TeleportParticleThroughPortal(ref p, hitB, vel, tB, dt, worldToLocalB, localToWorldA);
+                TeleportParticleThroughPortal(ref p, hitB, p.velocity, tB, dt, worldToLocalB, localToWorldA);
                 particleTeleportBuffer[i] = p;
                 changed = true;
+                wasTeleported = true;
                 if (debugParticleTeleportLog) particleDebugTeleportCount++;
             }
+
+            // 诊断探针：已过门平面后侧却没被传送的粒子计数（正常应≈0；持续>0说明有穿越被漏判）
+            if (debugParticleTeleportLog && !wasTeleported)
+            {
+                float zA = worldToLocalA.MultiplyPoint(curPos).z;
+                float zB = worldToLocalB.MultiplyPoint(curPos).z;
+                if (zA < -0.01f || zB < -0.01f) particleDebugStuckCount++;
+            }
+
+            // 记录本帧实测数据（若刚传送，用写回缓冲后的最终状态，下帧线段从出口侧起算）
+            ParticleSystem.Particle finalState = particleTeleportBuffer[i];
+            particlePrevPositions[i] = finalState.position;
+            particlePrevLifetimes[i] = finalState.remainingLifetime;
+            particlePrevOwners[i] = ps;
         }
 
         // 只有真的改过才写回，省掉无穿越帧的 SetParticles 开销
