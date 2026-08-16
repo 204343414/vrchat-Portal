@@ -92,12 +92,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("参与传送的粒子系统白名单：只处理明确挂进来的系统，防止误挂超大粒子量的系统拖垮帧率。不挂任何系统时本功能零开销。")]
     public ParticleSystem[] portalParticleSystems;
 
-    [Tooltip("每个系统每帧最多读取/处理的粒子数（缓冲区大小）。活粒子多于此数时只处理前N颗，其余下一帧再说——Quest性能预算。高速/高密度粒子特效如果出现隧穿，优先加大这个值。")]
+    [Tooltip("每个系统每帧最多读取/处理的粒子数（缓冲区大小）。活粒子多于此数时超出部分完全不被处理（不是晚一帧，是漏掉）。实测结论：普通隧穿与它无关，但高密度特效(活粒子>1024)的隧穿要先查这里。")]
     [Range(32, 2048)]
-    public int particleTeleportBufferSize = 512;
+    public int particleTeleportBufferSize = 1024;
 
-    [Tooltip("粒子系统离两扇门都超过这个距离时整体跳过（性能闸门）。")]
-    public float particleTeleportMaxDistance = 30f;
+    [Tooltip("粒子系统【原点】离两扇门都超过这个距离时整体跳过（性能闸门，按系统原点算不是按粒子位置）。远处系统喷射的粒子飞进门区也不会被处理——有这种特效就把这个值加大。")]
+    public float particleTeleportMaxDistance = 100f;
 
     [Tooltip("自动收集粒子系统：开启后有三路来源——" +
              "1) 放置时发现：传送枪放门成功时/Start时，用OverlapSphere枚举门周围半径内的碰撞体，顺藤摸瓜找它们层级里的粒子系统自动注册（免手拖，推荐主用）；" +
@@ -3074,7 +3074,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (particleDebugFrameCounter >= 60)
             {
                 particleDebugFrameCounter = 0;
-                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（白名单" + portalParticleSystems.Length + "个系统）");
+                int rootListCount = discoveredParticleSystems != null ? discoveredParticleSystems.Length : 0;
+                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（已注册系统：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲上限" + particleTeleportBufferSize + "）");
                 particleDebugTestedCount = 0;
                 particleDebugTeleportCount = 0;
             }
