@@ -205,6 +205,13 @@
 //         发生，落点离出口平面0.3米，头不再滞留退化区。
 //   结论：teleportTriggerOffset 不建议设为0；贴面渲染退化（跳过裁剪会漏、强制裁剪会反向）
 //         仍是遗留课题，但正常游玩不会停在退化区，优先级靠后。
+//   后续清理（2026-08-16）：诊断开关 obliqueClipWhenHeadInsideVolume 实测"开启更糟、
+//         关闭=可用"后已删除（行为锁定为贴门跳过斜裁剪），配套置顶绘制/HelpBox一并移除。
+//
+// 【粒子传送当前状态（2026-08-16）】
+//   已通：无碰撞可传、白名单/收集根/root扫描/放置发现四路注册、实测位移取代速度重建。
+//   遗留：高速(速度10)仍有隧穿；诊断日志显示大量'过平面未传送滞留'，待滞留样本日志
+//         区分身份（门框外穿过=正确行为 / 发射器生在后侧=布置问题 / 配对失败=待修）。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;
@@ -293,7 +300,6 @@ public static class 传送门中文面板_标签表
         { "recursivePauseDuringTransition", "过渡时暂停递归(旧)" },
         { "recursiveDynamicNearClipMax", "动态近裁剪最大值" },
         { "debugRecursiveClipLog", "递归裁剪调试日志" },
-        { "obliqueClipWhenHeadInsideVolume", "诊断-贴门时仍斜裁剪(修遮罩伪影)" },
 
         { "portalViewTransitionCube", "过渡视角立方体" },
         { "transitionDuration", "过渡时长" },
@@ -408,30 +414,12 @@ public static class 传送门中文面板_标签表
 [CustomEditor(typeof(双向传送门管理器))]
 public class 双向传送门管理器_中文面板 : Editor
 {
-    // 置顶字段：显式画在 Inspector 最顶部，不依赖遍历顺序。
-    private static readonly HashSet<string> 置顶字段 = new HashSet<string> { "obliqueClipWhenHeadInsideVolume" };
-
     public override void OnInspectorGUI()
     {
         if (UdonSharpEditorGUIHelper.尝试绘制默认头部(serializedObject, target)) return;
 
         serializedObject.Update();
-
-        // 置顶诊断开关 + 编译状态探测：字段找不到说明 Unity 还没用新脚本完成重编译
-        SerializedProperty obliqueProp = serializedObject.FindProperty("obliqueClipWhenHeadInsideVolume");
-        if (obliqueProp != null)
-        {
-            EditorGUILayout.PropertyField(obliqueProp, new GUIContent(
-                "【诊断】贴门时仍斜裁剪(修遮罩伪影)",
-                "站在伪影位置切换此开关对比验证：开启后贴门时递归相机恢复斜裁剪，门后墙背面几何不再漏进传送门画面。确认无副作用后应改为默认开启。"), true);
-            EditorGUILayout.Space();
-        }
-        else
-        {
-            EditorGUILayout.HelpBox("诊断开关字段未被 Unity 识别：脚本尚未重新编译。请检查 Console 是否有编译错误，或 Ctrl+R / 切换窗口焦点强制刷新。若文件确为新版仍如此，检查工程里是否存在该脚本的第二份拷贝。", MessageType.Warning);
-        }
-
-        UdonSharpEditorGUIHelper.绘制中文字段(serializedObject, 传送门中文面板_标签表.门管理器标签, 置顶字段);
+        UdonSharpEditorGUIHelper.绘制中文字段(serializedObject, 传送门中文面板_标签表.门管理器标签);
         serializedObject.ApplyModifiedProperties();
     }
 }
@@ -480,16 +468,13 @@ public static class UdonSharpEditorGUIHelper
         return null;
     }
 
-    public static void 绘制中文字段(SerializedObject so, Dictionary<string, string> 标签表, HashSet<string> 跳过字段 = null)
+    public static void 绘制中文字段(SerializedObject so, Dictionary<string, string> 标签表)
     {
         SerializedProperty prop = so.GetIterator();
         bool enterChildren = true;
         while (prop.NextVisible(enterChildren))
         {
             enterChildren = false;
-
-            // 已置顶显式绘制的字段跳过，避免重复出现
-            if (跳过字段 != null && 跳过字段.Contains(prop.name)) continue;
 
             if (prop.name == "m_Script")
             {

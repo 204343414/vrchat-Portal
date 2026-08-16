@@ -131,6 +131,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private int particleDebugTestedCount = 0;
     private int particleDebugTeleportCount = 0;
     private int particleDebugStuckCount = 0;
+    private int particleDebugStuckSamples = 0;
 
     private ParticleSystem.Particle[] particleTeleportBuffer;
     // 实测位移三件套（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命（配对校验用）+ 槽位归属系统。
@@ -357,13 +358,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("输出递归裁剪/near clip 调试日志。")]
     [HideInInspector]
     public bool debugRecursiveClipLog = false;
-
-    [Tooltip("诊断/修复开关：头部在门体积内时，递归相机是否仍做 oblique 斜裁剪。" +
-             "关闭(默认)=历史行为：跳过斜裁剪——副作用是递归相机把'相机与门平面之间'的墙背面区域渲进传送门画面，" +
-             "极近距离站在门框内会看到门后墙的背面几何（'遮罩伪影'）。" +
-             "开启=Seb原版做法：始终斜裁剪（ApplyObliqueClippingSebStyle 已内置按相机所在侧自动翻转法线）。" +
-             "站在伪影位置切换此开关对比验证；确认无副作用后应作为默认。")]
-    public bool obliqueClipWhenHeadInsideVolume = false;
 
     // ============================================================
     // 新增：过渡系统（极简）
@@ -2316,15 +2310,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         SyncPortalRenderTextureBindings();
 
-        // 头在传送门体积内时的 oblique 裁剪策略：
-        // 默认(旧行为)跳过斜裁剪——历史修复"贴近裁剪面法线翻转导致画面消失"的补丁，
-        // 但副作用是递归相机把墙背面区域渲进传送门画面（极近距离的'遮罩伪影'）；
-        // obliqueClipWhenHeadInsideVolume=true 时恢复 Seb 原版做法：始终斜裁剪
-        // （法线按相机所在侧自动翻转的逻辑 ApplyObliqueClippingSebStyle 里已实现）。
+        // 头在传送门体积内时：跳过 oblique 斜裁剪（历史补丁：避免贴近裁剪面时法线翻转导致
+        // 反向裁切/画面消失）。已知并接受副作用：贴门时门后墙背面区域可能漏进传送门画面；
+        // 实测(2026-08-15)贴门强制斜裁剪的画面更糟，故锁定跳过行为，不再提供开关。
+        // teleportTriggerOffset 保持 ≥0.1（默认0.3）可让正常游玩不进入贴面退化区（见交接文档）。
         bool headInsideVolumeA = IsHeadInsidePortalVolume(portalPlaneA, viewerPos, ResolvePortalShape(true));
         bool headInsideVolumeB = IsHeadInsidePortalVolume(portalPlaneB, viewerPos, ResolvePortalShape(false));
-        bool skipObliqueA = headInsideVolumeA && !obliqueClipWhenHeadInsideVolume;
-        bool skipObliqueB = headInsideVolumeB && !obliqueClipWhenHeadInsideVolume;
 
         // A 门表面显示 B 侧视角：严格对应 Seb 中 thisPortal=B, linkedPortal=A。
         // 头在 A 门体积内 → 镜像相机贴近 B 门 → 跳过 B 门侧 oblique。
@@ -2344,7 +2335,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             syncFOV,
             recursivePositionsA,
             recursiveRotationsA,
-            skipObliqueA
+            headInsideVolumeA
         );
 
         // B 门表面显示 A 侧视角：严格对应 Seb 中 thisPortal=A, linkedPortal=B。
@@ -2365,7 +2356,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             syncFOV,
             recursivePositionsB,
             recursiveRotationsB,
-            skipObliqueB
+            headInsideVolumeB
         );
 
         if (debugRecursiveRenderLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
@@ -3087,6 +3078,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 particleDebugTestedCount = 0;
                 particleDebugTeleportCount = 0;
                 particleDebugStuckCount = 0;
+                particleDebugStuckSamples = 0;
             }
         }
     }
@@ -3167,12 +3159,24 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if (debugParticleTeleportLog) particleDebugTeleportCount++;
             }
 
-            // 诊断探针：已过门平面后侧却没被传送的粒子计数（正常应≈0；持续>0说明有穿越被漏判）
+            // 诊断探针：已过门平面后侧却没被传送的粒子计数 + 样本（正常应≈0）。
+            // 样本字段用来区分滞留粒子的身份：框内/框外（门框外穿过=正确行为不算漏）、
+            // 配对状态（配对失败=回退速度重建）、寿命（很大=刚出生就在后侧=发射器位置问题）。
             if (debugParticleTeleportLog && !wasTeleported)
             {
                 float zA = worldToLocalA.MultiplyPoint(curPos).z;
                 float zB = worldToLocalB.MultiplyPoint(curPos).z;
-                if (zA < -0.01f || zB < -0.01f) particleDebugStuckCount++;
+                if (zA < -0.01f || zB < -0.01f)
+                {
+                    particleDebugStuckCount++;
+                    if (particleDebugStuckSamples < 2)
+                    {
+                        particleDebugStuckSamples++;
+                        bool inRectA = LocalPointInPortalRect(worldToLocalA.MultiplyPoint(curPos), shapeA);
+                        bool inRectB = LocalPointInPortalRect(worldToLocalB.MultiplyPoint(curPos), shapeB);
+                        Debug.Log("[粒子传送][滞留样本] zA=" + zA.ToString("F2") + " zB=" + zB.ToString("F2") + " 框内A=" + inRectA + " 框内B=" + inRectB + " 配对=" + paired + " 寿命=" + curLife.ToString("F2") + " 速度=" + p.velocity.magnitude.ToString("F1"));
+                    }
+                }
             }
 
             // 记录本帧实测数据（若刚传送，用写回缓冲后的最终状态，下帧线段从出口侧起算）
