@@ -179,6 +179,11 @@
 //     粒子碰撞子步使速度反推线段偏离真实路径，回溯窗随速度等比放大补漏；
 //     理论边界：逐帧采样无法保证任意速度零隧穿（帧间无数据），但窗口可调到覆盖任意现实速度。
 //   风险预案：GetParticles/SetParticles 若在 Udon 白名单外，编译报错后按报错逐项降级。
+//   触发器方案裁决（2026-08-16，编译实测）：OnParticleTrigger 未被 Udon 暴露
+//         （override 报 CS0115: no suitable method found to override）——Unity 粒子
+//         Trigger 模块的回调在 Udon 里接不上线；且该回调无参无位置，即使暴露传送仍需
+//         扫缓冲。结论：缓冲扫描是 Udon 约束下粒子传送检测的唯一可行路径，
+//         触发器/碰撞事件路线结案，勿再投入。
 //
 // 【近门渲染退化区与 teleportTriggerOffset=0 的坑（2026-08-15 用户实测破案）】
 //   现象链：teleportTriggerOffset=0 时穿越判定发生在门平面正中(z=0)，传送落点
