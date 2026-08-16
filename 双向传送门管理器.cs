@@ -99,17 +99,18 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("粒子系统离两扇门都超过这个距离时整体跳过（性能闸门）。")]
     public float particleTeleportMaxDistance = 30f;
 
-    [Tooltip("自动收集粒子系统：开启后除了手动白名单，还会自动收集两类来源——" +
-             "1) 本物体 transform.root 子树内离两扇门足够近的粒子系统（预制件自带特效零配置生效）；" +
-             "2) 下方'收集根'物体子树内的粒子系统（特效挂在别的根节点下时才需要拖，可选）。" +
-             "Udon 沙箱禁止全场景枚举API，这是白名单内能做到的最大自动范围。")]
+    [Tooltip("自动收集粒子系统：开启后有三路来源——" +
+             "1) 放置时发现：传送枪放门成功时/Start时，用OverlapSphere枚举门周围半径内的碰撞体，顺藤摸瓜找它们层级里的粒子系统自动注册（免手拖，推荐主用）；" +
+             "2) 本物体 transform.root 子树定时扫描（预制件自带特效零配置生效）；" +
+             "3) 下方'收集根'物体子树（以上都覆盖不到时的兜底，可选）。" +
+             "诚实边界：Udon 无法枚举没有碰撞体的物体，完全独立且无碰撞体的粒子系统仍需白名单/收集根。")]
     public bool autoDiscoverParticleSystems = true;
 
-    [Tooltip("收集根（可选）：特效物件没挂在传送门同一根节点下时，把它们的容器物体拖进来。不拖也有 transform.root 自动扫描兜底。")]
+    [Tooltip("收集根（可选）：特效物件没挂在传送门同一根节点下、自己又没有碰撞体时，把它们的容器物体拖进来。")]
     public GameObject[] particleDiscoveryRoots;
 
-    [Tooltip("自动收集半径：粒子系统原点离任一门在这个距离内就自动加入参与列表。")]
-    public float particleDiscoveryRadius = 25f;
+    [Tooltip("自动发现半径：放置时发现(OverlapSphere)的半径，也是root扫描的距离过滤。门放哪扫到哪。")]
+    public float particleDiscoveryRadius = 100f;
 
     [Tooltip("自动收集刷新间隔（秒）。门可以被传送枪移动，定期重新扫描保证参与列表跟上。")]
     public float particleDiscoveryRefreshInterval = 5f;
@@ -118,9 +119,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
              "粒子会在到达门平面之前先被墙体碰撞体弹走、数学上永远不穿过门平面；把检测面推出墙面，让粒子在撞墙前就传送。")]
     public float particleTeleportPlaneOffset = 0.05f;
 
-    [Tooltip("穿越回溯窗（以'帧位移线段长度'为单位）。粒子碰撞/模拟子步会让速度反推线段偏离真实路径，回溯窗补漏；高速粒子仍隧穿就把这个值调大。")]
+    [Tooltip("穿越回溯窗（以'帧位移线段长度'为单位）。粒子碰撞/模拟子步会让速度反推线段偏离真实路径，回溯窗补漏。" +
+             "实测结论（2026-08-16）：调大缓冲区不防隧穿，调大回溯窗防隧穿——高速粒子的重建误差随速度等比放大。" +
+             "高速特效隧穿就把这个值往上调（1~2），代价仅是传送落点的时间外推，无副作用。")]
     [Range(0f, 2f)]
-    public float particleTeleportRetroWindow = 0.5f;
+    public float particleTeleportRetroWindow = 1f;
 
     [Tooltip("粒子传送诊断日志：每60帧输出一次'检测了多少粒子/传送了多少次'。粒子隧穿不传送时用它定位卡在哪一环：检测数=0说明系统没被读取（Simulation Space不是World/系统没播放/距离闸门）；检测数>0但传送=0说明穿越判定不命中（空间语义/门框范围/方向）。")]
     public bool debugParticleTeleportLog = false;
@@ -131,6 +134,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private ParticleSystem.Particle[] particleTeleportBuffer;
     private ParticleSystem[] discoveredParticleSystems;
     private float particleDiscoveryTimer = 0f;
+
+    // 放置时发现：OverlapSphere 缓冲 + 注册表（固定容量，Udon无动态数组）
+    private Collider[] discoveryOverlapBuffer;
+    private ParticleSystem[] placedDiscoverySystems;
+    private int placedDiscoveryCount = 0;
 
     [Header("════════════ 性能优化 ════════════")]
     public bool enableVisibilityOptimization = true;
@@ -615,6 +623,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (enableParticleTeleport && autoDiscoverParticleSystems)
         {
             DiscoverParticleSystems();
+            // 放置时发现：以两扇门的初始位置为中心各扫一遍
+            if (portalPlaneA != null) DiscoverParticleSystemsAround(portalPlaneA.position);
+            if (portalPlaneB != null) DiscoverParticleSystemsAround(portalPlaneB.position);
         }
 
         // 初始化 clone 要销毁的组件类型列表（Udon不支持自定义static字段，Start里构建实例数组）
@@ -3047,6 +3058,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 ProcessSingleParticleSystem(discoveredParticleSystems[s], worldToLocalA, localToWorldA, worldToLocalB, localToWorldB, shapeA, shapeB, dt, maxDistSqr);
             }
         }
+        // 放置时发现注册表（第三路）
+        if (placedDiscoverySystems != null)
+        {
+            for (int s = 0; s < placedDiscoveryCount; s++)
+            {
+                ProcessSingleParticleSystem(placedDiscoverySystems[s], worldToLocalA, localToWorldA, worldToLocalB, localToWorldB, shapeA, shapeB, dt, maxDistSqr);
+            }
+        }
 
         // 诊断日志：每60帧汇总一次，定位"隧穿不传送"卡在哪一环
         if (debugParticleTeleportLog)
@@ -3198,6 +3217,83 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
         }
         return idx;
+    }
+
+    // ============================================================
+    // 放置时发现：传送枪放门成功后调用（Start时也按初始门位置各扫一次）。
+    // OverlapSphereNonAlloc 枚举半径内碰撞体 → 对每个碰撞体向上爬层级(找祖先的粒子系统)、
+    // 向下 GetComponentsInChildren(找子物体里的粒子系统) → 去重注册。
+    // 为什么不用触发器：粒子不触发 OnTriggerEnter（已查证/实测），且这里要找的是
+    // "哪些系统存在"而不是"哪颗粒子到达"，物理查询+层级遍历才是对的工具。
+    // 诚实边界：没有碰撞体的独立物体无法被枚举到，那部分靠 root 扫描/收集根/白名单。
+    // ============================================================
+
+    public void DiscoverParticleSystemsAround(Vector3 center)
+    {
+        if (!enableParticleTeleport || !autoDiscoverParticleSystems) return;
+        if (portalPlaneA == null || portalPlaneB == null) return;
+
+        if (discoveryOverlapBuffer == null) discoveryOverlapBuffer = new Collider[256];
+        if (placedDiscoverySystems == null) placedDiscoverySystems = new ParticleSystem[64];
+
+        int hitCount = Physics.OverlapSphereNonAlloc(center, particleDiscoveryRadius, discoveryOverlapBuffer, ~0, QueryTriggerInteraction.Collide);
+        for (int i = 0; i < hitCount; i++)
+        {
+            Collider col = discoveryOverlapBuffer[i];
+            if (col == null) continue;
+
+            // 向上爬：粒子系统可能在碰撞体的祖先上（最多爬8层，防长链）
+            Transform t = col.transform;
+            for (int up = 0; up < 8 && t != null; up++)
+            {
+                ParticleSystem psUp = t.GetComponent<ParticleSystem>();
+                if (psUp != null)
+                {
+                    RegisterDiscoveredParticleSystem(psUp);
+                    break;
+                }
+                t = t.parent;
+            }
+
+            // 向下找：粒子系统可能在碰撞体的子物体里
+            ParticleSystem[] down = col.gameObject.GetComponentsInChildren<ParticleSystem>(true);
+            if (down == null) continue;
+            for (int d = 0; d < down.Length; d++)
+            {
+                if (down[d] != null) RegisterDiscoveredParticleSystem(down[d]);
+            }
+        }
+    }
+
+    // 去重注册：已存在于 放置注册表/手动白名单/root扫描列表 的系统不重复登记。
+    private void RegisterDiscoveredParticleSystem(ParticleSystem ps)
+    {
+        if (ps == null) return;
+        if (placedDiscoverySystems == null) return;
+        if (placedDiscoveryCount >= placedDiscoverySystems.Length) return;
+
+        for (int i = 0; i < placedDiscoveryCount; i++)
+        {
+            if (placedDiscoverySystems[i] == ps) return;
+        }
+        if (portalParticleSystems != null)
+        {
+            for (int i = 0; i < portalParticleSystems.Length; i++)
+            {
+                if (portalParticleSystems[i] == ps) return;
+            }
+        }
+        if (discoveredParticleSystems != null)
+        {
+            for (int i = 0; i < discoveredParticleSystems.Length; i++)
+            {
+                if (discoveredParticleSystems[i] == ps) return;
+            }
+        }
+
+        placedDiscoverySystems[placedDiscoveryCount] = ps;
+        placedDiscoveryCount++;
+        Debug.Log("[粒子传送] 放置时发现自动注册: " + ps.name);
     }
 
     // 粒子本帧线段与门平面求交：交点落在线段上且位于门框形状内才算穿越。

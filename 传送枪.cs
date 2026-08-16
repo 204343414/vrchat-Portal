@@ -832,6 +832,12 @@ public class 传送枪 : UdonSharpBehaviour
             portal.position = portalPos;
             portal.rotation = portalRot;
 
+            // 放置时发现：以门的新位置为中心扫描半径内的粒子系统自动注册（免手拖）
+            if (portalManager != null)
+            {
+                portalManager.DiscoverParticleSystemsAround(portalPos);
+            }
+
             if (debugPortalGunLog)
             {
                 Debug.Log(
