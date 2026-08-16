@@ -106,90 +106,6 @@
 //   - 视觉：完整传送（相对坐标保持），无需新 Shader。性能优先（复用 checkInterval）。
 //   - 泛用性：可直接做 Prefab，无需新组件。networking 留空（本地优先）。
 //   - 交接注意：刚体传送完全复用现有 traveller/halfTurn/形状系统，极高鲁棒性。
-//
-// 【clone材质动画跟随修复（2026-08-13，两轮迭代后的最终结论）】
-//   症状：本体刚体的材质被动画控制器动画（如变色）时，穿门clone显示文件夹里的默认材质，不跟随变色。
-//   查证结论（联网核实Unity官方文档/论坛）：Animator对材质属性的动画【不写进材质本身】，
-//         而是通过渲染器的 MaterialPropertyBlock 应用——因此任何"复制/共享材质"的方案都同步不到动画值
-//         （第一轮只共享材质引用的修复因此无效）。另外clone的Animator被Destroy是帧末延迟生效的，
-//         销毁时Unity会把clone渲染器材质还原回资产，一次性赋值也可能被撤销，需要持续校正。
-//   方案（RepointCloneMaterials 双层校正，UpdateRigidbodyClonePoses 每帧执行）：
-//         1) 材质引用校正：slot0 sharedMaterial做廉价探针，引用漂移才重写；
-//         2) PropertyBlock同步：本体 GetPropertyBlock -> clone SetPropertyBlock
-//            （官方API，UdonSharp支持已联网查证：有多个真实VRChat世界用例）。
-//
-// 【剪刀穿模结构图层还原修复（2026-08-13）】
-//   症状：A打地板、B打在穿模过来的斜面上，A的clipVolume把斜面切到穿透层；从A穿到B后，
-//         斜面永远卡在穿透层，不还原默认层。
-//   根因：传送同帧的 afterTeleport 会对B的markedCollider(斜面)执行 ApplyPassThroughLayer，
-//         此时斜面已被A的clipVolume切到穿透层（clipVolume还原发生在LateUpdate更后面），
-//         旧代码查不到真原始层就把穿透层本身误记为"原始layer"，离开时"还原"成穿透层=永不还原。
-//   方案：新增 FindClipVolumeOriginalLayer 查clipVolume追踪表（它只在非穿透层时接管记录，
-//         表里必是真原始值）；在 ApplyPassThroughLayer 记录时（根治，共两处）和
-//         RestorePassThroughLayer 还原时（防御兜底）都用它纠正被污染的穿透层记录。
-//
-// 【斜向门触发语义 + 下落穿透修复（2026-08-13，两轮迭代后的最终形态）】
-//   症状：45°斜坡门"靠近就传送"；直直下落穿斜门会穿模不触发。
-//   根因1：旧混合检测点是 root XY + head Z 的混搭。纯平/竖直门无碍（head/root平面内坐标重合），
-//          但斜门上 head 与 root 的门平面内 XY 相差"身高在平面上的投影"（45°约1.1米）——
-//          混搭点不在身体上，直落穿斜门时检测XY偏离头部实际穿平面位置约1.1米→门框检查失败→穿模。
-//          同时旧 IsFlatPortal 阈值0.9925把斜坡归为"墙面"(深度用root)，脚先过平面→靠近就传。
-//   最终方案：检测点全局统一为纯 head——任何朝向都是"头穿过门平面→传送"，
-//          没有任何按角度分类/阈值参与触发判定（用户明确要求去掉角度机制）；
-//          实际传送落点仍由 TeleportPointLocalForPortal(root) 计算，检测与落点分离。
-//          IsUpwardFacingPortal 降级为纯内部函数(常量0.5)，只用于 TeleportSebStyle 的
-//          落点映射配方选择，误判由出口侧保险兜底。改造后零调用的旧 IsFlatPortal 已删除。
-//   附带：扫掠判定修复死区洞（上一帧在±triggerOffset死区内时旧门槛哑火），
-//          用 lastBodySide 记录来向放行"死区内穿出"，传送出口边界落点种 lastBodySide 防哑火/防重传。
-//
-// 【手持刚体松手提交（2026-08-14，用户提出的简化方案，取代之前三轮失败的实时干预）】
-//   历史教训：三轮"握持期间实时干预"的尝试（穿越即传/线段隧穿判定/折射握持）全部失败，
-//         根因一致：枪每帧 MovePosition 刚体，实时干预逻辑每帧又去重定位它，
-//         穿越检测还会把重定位产生的位置跳变当成新穿越 → 三方拉扯 = 鬼畜/塞不进/松手位置错乱。
-//   最终方案（职责分离，只在松手瞬间动一次）：
-//         握持期间：枪独占刚体位置；传送门系统只显示 clone 镜像（UpdateRigidbodyClonePoses
-//         每帧用与传送相同的 from→to+半转数学镜像本体，clone位置=正确的出口位置）。
-//         松手瞬间：传送枪 ReleaseHeldRigidbody 调用管理器 CommitHeldRigidbodyToClone，两级判定：
-//         1) 有活跃clone且本体真在fromPortal平面后侧 → 对齐到clone位姿、清速度、销毁clone；
-//         2) 无clone（深捅超过追踪深度1.1米导致追踪移除、clone销毁——这正是早期版本
-//            松手提交失效、刚体留在门后的根因）→ 纯几何直判：本体过某门平面且在门框内
-//            → 按同款镜像数学传送到另一侧。
-//         防拽回闸门：clone路径要求本体在平面后侧；几何路径额外要求本体不在另一扇门的
-//         门前区域内（"已经出来了"的状态不提交）。没伸进门时空操作，正常松手行为不变。
-//
-// 【粒子传送（2026-08-14，1.0后的首个新功能）】
-//   功能：白名单粒子系统里穿过门平面的粒子被映射到另一侧（位置+速度同款 from→to+半转数学）。
-//   关键设计：
-//     - 无状态穿越判定：用粒子速度反推本帧线段 [pos-vel*dt, pos] 求交，不存上一帧位置——
-//       Unity粒子缓冲槽位会被死亡粒子复用，按序号对齐不可靠（这是不做prev缓存的原因）。
-//     - 矩阵每帧只构造4次（A/B各一套），粒子循环内只有 MultiplyPoint/MultiplyVector。
-//     - 性能闸门：白名单 + 距离闸门(particleTeleportMaxDistance) + 每系统每帧读取上限
-//       (particleTeleportBufferSize，GetParticles只读缓冲大小颗)。
-//     - 一帧至多穿越一次：两门都命中取t更大的（更晚的），与粒子终点一致。
-//   使用要求：参与系统 Simulation Space 必须是 World（Local空间语义不同，暂不支持）。
-//   泛用化迭代：自动收集两个来源——1) transform.root 子树（预制件自带特效零配置生效，
-//     联网查证确认：FindObjectsOfType 实测编译报错、Scene.GetRootGameObjects 在 VRChat
-//     官方反馈板有请求但至今未开放，全场景枚举类API整体被 Udon 沙箱禁用；
-//     沿层级树 GetComponentsInChildren 是白名单内最优路径）；
-//     2) particleDiscoveryRoots 收集根（特效挂在别的根下时手动拖容器，可选）。
-//   贴墙门+碰撞粒子修复：粒子带碰撞时被墙体碰撞体在门平面处弹走，数学上永远穿不过门平面。
-//     particleTeleportPlaneOffset 把检测面沿法线推出墙面（默认5cm），粒子撞墙前即传送；
-//     同时只收"朝门飞"的穿越（denom<0），反弹向外飞的粒子不误传。
-//   高速隧穿修复：缓冲区默认512 + 穿越回溯窗 t∈[-particleTeleportRetroWindow,1]（可调）——
-//     粒子碰撞子步使速度反推线段偏离真实路径，回溯窗随速度等比放大补漏；
-//     理论边界：逐帧采样无法保证任意速度零隧穿（帧间无数据），但窗口可调到覆盖任意现实速度。
-//   风险预案：GetParticles/SetParticles 若在 Udon 白名单外，编译报错后按报错逐项降级。
-//
-// 【近门渲染退化区与 teleportTriggerOffset=0 的坑（2026-08-15 用户实测破案）】
-//   现象链：teleportTriggerOffset=0 时穿越判定发生在门平面正中(z=0)，传送落点
-//         exitTargetDist=max(exitSideMinDistance,0)=0.02米——头恰好停在出口门平面上，
-//         卡在"头在门体积内+贴面"的渲染退化区：skipAllOblique生效→递归相机不裁剪→
-//         门后墙背面漏进画面；同时相机贴面时斜裁剪数学退化→门面本身渲染异常。
-//         转头前探离开退化区后画面恢复正常（用户逐步转头实测复现全链）。
-//   解决：teleportTriggerOffset 调高（默认0.3）后所有异常消失——传送提前到触发平面
-//         发生，落点离出口平面0.3米，头不再滞留退化区。
-//   结论：teleportTriggerOffset 不建议设为0；贴面渲染退化（跳过裁剪会漏、强制裁剪会反向）
-//         仍是遗留课题，但正常游玩不会停在退化区，优先级靠后。
 // ================================================================================
 #if UNITY_EDITOR
 using System.Collections.Generic;
@@ -226,17 +142,6 @@ public static class 传送门中文面板_标签表
         { "colliderDisableBuffer", "碰撞穿透缓冲距离" },
         { "solidCollisionLayer", "实体碰撞层" },
         { "playerPassThroughLayer", "玩家穿透层" },
-
-        { "enableParticleTeleport", "启用粒子传送" },
-        { "portalParticleSystems", "粒子传送白名单(手动)" },
-        { "particleTeleportBufferSize", "粒子传送-每系统每帧上限" },
-        { "particleTeleportMaxDistance", "粒子传送-距离闸门" },
-        { "autoDiscoverParticleSystems", "粒子传送-自动收集开关" },
-        { "particleDiscoveryRoots", "粒子传送-收集根(拖容器)" },
-        { "particleDiscoveryRadius", "粒子传送-自动收集半径" },
-        { "particleDiscoveryRefreshInterval", "粒子传送-收集刷新间隔" },
-        { "particleTeleportPlaneOffset", "粒子传送-检测面外推(防墙弹)" },
-        { "particleTeleportRetroWindow", "粒子传送-高速回溯窗" },
 
         { "enableVisibilityOptimization", "启用可见性优化" },
         { "maxRenderDistance", "最大渲染距离" },
@@ -278,7 +183,6 @@ public static class 传送门中文面板_标签表
         { "recursivePauseDuringTransition", "过渡时暂停递归(旧)" },
         { "recursiveDynamicNearClipMax", "动态近裁剪最大值" },
         { "debugRecursiveClipLog", "递归裁剪调试日志" },
-        { "obliqueClipWhenHeadInsideVolume", "诊断-贴门时仍斜裁剪(修遮罩伪影)" },
 
         { "portalViewTransitionCube", "过渡视角立方体" },
         { "transitionDuration", "过渡时长" },
@@ -294,6 +198,7 @@ public static class 传送门中文面板_标签表
         { "debugLogIntervalFrames", "调试-日志间隔帧数" },
         { "playerCapsuleRadius", "玩家胶囊体半径" },
         { "playerCapsuleHeight", "玩家胶囊体高度" },
+        { "portalSideEpsilon", "门侧判定死区" },
         { "teleportBlockFrames", "传送后屏蔽帧数" },
         { "stopAfterTeleportSameFrame", "传送后结束本帧" },
         { "protectSharedMarkedCollider", "保护共享碰撞体" },
@@ -303,7 +208,7 @@ public static class 传送门中文面板_标签表
 
         { "teleportTriggerOffset", "传送触发面偏移" },
         { "useRootAsTraveller", "使用根骨追踪" },
-        { "useHybridRootXYHeadZTraveller", "混合追踪(头判定/根骨落点)" },
+        { "useHybridRootXYHeadZTraveller", "混合根骨/头部追踪" },
         { "enableExitSideCorrection", "出口侧保险修正" },
         { "exitSideMinDistance", "出口最小安全距离" },
         { "useVRCTrackingRootTeleport", "旧版-头部反推根骨" },
@@ -393,30 +298,12 @@ public static class 传送门中文面板_标签表
 [CustomEditor(typeof(双向传送门管理器))]
 public class 双向传送门管理器_中文面板 : Editor
 {
-    // 置顶字段：显式画在 Inspector 最顶部，不依赖遍历顺序。
-    private static readonly HashSet<string> 置顶字段 = new HashSet<string> { "obliqueClipWhenHeadInsideVolume" };
-
     public override void OnInspectorGUI()
     {
         if (UdonSharpEditorGUIHelper.尝试绘制默认头部(serializedObject, target)) return;
 
         serializedObject.Update();
-
-        // 置顶诊断开关 + 编译状态探测：字段找不到说明 Unity 还没用新脚本完成重编译
-        SerializedProperty obliqueProp = serializedObject.FindProperty("obliqueClipWhenHeadInsideVolume");
-        if (obliqueProp != null)
-        {
-            EditorGUILayout.PropertyField(obliqueProp, new GUIContent(
-                "【诊断】贴门时仍斜裁剪(修遮罩伪影)",
-                "站在伪影位置切换此开关对比验证：开启后贴门时递归相机恢复斜裁剪，门后墙背面几何不再漏进传送门画面。确认无副作用后应改为默认开启。"), true);
-            EditorGUILayout.Space();
-        }
-        else
-        {
-            EditorGUILayout.HelpBox("诊断开关字段未被 Unity 识别：脚本尚未重新编译。请检查 Console 是否有编译错误，或 Ctrl+R / 切换窗口焦点强制刷新。若文件确为新版仍如此，检查工程里是否存在该脚本的第二份拷贝。", MessageType.Warning);
-        }
-
-        UdonSharpEditorGUIHelper.绘制中文字段(serializedObject, 传送门中文面板_标签表.门管理器标签, 置顶字段);
+        UdonSharpEditorGUIHelper.绘制中文字段(serializedObject, 传送门中文面板_标签表.门管理器标签);
         serializedObject.ApplyModifiedProperties();
     }
 }
@@ -465,16 +352,13 @@ public static class UdonSharpEditorGUIHelper
         return null;
     }
 
-    public static void 绘制中文字段(SerializedObject so, Dictionary<string, string> 标签表, HashSet<string> 跳过字段 = null)
+    public static void 绘制中文字段(SerializedObject so, Dictionary<string, string> 标签表)
     {
         SerializedProperty prop = so.GetIterator();
         bool enterChildren = true;
         while (prop.NextVisible(enterChildren))
         {
             enterChildren = false;
-
-            // 已置顶显式绘制的字段跳过，避免重复出现
-            if (跳过字段 != null && 跳过字段.Contains(prop.name)) continue;
 
             if (prop.name == "m_Script")
             {
