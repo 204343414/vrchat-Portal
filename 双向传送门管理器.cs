@@ -3159,9 +3159,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if (debugParticleTeleportLog) particleDebugTeleportCount++;
             }
 
-            // 诊断探针：已过门平面后侧却没被传送的粒子计数 + 样本（正常应≈0）。
-            // 样本字段用来区分滞留粒子的身份：框内/框外（门框外穿过=正确行为不算漏）、
-            // 配对状态（配对失败=回退速度重建）、寿命（很大=刚出生就在后侧=发射器位置问题）。
+            // 诊断探针：已过门平面后侧却没被传送的粒子计数（含在途的后侧出生粒子，偏大正常），
+            // 样本只采"刚过平面"的滞留粒子（平面后0.6米内）——那才是真隧穿者；
+            // 深处后侧的多是出生在后侧的在途粒子（2026-08-16样本已证实）。
             if (debugParticleTeleportLog && !wasTeleported)
             {
                 float zA = worldToLocalA.MultiplyPoint(curPos).z;
@@ -3169,7 +3169,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if (zA < -0.01f || zB < -0.01f)
                 {
                     particleDebugStuckCount++;
-                    if (particleDebugStuckSamples < 2)
+                    bool nearPlaneA = zA < -0.01f && zA > -0.6f;
+                    bool nearPlaneB = zB < -0.01f && zB > -0.6f;
+                    if ((nearPlaneA || nearPlaneB) && particleDebugStuckSamples < 2)
                     {
                         particleDebugStuckSamples++;
                         bool inRectA = LocalPointInPortalRect(worldToLocalA.MultiplyPoint(curPos), shapeA);
@@ -3354,17 +3356,24 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         Vector3 segDir = segEnd - segStart;
         float denom = Vector3.Dot(segDir, portalPlane.forward);
-        // 只收"朝门平面飞"的穿越：撞墙反弹后向外飞的粒子、从门面喷出的粒子不应触发传送
-        if (denom >= -0.000001f) return false;
+        // 与门平面平行的不算穿越
+        if (Mathf.Abs(denom) < 0.000001f) return false;
+        // 双向穿越都收（2026-08-16 修复：滞留样本破案）：发射器在墙背面时粒子流从平面
+        // 后方穿越，旧的方向过滤(denom<-0)把它们全部拒绝，表现为"径直穿过传送门不传送"。
+        // 与玩家/刚体传送的双向语义保持一致。无需担心传送后立刻回穿：传送落点在出口平面
+        // 前侧且沿映射速度远离，下一帧线段不会回到平面。
 
         // 检测平面沿法线外推：门贴墙/地板且粒子带碰撞时，墙体碰撞体在门平面处就把粒子弹走，
         // 粒子数学上永远穿不过门平面；把检测面推出墙面，粒子在撞墙前就传送。
         Vector3 planePoint = portalPlane.position + portalPlane.forward * particleTeleportPlaneOffset;
         t = Vector3.Dot(planePoint - segStart, portalPlane.forward) / denom;
-        // t∈[0,1]是本帧线段；回溯窗(-particleTeleportRetroWindow)补粒子碰撞/模拟子步
-        // 造成的速度反推线段错位（高速隧穿修复，窗口随速度等比放大）。
-        // 已传送的粒子正在远离出口平面，不会被回溯窗二次捕获。
-        if (t < -particleTeleportRetroWindow || t > 1f) return false;
+        // t 窗分方向（关键，防回归）：
+        // - 朝门内飞(denom<0)：回溯窗(-retroWindow)补粒子碰撞/模拟子步造成的速度反推错位（高速隧穿修复）。
+        // - 朝门外飞(denom>0)：严格 t∈[0,1]，不开回溯窗——否则"刚传送完正飞离出口"的粒子，
+        //   其相对出口平面的穿越点落在 t<0 的回溯窗内会被误判回穿（旧方向过滤删掉后必须补这道闸）。
+        //   墙后发射器的正向穿越 t∈[0,1]，不受影响。
+        float tMin = denom < 0f ? -particleTeleportRetroWindow : 0f;
+        if (t < tMin || t > 1f) return false;
 
         hitPoint = segStart + segDir * t;
         Vector3 local = worldToLocal.MultiplyPoint(hitPoint);
