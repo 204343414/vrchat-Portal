@@ -119,11 +119,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
              "粒子会在到达门平面之前先被墙体碰撞体弹走、数学上永远不穿过门平面；把检测面推出墙面，让粒子在撞墙前就传送。")]
     public float particleTeleportPlaneOffset = 0.05f;
 
-    [Tooltip("穿越回溯窗（以'帧位移线段长度'为单位）。粒子碰撞/模拟子步会让速度反推线段偏离真实路径，回溯窗补漏。" +
-             "实测结论（2026-08-16）：调大缓冲区不防隧穿，调大回溯窗防隧穿——高速粒子的重建误差随速度等比放大。" +
-             "高速特效隧穿就把这个值往上调（1~2），代价仅是传送落点的时间外推，无副作用。")]
-    [Range(0f, 2f)]
-    public float particleTeleportRetroWindow = 1f;
+    [Tooltip("穿越回溯窗（以'帧位移线段长度'为单位），同时是'已漏检粒子'的追补深度：值越大，能抓住越久之前的漏检穿越。" +
+             "调大的代价：落点安全边距随之加大（防回穿所需），粒子出射点会离出口门稍远一点点并快速飞离，属正常。" +
+             "默认6已覆盖常见隧穿存量；仍有隧穿继续往上拉。")]
+    [Range(0f, 8f)]
+    public float particleTeleportRetroWindow = 6f;
 
     [Tooltip("粒子传送诊断日志：每60帧输出一次'检测了多少粒子/传送了多少次'。粒子隧穿不传送时用它定位卡在哪一环：检测数=0说明系统没被读取（Simulation Space不是World/系统没播放/距离闸门）；检测数>0但传送=0说明穿越判定不命中（空间语义/门框范围/方向）。")]
     public bool debugParticleTeleportLog = false;
@@ -3380,7 +3380,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         hitPoint = segStart + segDir * t;
         Vector3 local = worldToLocal.MultiplyPoint(hitPoint);
-        return LocalPointInPortalRect(local, shapeType);
+        if (LocalPointInPortalRect(local, shapeType)) return true;
+        // 补判当前位置（2026-08-16 三次修复）：斜着飞的粒子先在门框【外】穿过检测面、
+        // 再飘进门框内——只查穿越点会漏掉它们（等飘进框时已在检测面后方、回溯窗外）。
+        // 当前位置在门框内同样算穿越。落点边距保证回溯窗加大也不回穿，此处放宽是安全的。
+        Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
+        return LocalPointInPortalRect(localEnd, shapeType);
     }
 
     // 把单颗粒子映射到另一侧：穿越点 from→to+经典半转，速度同映射，
