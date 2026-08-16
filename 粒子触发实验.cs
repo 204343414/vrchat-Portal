@@ -16,22 +16,20 @@ using UnityEngine;
 //      真要传送仍需扫描粒子缓冲（本管理器每帧已在做的事）。
 //
 // 实验步骤（30秒裁决）：
-//   1) 取消下方 OnParticleTrigger 的注释；
-//   2) 等 UdonSharp 编译：
+//   本文件已激活 OnParticleTrigger override，同步进工程后看 UdonSharp 编译结果：
 //      - 编译报错"no suitable method found to override"之类
-//        → UdonSharpBehaviour 没声明该事件 → Udon 不接线 → 方案不可行（大概率结局）；
+//        → UdonSharpBehaviour 没声明该事件 → Udon 不接线 → 触发器方案不可行；
 //      - 编译通过 → 事件被 Udon 接线 → 把本脚本挂到粒子系统所在物体，
 //        在粒子系统 Trigger 模块里拖入一个测试碰撞体、勾 Enter + Callback，
 //        运行看 Console 有没有日志 → 有的话我们再评估值不值得用它。
+//   注意：若编译报错，删除本文件即可恢复，报错本身就是裁决结果。
 // ============================================================
 
 [UdonBehaviourSyncMode(BehaviourSyncMode.None)]
 public class 粒子触发实验 : UdonSharpBehaviour
 {
-    // ↓ 取消注释做编译裁决（override 是关键：UdonSharpBehaviour 未声明的事件
-    //   无法被 override，编译器会直接报错——这就是裁决信号）
-    // public override void OnParticleTrigger()
-    // {
-    //     Debug.Log("[粒子触发实验] OnParticleTrigger 触发了！");
-    // }
+    public override void OnParticleTrigger()
+    {
+        Debug.Log("[粒子触发实验] OnParticleTrigger 触发了！");
+    }
 }
