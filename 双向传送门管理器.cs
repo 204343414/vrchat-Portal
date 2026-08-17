@@ -644,6 +644,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (portalPlaneA != null) DiscoverParticleSystemsAround(portalPlaneA.position);
             if (portalPlaneB != null) DiscoverParticleSystemsAround(portalPlaneB.position);
         }
+        else
+        {
+            // 十一轮：堵死最后的静默路径——初始发现没跑时亲口说明原因，
+            // 避免"放置发现没工作又没日志"的排查死胡同
+            Debug.Log("[粒子传送][初始发现] 跳过：enableParticleTeleport=" + enableParticleTeleport + " autoDiscoverParticleSystems=" + autoDiscoverParticleSystems);
+        }
 
         // 初始化 clone 要销毁的组件类型列表（Udon不支持自定义static字段，Start里构建实例数组）
         cloneDestroyTypes = new System.Type[]
