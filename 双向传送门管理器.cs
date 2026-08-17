@@ -3066,7 +3066,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     private void ProcessParticleTeleports()
     {
-        if (portalParticleSystems == null || portalParticleSystems.Length == 0) return;
+        // 十一轮修：旧门控"白名单为空就整体return"是自动收集功能加入前的遗留——
+        // 用户清空白名单只靠自动收集时，已注册系统全都不被处理、诊断日志也静默消失。
+        // 现在：四路注册源全空才跳过。
+        bool hasWhitelist = portalParticleSystems != null && portalParticleSystems.Length > 0;
+        bool hasDiscovered = discoveredParticleSystems != null && discoveredParticleSystems.Length > 0;
+        bool hasPlaced = placedDiscoverySystems != null && placedDiscoveryCount > 0;
+        if (!hasWhitelist && !hasDiscovered && !hasPlaced) return;
         if (portalPlaneA == null || portalPlaneB == null) return;
 
         int bufferSize = Mathf.Max(32, particleTeleportBufferSize);
