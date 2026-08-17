@@ -281,6 +281,15 @@
 //           无实穿越时兜底命中也取最早。玩家侧补充排查线索：若天花板+地板门高速循环
 //           仍断裂，查场景里 teleportBlockFrames 是否为0（>0会在高速下让整段检测停摆），
 //           并开 debugTeleportCoreLog 抓异常跳变的 [T#] 行（z区间+t值直接暴露晚检测）。
+//     十四轮（2026-08-18，Local空间粒子支持=激光特效地基）：用户提出激光需求——
+//           低速粒子模拟笔直激光（不抖动不弧线），但激光特效通常是 Simulation Space=Local
+//           （moveWithTransform跟随枪体）。实现：新增 particleLocalSpaceSystems 清单
+//           （显式拖入，规避 ps.main.simulationSpace 的 Udon 白名单风险），循环内
+//           局部→世界转换判定（TransformPoint/TransformVector），传送/反弹结果统一按
+//           世界坐标计算，写回前 InverseTransform 转回局部（配对记录永远存世界坐标）。
+//           同轮性能审计（两门同屏掉帧）：脚本侧无死逻辑（过渡相机/渲染器扫描均有缓存守卫），
+//           掉帧主因是递归渲染本身——recursiveRenderLimit 默认3，两门同屏=多次全场景
+//           Camera.Render()，属传送门渲染固有价值成本；缓解=调低 recursiveRenderLimit。
 //     十三轮（2026-08-17，规则5语义收窄）：用户实测指出"没开碰撞粒子却在门边缘自己反弹"
 //           不符合预期——没碰撞=粒子本该自由穿墙，只有进门框才传送。规则5撞墙近似反弹
 //           默认改为【关】，tooltip收窄为单一适用场景：门嵌墙/地板+粒子开碰撞+高速隧穿墙面。
@@ -364,6 +373,7 @@ public static class 传送门中文面板_标签表
         { "particleDiscoveryRoots", "粒子传送-收集根(拖容器)" },
         { "particleTeleportExclusionRoots", "粒子传送-排除根(枪已自动排除)" },
         { "particleWallBounceAssist", "粒子传送-撞墙近似反弹(高速防隧穿)" },
+        { "particleLocalSpaceSystems", "粒子传送-Local空间系统(激光拖这里)" },
         { "particleDiscoveryRadius", "粒子传送-自动收集半径" },
         { "particleDiscoveryRefreshInterval", "粒子传送-收集刷新间隔" },
         { "particleTeleportPlaneOffset", "粒子传送-检测面外推(防墙弹)" },
