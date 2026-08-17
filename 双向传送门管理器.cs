@@ -3552,6 +3552,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private bool IsParticleSystemExcluded(ParticleSystem ps)
     {
         if (ps == null) return true;
+        // 显式拖进 Local空间清单 = 用户明确要它参与传送（比如挂在枪上的激光），
+        // 优先于传送枪自动排除——否则枪载激光永远进不了传送逻辑。
+        if (IsLocalSpaceParticleSystem(ps)) return false;
         Transform t = ps.transform;
         // 传送枪自动排除：枪的激光/枪口特效是视觉特效，跟着门传送看起来鬼畜
         if (portalGun != null && IsTransformUnder(t, portalGun.transform)) return true;
