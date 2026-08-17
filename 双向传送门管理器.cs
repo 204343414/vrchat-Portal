@@ -114,6 +114,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
              "传送枪自身层级已自动排除（枪的激光/枪口特效若参与传送会鬼畜）；其他不想被传送的特效拖进来即可。")]
     public Transform[] particleTeleportExclusionRoots;
 
+    [Tooltip("撞墙近似反弹（十二轮，高速防隧穿收官）：带碰撞粒子速度一高，Unity的离散碰撞就拦不住" +
+             "（每帧位移>碰撞体厚度直接穿墙，速度100时约1.7米/帧）。本开关让管理器接管：粒子线段从前往后" +
+             "穿过检测面且穿越点在门框【外】（=撞墙不是进门）→ 沿平面镜像反弹，模拟墙面碰撞，" +
+             "粒子在任何速度下都不会穿过门所在的墙。适用前提：门嵌在墙/地板里（本项目默认场景）；" +
+             "悬浮在空中的门请关闭此开关，否则粒子会撞上隐形平面。")]
+    public bool particleWallBounceAssist = true;
+
     [Tooltip("自动发现半径：放置时发现(OverlapSphere)的半径，也是root扫描的距离过滤。门放哪扫到哪。")]
     public float particleDiscoveryRadius = 100f;
 
@@ -142,6 +149,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private int particleDebugStuckSamples = 0;
     private int particleDebugTruncatedSystems = 0;
     private int particleDebugBounceCount = 0;
+    private int particleDebugWallAssistCount = 0;
 
     private ParticleSystem.Particle[] particleTeleportBuffer;
     // 实测位移配对组（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命 + 粒子身份证(randomSeed) + 有效标记。
@@ -3122,10 +3130,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 particleDebugFrameCounter = 0;
                 int rootListCount = discoveredParticleSystems != null ? discoveredParticleSystems.Length : 0;
-                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（其中反弹捕获 " + particleDebugBounceCount + "），过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容）");
+                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（其中反弹捕获 " + particleDebugBounceCount + "、撞墙反弹 " + particleDebugWallAssistCount + "），过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容）");
                 particleDebugTestedCount = 0;
                 particleDebugTeleportCount = 0;
                 particleDebugBounceCount = 0;
+                particleDebugWallAssistCount = 0;
                 particleDebugStuckCount = 0;
                 particleDebugStuckSamples = 0;
                 particleDebugTruncatedSystems = 0;
@@ -3297,6 +3306,26 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
 
             bool wasTeleported = false;
+
+            // 规则5 撞墙近似反弹（十二轮）：没有任何传送命中 + 开关开启时，
+            // 检查本帧线段是否"前→后穿过检测面且穿越点在门框外"——那就是粒子在高速下
+            // 隧穿门所在墙面的瞬间（Unity离散碰撞拦不住的速度区间由我们接管）：
+            // 镜像反弹，粒子永远不会穿过墙面。先A后B，弹过一边就不再弹另一边。
+            if (!doA && !doB && particleWallBounceAssist)
+            {
+                if (TryWallAssistBounce(ref p, segStart, curPos, portalPlaneA, worldToLocalA, shapeA))
+                {
+                    particleTeleportBuffer[i] = p;
+                    changed = true;
+                    if (debugParticleTeleportLog) particleDebugWallAssistCount++;
+                }
+                else if (TryWallAssistBounce(ref p, segStart, curPos, portalPlaneB, worldToLocalB, shapeB))
+                {
+                    particleTeleportBuffer[i] = p;
+                    changed = true;
+                    if (debugParticleTeleportLog) particleDebugWallAssistCount++;
+                }
+            }
 
             if (doA)
             {
@@ -3621,6 +3650,33 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
 
         return false;
+    }
+
+    // 撞墙近似反弹（十二轮）：线段前→后穿过检测面且穿越点在门框外 = 粒子正以Unity碰撞
+    // 拦不住的速度凿向门所在的墙。沿检测面做镜像：位置对称翻回、速度法向分量反转并乘
+    // 恢复系数0.6（近似常见碰撞设置的弹性，无法安全读取粒子Collision模块参数）。
+    // 只处理"朝墙飞"(前→后)的穿越；从墙后飞出的粒子不碰（它们已经出来了）。
+    // 与规则4不冲突：反弹点在门框外，规则4的门框内判定不会把它误当门面反弹去传送。
+    private bool TryWallAssistBounce(ref ParticleSystem.Particle p, Vector3 segStart, Vector3 curPos, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType)
+    {
+        Vector3 planePoint = portalPlane.position + portalPlane.forward * particleTeleportPlaneOffset;
+        Vector3 normal = portalPlane.forward;
+        float zStart = Vector3.Dot(segStart - planePoint, normal);
+        float zEnd = Vector3.Dot(curPos - planePoint, normal);
+        if (!(zStart > 0f && zEnd <= 0f)) return false;
+
+        float t = zStart / (zStart - zEnd);
+        Vector3 hitPoint = segStart + (curPos - segStart) * t;
+        // 穿越点在门框内 = 进门，归传送规则管，这里不碰
+        if (LocalPointInPortalRect(worldToLocal.MultiplyPoint(hitPoint), shapeType)) return false;
+
+        // 位置：把终点沿检测面镜像翻回（等价于剩余路程撞墙反弹）
+        p.position = curPos - normal * (2f * zEnd);
+        // 速度：法向分量反转 × 恢复系数，切向保留
+        Vector3 v = p.velocity;
+        Vector3 reflected = v - normal * (2f * Vector3.Dot(v, normal));
+        p.velocity = reflected * 0.6f;
+        return true;
     }
 
     // 把单颗粒子映射到另一侧：穿越点 from→to+经典半转，速度同映射，
