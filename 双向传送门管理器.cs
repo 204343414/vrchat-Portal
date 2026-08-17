@@ -110,6 +110,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("收集根（可选）：特效物件没挂在传送门同一根节点下、自己又没有碰撞体时，把它们的容器物体拖进来。")]
     public GameObject[] particleDiscoveryRoots;
 
+    [Tooltip("粒子传送排除根：这些物体（含其子层级）下的粒子系统不参与检测/传送。" +
+             "传送枪自身层级已自动排除（枪的激光/枪口特效若参与传送会鬼畜）；其他不想被传送的特效拖进来即可。")]
+    public Transform[] particleTeleportExclusionRoots;
+
     [Tooltip("自动发现半径：放置时发现(OverlapSphere)的半径，也是root扫描的距离过滤。门放哪扫到哪。")]
     public float particleDiscoveryRadius = 100f;
 
@@ -3121,6 +3125,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private void ProcessSingleParticleSystem(ParticleSystem ps, Matrix4x4 worldToLocalA, Matrix4x4 localToWorldA, Matrix4x4 worldToLocalB, Matrix4x4 localToWorldB, int shapeA, int shapeB, float dt, float maxDistSqr)
     {
         if (ps == null) return;
+        // 排除根拦截（十一轮）：无论该系统从哪条路径注册进来（白名单/root扫描/放置发现），
+        // 只要挂在排除根（默认含传送枪）下就不处理——枪的激光特效被传送会鬼畜。
+        if (IsParticleSystemExcluded(ps)) return;
 
         // 距离闸门：离两扇门都太远 → 整个系统跳过
         Vector3 sysPos = ps.transform.position;
@@ -3429,8 +3436,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     public void DiscoverParticleSystemsAround(Vector3 center)
     {
-        if (!enableParticleTeleport || !autoDiscoverParticleSystems) return;
-        if (portalPlaneA == null || portalPlaneB == null) return;
+        if (!enableParticleTeleport) { Debug.Log("[粒子传送][放置发现] 跳过：粒子传送未启用"); return; }
+        if (!autoDiscoverParticleSystems) { Debug.Log("[粒子传送][放置发现] 跳过：自动收集开关关闭"); return; }
+        if (portalPlaneA == null || portalPlaneB == null) { Debug.Log("[粒子传送][放置发现] 跳过：门Transform未就绪"); return; }
 
         if (discoveryOverlapBuffer == null) discoveryOverlapBuffer = new Collider[512];
         if (placedDiscoverySystems == null) placedDiscoverySystems = new ParticleSystem[64];
@@ -3439,41 +3447,68 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 截断告警：半径内碰撞体顶满缓冲时，超出的碰撞体携带的粒子系统扫不到（NonAlloc语义无法枚举完整集合）
         if (hitCount >= discoveryOverlapBuffer.Length)
         {
-            Debug.LogWarning("[粒子传送] 放置时发现：半径" + particleDiscoveryRadius + "m内碰撞体超过" + discoveryOverlapBuffer.Length + "个被截断，可能有粒子系统漏注册（把粒子Discovery半径调小或手动白名单补上）");
+            Debug.LogWarning("[粒子传送][放置发现] 半径" + particleDiscoveryRadius + "m内碰撞体超过" + discoveryOverlapBuffer.Length + "个被截断，可能有粒子系统漏注册");
         }
+
+        int registeredThisCall = 0;
         for (int i = 0; i < hitCount; i++)
         {
             Collider col = discoveryOverlapBuffer[i];
             if (col == null) continue;
 
-            // 向上爬：粒子系统可能在碰撞体的祖先上（最多爬8层，防长链）
-            Transform t = col.transform;
-            for (int up = 0; up < 8 && t != null; up++)
-            {
-                ParticleSystem psUp = t.GetComponent<ParticleSystem>();
-                if (psUp != null)
-                {
-                    RegisterDiscoveredParticleSystem(psUp);
-                    break;
-                }
-                t = t.parent;
-            }
+            // 十一轮结构盲区修复：先向上爬到最高祖先（最多8层防长链），再从祖先整体向下扫。
+            // 旧版只扫"碰撞体自身子树+祖先链上的单点"——粒子系统挂在碰撞体的【兄弟节点】
+            // （常见预制件结构：根/兄弟挂ParticleSystem，碰撞挂在另一个子物体上）时完全扫不到，
+            // 这正是"放置时自动检测没工作"的头号嫌疑。从最高祖先向下扫 = 祖先+兄弟+全部后代一次覆盖。
+            Transform top = col.transform;
+            for (int up = 0; up < 8 && top.parent != null; up++) top = top.parent;
 
-            // 向下找：粒子系统可能在碰撞体的子物体里
-            ParticleSystem[] down = col.gameObject.GetComponentsInChildren<ParticleSystem>(true);
-            if (down == null) continue;
-            for (int d = 0; d < down.Length; d++)
+            ParticleSystem[] under = top.gameObject.GetComponentsInChildren<ParticleSystem>(true);
+            if (under == null) continue;
+            for (int d = 0; d < under.Length; d++)
             {
-                if (down[d] != null) RegisterDiscoveredParticleSystem(down[d]);
+                if (under[d] != null && RegisterDiscoveredParticleSystem(under[d])) registeredThisCall++;
             }
         }
+        Debug.Log("[粒子传送][放置发现] 扫描完成：半径" + particleDiscoveryRadius + "m内命中" + hitCount + "个碰撞体，新注册" + registeredThisCall + "个粒子系统（当前注册总数" + placedDiscoveryCount + "）");
+    }
+
+    // 粒子系统是否在排除根子树下（传送枪特效等不参与传送）。
+    private bool IsParticleSystemExcluded(ParticleSystem ps)
+    {
+        if (ps == null) return true;
+        Transform t = ps.transform;
+        // 传送枪自动排除：枪的激光/枪口特效是视觉特效，跟着门传送看起来鬼畜
+        if (portalGun != null && IsTransformUnder(t, portalGun.transform)) return true;
+        if (particleTeleportExclusionRoots != null)
+        {
+            for (int i = 0; i < particleTeleportExclusionRoots.Length; i++)
+            {
+                if (particleTeleportExclusionRoots[i] != null && IsTransformUnder(t, particleTeleportExclusionRoots[i])) return true;
+            }
+        }
+        return false;
+    }
+
+    // t 是否在 root 子树下（等价 Transform.IsChildOf；手搓父链遍历，零API白名单风险）
+    private bool IsTransformUnder(Transform t, Transform root)
+    {
+        if (t == null || root == null) return false;
+        while (t != null)
+        {
+            if (t == root) return true;
+            t = t.parent;
+        }
+        return false;
     }
 
     // 去重注册：已存在于 放置注册表/手动白名单/root扫描列表 的系统不重复登记。
-    private void RegisterDiscoveredParticleSystem(ParticleSystem ps)
+    // 返回 true = 本次确实新注册（供放置发现统计）。
+    private bool RegisterDiscoveredParticleSystem(ParticleSystem ps)
     {
-        if (ps == null) return;
-        if (placedDiscoverySystems == null) return;
+        if (ps == null) return false;
+        if (placedDiscoverySystems == null) return false;
+        if (IsParticleSystemExcluded(ps)) return false;
         // 注册表满了自动翻倍扩容（旧行为是静默丢弃——密集世界里第65个之后的系统会无声漏注册）
         if (placedDiscoveryCount >= placedDiscoverySystems.Length)
         {
@@ -3484,26 +3519,27 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         for (int i = 0; i < placedDiscoveryCount; i++)
         {
-            if (placedDiscoverySystems[i] == ps) return;
+            if (placedDiscoverySystems[i] == ps) return false;
         }
         if (portalParticleSystems != null)
         {
             for (int i = 0; i < portalParticleSystems.Length; i++)
             {
-                if (portalParticleSystems[i] == ps) return;
+                if (portalParticleSystems[i] == ps) return false;
             }
         }
         if (discoveredParticleSystems != null)
         {
             for (int i = 0; i < discoveredParticleSystems.Length; i++)
             {
-                if (discoveredParticleSystems[i] == ps) return;
+                if (discoveredParticleSystems[i] == ps) return false;
             }
         }
 
         placedDiscoverySystems[placedDiscoveryCount] = ps;
         placedDiscoveryCount++;
         Debug.Log("[粒子传送] 放置时发现自动注册: " + ps.name);
+        return true;
     }
 
     // 粒子线段与门检测面求交（六轮重写：符号距离插值 + 后侧窗符号修正）。

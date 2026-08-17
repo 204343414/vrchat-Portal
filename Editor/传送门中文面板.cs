@@ -281,6 +281,15 @@
 //           无实穿越时兜底命中也取最早。玩家侧补充排查线索：若天花板+地板门高速循环
 //           仍断裂，查场景里 teleportBlockFrames 是否为0（>0会在高速下让整段检测停摆），
 //           并开 debugTeleportCoreLog 抓异常跳变的 [T#] 行（z区间+t值直接暴露晚检测）。
+//     十一轮（2026-08-17，毕业后实测返修）：
+//           a) 放置发现"没工作"破案方向：旧版只扫"碰撞体自身子树+祖先链单点"，
+//              粒子系统挂在碰撞体【兄弟节点】（常见预制件结构）时完全扫不到 → 改为
+//              爬到最高祖先(8层)后整体 GetComponentsInChildren，祖先+兄弟+后代全覆盖；
+//              全程加诊断日志（跳过原因/命中碰撞体数/新注册数），传送枪未接 manager 也告警。
+//              另一嫌疑：传送枪 portalManager 槽位未接线（新增 Warning 直接点名）。
+//           b) 传送枪自身特效排除：枪的激光/枪口特效被传送会鬼畜。新增
+//              particleTeleportExclusionRoots 排除根数组 + 传送枪层级自动排除；
+//              ProcessSingleParticleSystem 入口拦截，覆盖白名单/root扫描/放置发现全部路径。
 //     十轮（2026-08-17，v1.0毕业收尾）：
 //           a) 放置发现健壮性：注册表满员(64)自动翻倍扩容（旧行为静默丢弃）；
 //              OverlapSphere缓冲256→512，顶满时输出截断告警（旧行为静默漏扫）。
@@ -339,6 +348,7 @@ public static class 传送门中文面板_标签表
         { "particleTeleportMaxDistance", "粒子传送-距离闸门" },
         { "autoDiscoverParticleSystems", "粒子传送-自动收集开关" },
         { "particleDiscoveryRoots", "粒子传送-收集根(拖容器)" },
+        { "particleTeleportExclusionRoots", "粒子传送-排除根(枪已自动排除)" },
         { "particleDiscoveryRadius", "粒子传送-自动收集半径" },
         { "particleDiscoveryRefreshInterval", "粒子传送-收集刷新间隔" },
         { "particleTeleportPlaneOffset", "粒子传送-检测面外推(防墙弹)" },

@@ -837,6 +837,10 @@ public class 传送枪 : UdonSharpBehaviour
             {
                 portalManager.DiscoverParticleSystemsAround(portalPos);
             }
+            else
+            {
+                Debug.LogWarning("[传送枪] portalManager 未接线：放置时粒子自动发现被跳过（把管理器拖进传送枪的 portalManager 槽位）");
+            }
 
             if (debugPortalGunLog)
             {
