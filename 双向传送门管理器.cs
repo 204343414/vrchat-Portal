@@ -136,6 +136,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private int particleDebugStuckCount = 0;
     private int particleDebugStuckSamples = 0;
     private int particleDebugTruncatedSystems = 0;
+    private int particleDebugBounceCount = 0;
 
     private ParticleSystem.Particle[] particleTeleportBuffer;
     // 实测位移配对组（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命 + 粒子身份证(randomSeed) + 有效标记。
