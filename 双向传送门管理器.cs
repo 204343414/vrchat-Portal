@@ -92,7 +92,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("参与传送的粒子系统白名单：只处理明确挂进来的系统，防止误挂超大粒子量的系统拖垮帧率。不挂任何系统时本功能零开销。")]
     public ParticleSystem[] portalParticleSystems;
 
-    [Tooltip("每个系统每帧最多读取/处理的粒子数（缓冲区大小）。活粒子多于此数时超出部分完全不被处理（不是晚一帧，是漏掉）。实测结论：普通隧穿与它无关，但高密度特效(活粒子>1024)的隧穿要先查这里。")]
+    [Tooltip("粒子缓冲初始大小。六轮升级：活粒子顶满缓冲时会自动翻倍扩容并补读（扩容帧全体粒子按'首见'规则处理，后侧兜底接管，零漏检），此值只是初始分配，不再构成上限。")]
     [Range(32, 2048)]
     public int particleTeleportBufferSize = 1024;
 
@@ -119,12 +119,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
              "粒子会在到达门平面之前先被墙体碰撞体弹走、数学上永远不穿过门平面；把检测面推出墙面，让粒子在撞墙前就传送。")]
     public float particleTeleportPlaneOffset = 0.05f;
 
-    [Tooltip("穿越判定窗（单位：米，沿门法线的前进距离），只对'无法配对实测位移、回退速度重建'的少数粒子生效的追补深度。" +
-             "已改用 randomSeed 种子配对实测位移后，本帧穿越的粒子无论快慢都必抓，此窗只需很小（默认0.3）。" +
-             "调大的代价：落点安全边距随之加大，粒子出射点离出口门更远（出射点=2*offset+此窗+0.1）。" +
-             "高速粒子隧穿基本已由种子配对根治，此窗保持小值即可，不要为了防隧穿盲目拉大。")]
+    [Tooltip("后侧追补深度（米，沿门法线越过检测面之后的深度）。六轮语义修正：旧版符号写反了——" +
+             "旧条件抓的是门【前侧】正在靠近的粒子（甚至会把门前窗值米内的粒子提前吸走），后侧漏检从来抓不到，这是'窗=2仍残留隧穿'的病根。" +
+             "现已改为真正的'已过检测面且深度<=此值'追补。种子配对+出生反推+首见后侧兜底之后，此窗=0 也能一个不漏；" +
+             ">0 只是给槽位洗牌等极端情况多一层保险。调大代价：落点安全边距随之加大（出射点=2*offset+此窗+0.1），推荐 0~0.3。")]
     [Range(0f, 2f)]
-    public float particleTeleportRetroWindow = 0.3f;
+    public float particleTeleportRetroWindow = 0f;
 
     [Tooltip("粒子传送诊断日志：每60帧输出一次'检测了多少粒子/传送了多少次'。粒子隧穿不传送时用它定位卡在哪一环：检测数=0说明系统没被读取（Simulation Space不是World/系统没播放/距离闸门）；检测数>0但传送=0说明穿越判定不命中（空间语义/门框范围/方向）。")]
     public bool debugParticleTeleportLog = false;
@@ -136,12 +136,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private int particleDebugTruncatedSystems = 0;
 
     private ParticleSystem.Particle[] particleTeleportBuffer;
-    // 实测位移三件套（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命 + 粒子身份证(randomSeed)。
+    // 实测位移配对组（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命 + 粒子身份证(randomSeed) + 有效标记。
     // randomSeed 是粒子出生时分配、终生不变的稳定ID，是跨帧识别"同一颗粒子"的可靠钥匙
     // （旧的"归属系统"配对太弱：同系统里寿命相近的两颗粒子会被误认成同一颗）。
+    // GetParticles 的槽位顺序在有粒子死亡时会洗牌（Unity官方论坛实证），配对失败=槽位换了粒子
+    // → 走"首见"路径（出生反推 + 首见后侧兜底），保证零漏检。
+    // particlePrevValid 显式标记"本槽位有记录"（替代旧的 seed!=0 技巧，seed 恰好为 0 的粒子也能正常配对）。
     private Vector3[] particlePrevPositions;
     private float[] particlePrevLifetimes;
     private uint[] particlePrevSeeds;
+    private bool[] particlePrevValid;
     private ParticleSystem[] discoveredParticleSystems;
     private float particleDiscoveryTimer = 0f;
 
@@ -3010,16 +3014,23 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     // ============================================================
     // 粒子传送：白名单系统里穿过门平面的粒子，位置+速度按门映射传到另一侧。
-    // 设计要点：
-    // - 无状态穿越判定：用粒子自身速度反推本帧线段 [pos - vel*dt, pos] 做平面求交，
-    //   不维护"上一帧位置"缓存——Unity粒子缓冲槽位会被死亡粒子复用，按序号对齐不可靠。
+    // 设计要点（六轮，window=0 零漏检架构）：
+    // - 身份配对：randomSeed（出生时分配、终生不变的稳定ID）按槽位认同"同一颗粒子"；
+    //   GetParticles 槽位顺序在粒子死亡时会洗牌（Unity官方论坛实证），配对失败即走"首见"路径。
+    // - 零漏检三条规则：
+    //   规则1 本帧穿越：配对实测位移（或出生反推）线段与检测面符号翻转求交——任意速度必抓；
+    //         符号距离插值对退化线段也成立（门移动扫过静止粒子照样抓）；双向都收。
+    //   规则2 后侧追补窗（retroWindow>0 时）：已在检测面后侧且深度<=窗值 → 补抓。
+    //         （六轮修正：旧版窗符号写反，抓的是门前侧靠近的粒子，后侧漏检从来抓不到。）
+    //   规则3 首见后侧兜底：未配对粒子当前位置已在检测面后侧且在门框内 → 立即传送——
+    //         覆盖一切"穿越那一刻无记录"的情况（出生即穿越/出生在墙后/注册晚了/槽位洗牌/缓冲扩容帧）。
+    // - 缓冲自动扩容：活粒子顶满缓冲 → 自动翻倍补读，超出部分不再被永久漏掉。
     // - 一帧至多一次穿越：两扇门都命中时取 t 更大（更晚）的一次，与粒子终点位置一致。
     // - 矩阵每帧只构造4次（A/B各一套worldToLocal/localToWorld，与 useScaleFreePortalMatrix
     //   的数学完全一致），粒子循环里只有 MultiplyPoint/MultiplyVector，无 TRS/inverse。
-    // - 性能闸门：白名单/收集根自动收集 + 距离闸门 + 每系统每帧读取上限（缓冲区大小）。
+    // - 性能闸门：白名单/收集根自动收集 + 距离闸门 + 缓冲初始大小（自动扩容）。
     // - 检测面沿法线外推 particleTeleportPlaneOffset：贴墙/地板门 + 带碰撞粒子的场景，
     //   粒子会被墙体在门平面处弹走永远穿不过平面，外推检测面让粒子撞墙前就传送。
-    // - 只收"朝门飞"的穿越(denom<0)；穿越窗口放宽到 t∈[-回溯窗,1]补碰撞子步错位漏检。
     // - 限制：要求粒子系统 Simulation Space = World（Local空间语义不同）。
     // ============================================================
 
@@ -3029,12 +3040,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (portalPlaneA == null || portalPlaneB == null) return;
 
         int bufferSize = Mathf.Max(32, particleTeleportBufferSize);
-        if (particleTeleportBuffer == null || particleTeleportBuffer.Length != bufferSize)
+        if (particleTeleportBuffer == null || particleTeleportBuffer.Length < bufferSize)
         {
-            particleTeleportBuffer = new ParticleSystem.Particle[bufferSize];
-            particlePrevPositions = new Vector3[bufferSize];
-            particlePrevLifetimes = new float[bufferSize];
-            particlePrevSeeds = new uint[bufferSize];
+            GrowParticleArrays(bufferSize);
         }
 
         float dt = Time.deltaTime;
@@ -3078,7 +3086,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 particleDebugFrameCounter = 0;
                 int rootListCount = discoveredParticleSystems != null ? discoveredParticleSystems.Length : 0;
-                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次，过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲顶满系统 " + particleDebugTruncatedSystems + " 个（已注册：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲上限" + particleTeleportBufferSize + "）");
+                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次，过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容）");
                 particleDebugTestedCount = 0;
                 particleDebugTeleportCount = 0;
                 particleDebugStuckCount = 0;
@@ -3103,33 +3111,40 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         int aliveCount = ps.GetParticles(particleTeleportBuffer);
         if (aliveCount <= 0) return;
-        // 缓冲截断警报：返回值顶满缓冲长度 = 活粒子可能被截断，超出部分永远不被处理（隧穿嫌疑头号）
-        if (debugParticleTeleportLog && aliveCount >= particleTeleportBuffer.Length) particleDebugTruncatedSystems++;
+        // 缓冲自动扩容：活粒子顶满缓冲时超出部分会被完全漏掉（不是晚一帧，是永久漏）。
+        // 扩容翻倍后补读；新缓冲配对记录清零，本帧全体粒子走"首见"规则（规则3兜住后侧），零漏检。
+        if (aliveCount >= particleTeleportBuffer.Length)
+        {
+            if (debugParticleTeleportLog) particleDebugTruncatedSystems++;
+            GrowParticleArrays(aliveCount * 2);
+            aliveCount = ps.GetParticles(particleTeleportBuffer);
+            if (aliveCount <= 0) return;
+        }
 
         bool changed = false;
         for (int i = 0; i < aliveCount; i++)
         {
             ParticleSystem.Particle p = particleTeleportBuffer[i];
             Vector3 curPos = p.position;
-            float curLife = p.remainingLifetime;
+            uint seed = p.randomSeed;
 
-            // 实测位移（优先）：本槽位上帧若是"同一颗粒子"，用真实位移当本帧线段——
-            // 彻底消除速度重建误差（碰撞子步/力模块/模拟步长与渲染帧长不一致等，
-            // 误差随速度等比放大，正是高速隧穿的病灶）。
-            // 身份判定用 randomSeed（粒子出生时分配、终生不变的稳定ID）：比旧的"归属系统+寿命连续"
-            // 可靠得多——同系统里寿命相近的两颗粒子不会被误认成同一颗。
-            // GetParticles 顺序基本稳定（粒子活着就待在自己的槽位），种子不匹配=槽位换了新粒子
-            // → 回退速度重建（仅一帧，无回归）。
-            bool paired = particlePrevSeeds != null && particlePrevSeeds[i] != 0 && particlePrevSeeds[i] == p.randomSeed;
-            Vector3 segStart = paired ? particlePrevPositions[i] : (curPos - p.velocity * dt);
+            // 身份配对（randomSeed 身份证）：本槽位上帧是同一颗粒子 → 实测位置当线段起点（精确，任意速度必抓）。
+            bool paired = particlePrevValid != null && particlePrevValid[i] && particlePrevSeeds[i] == seed;
 
-            // 无位移粒子不测试，但仍记录本帧数据供下帧配对
-            if ((curPos - segStart).sqrMagnitude < 0.000001f)
+            Vector3 segStart;
+            if (paired)
             {
-                particlePrevPositions[i] = curPos;
-                particlePrevLifetimes[i] = curLife;
-                particlePrevSeeds[i] = p.randomSeed;
-                continue;
+                segStart = particlePrevPositions[i];
+            }
+            else
+            {
+                // 首见/槽位洗牌：用速度反推线段起点。
+                //   新生粒子（age<=0.5秒）：反推到出生瞬间——恒速粒子精确，抓"出生当帧就已越过
+                //   检测面的高速粒子"；即使受力模块让反推偏离，规则3首见后侧兜底也会收走。
+                //   老粒子：只反推一帧——受力曲线长时反推会产生幻影线段，宁可保守；漏了由规则3兜。
+                float age = p.startLifetime - p.remainingLifetime;
+                float span = (age >= 0f && age <= 0.5f) ? Mathf.Max(age, dt) : dt;
+                segStart = curPos - p.velocity * span;
             }
 
             if (debugParticleTeleportLog) particleDebugTestedCount++;
@@ -3141,9 +3156,36 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Vector3 hitB;
             bool crossB = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneB, worldToLocalB, shapeB, out tB, out hitB);
 
-            // 一帧至多一次穿越：两门都命中取更晚的一次
+            // 一帧至多一次传送：两门都命中取更晚的一次
             bool doA = crossA && (!crossB || tA >= tB);
             bool doB = crossB && !doA;
+
+            // 规则3 首见后侧兜底（window=0 零漏检的最后安全网）：未配对粒子当前位置已在
+            // 检测面后侧且在门框内 → 立即传送。覆盖一切"穿越那一刻无记录"的情况：
+            // 出生即越过检测面、出生在墙后（发射器在墙背面）、注册晚了、GetParticles 槽位洗牌、
+            // 缓冲扩容帧。纯位置判定，不依赖任何历史，不依赖窗值。
+            // 无乒乓风险：刚传送完的粒子落在出口门【前侧】（房间侧）且沿映射速度远离，永不落进本规则。
+            if (!doA && !doB && !paired)
+            {
+                Vector3 firstLocalA = worldToLocalA.MultiplyPoint(curPos);
+                Vector3 firstLocalB = worldToLocalB.MultiplyPoint(curPos);
+                bool behindA = firstLocalA.z <= particleTeleportPlaneOffset && LocalPointInPortalRect(firstLocalA, shapeA);
+                bool behindB = firstLocalB.z <= particleTeleportPlaneOffset && LocalPointInPortalRect(firstLocalB, shapeB);
+                // 两门都命中（剪刀形重叠门）时，取穿入深度更深的一扇：更深=更"已经过去了"
+                if (behindA && (!behindB || firstLocalA.z <= firstLocalB.z))
+                {
+                    doA = true;
+                    hitA = curPos;
+                    tA = 1f;
+                }
+                else if (behindB)
+                {
+                    doB = true;
+                    hitB = curPos;
+                    tB = 1f;
+                }
+            }
+
             bool wasTeleported = false;
 
             if (doA)
@@ -3164,24 +3206,25 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
 
             // 诊断探针：
-            // 滞留计数 = 在实际平面后侧未被传送（含出生在后侧的在途粒子，偏大正常，仅看趋势）；
-            // 样本只采"检测面(offset)附近"的未传送粒子——那才是刚穿越却没被传送的真隧穿嫌疑人
-            // （上一版采深处后侧全是还没飞到的在途粒子，采样偏差已修正）。
+            // 滞留计数 = 在实际平面(z<0)后侧未被传送。六轮后此值应收敛到接近0（只剩门框外的后侧粒子）；
+            // 样本只采"检测面后侧且深度浅(0~0.5m)"的未传送粒子——那才是刚穿越却没被传送的真隧穿嫌疑。
             if (debugParticleTeleportLog && !wasTeleported)
             {
-                float zA = worldToLocalA.MultiplyPoint(curPos).z;
-                float zB = worldToLocalB.MultiplyPoint(curPos).z;
+                Vector3 diagLocalA = worldToLocalA.MultiplyPoint(curPos);
+                Vector3 diagLocalB = worldToLocalB.MultiplyPoint(curPos);
+                float zA = diagLocalA.z;
+                float zB = diagLocalB.z;
                 if (zA < -0.01f || zB < -0.01f) particleDebugStuckCount++;
 
                 float off = particleTeleportPlaneOffset;
-                bool nearDetectA = zA > off - 0.05f && zA < off + 0.5f;
-                bool nearDetectB = zB > off - 0.05f && zB < off + 0.5f;
-                if ((nearDetectA || nearDetectB) && particleDebugStuckSamples < 2)
+                bool suspectA = zA <= off && zA > off - 0.5f;
+                bool suspectB = zB <= off && zB > off - 0.5f;
+                if ((suspectA || suspectB) && particleDebugStuckSamples < 3)
                 {
                     particleDebugStuckSamples++;
-                    bool inRectA = LocalPointInPortalRect(worldToLocalA.MultiplyPoint(curPos), shapeA);
-                    bool inRectB = LocalPointInPortalRect(worldToLocalB.MultiplyPoint(curPos), shapeB);
-                    Debug.Log("[粒子传送][漏检嫌疑] zA=" + zA.ToString("F3") + " zB=" + zB.ToString("F3") + " 框内A=" + inRectA + " 框内B=" + inRectB + " 配对=" + paired + " 寿命=" + curLife.ToString("F2") + " 速度=" + p.velocity.magnitude.ToString("F1"));
+                    bool inRectA = LocalPointInPortalRect(diagLocalA, shapeA);
+                    bool inRectB = LocalPointInPortalRect(diagLocalB, shapeB);
+                    Debug.Log("[粒子传送][漏检嫌疑] zA=" + zA.ToString("F3") + " zB=" + zB.ToString("F3") + " 框内A=" + inRectA + " 框内B=" + inRectB + " 配对=" + paired + " 速度=" + p.velocity.magnitude.ToString("F1") + " 种子=" + seed.ToString());
                 }
             }
 
@@ -3190,6 +3233,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             particlePrevPositions[i] = finalState.position;
             particlePrevLifetimes[i] = finalState.remainingLifetime;
             particlePrevSeeds[i] = finalState.randomSeed;
+            particlePrevValid[i] = true;
         }
 
         // 只有真的改过才写回，省掉无穿越帧的 SetParticles 开销
@@ -3197,6 +3241,17 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             ps.SetParticles(particleTeleportBuffer, aliveCount);
         }
+    }
+
+    // 粒子数组扩容（五个数组同生灭）：扩容后配对记录清零，本帧全体粒子按"首见"规则处理，零漏检。
+    private void GrowParticleArrays(int newSize)
+    {
+        int size = Mathf.Max(32, newSize);
+        particleTeleportBuffer = new ParticleSystem.Particle[size];
+        particlePrevPositions = new Vector3[size];
+        particlePrevLifetimes = new float[size];
+        particlePrevSeeds = new uint[size];
+        particlePrevValid = new bool[size];
     }
 
     // 自动收集：从两类根收集粒子系统，保留原点离任一门 particleDiscoveryRadius 以内的：
@@ -3351,49 +3406,55 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Debug.Log("[粒子传送] 放置时发现自动注册: " + ps.name);
     }
 
-    // 粒子本帧线段与门平面求交：交点落在线段上且位于门框形状内才算穿越。
+    // 粒子线段与门检测面求交（六轮重写：符号距离插值 + 后侧窗符号修正）。
+    // 符号距离 z = dot(点 - 检测面点, 门法线)：>0 = 前侧（房间侧），<=0 = 后侧。
+    // 规则1 本帧穿越：线段两端跨检测面符号翻转 → 插值求穿越点，双向都收：
+    //   - 前→后：正常进门；后→前：墙后发射器朝门外喷（与一轮"双向穿越都收"决议一致）；
+    //   - 用 z 插值而不是 denom 除法：退化线段（粒子静止、门被传送枪移动扫过粒子）照样能抓到。
+    //   - 穿越点在门框内算穿越；穿越点在框外但终点已飘进门框（斜粒子）也算（三轮补判，保留）。
+    // 规则2 后侧追补窗：已在检测面后侧且深度<=retroWindow → 补抓。
+    //   六轮关键修正：旧版 withinWindow 的符号写反了——dot(segEnd-planePoint, forward)>=0 抓的其实是
+    //   检测面【前侧】正在靠近的粒子（门前窗值米内会被提前吸走），而真正过平面后的漏检粒子
+    //   forwardPastPlane<0 永远进不了窗——这就是"窗=2 仍残留 1~2 颗隧穿"的病根（窗从没兜住入口侧漏检）。
+    //   现改为真正的"后侧深度<=窗值"。窗=0 时本分支自然关闭，零漏检由规则1+调用方规则3保证。
     private bool ParticleSegmentCrossesPortal(Vector3 segStart, Vector3 segEnd, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, out float t, out Vector3 hitPoint)
     {
         t = 0f;
         hitPoint = Vector3.zero;
         if (portalPlane == null) return false;
 
-        Vector3 segDir = segEnd - segStart;
-        float denom = Vector3.Dot(segDir, portalPlane.forward);
-        // 与门平面平行的不算穿越
-        if (Mathf.Abs(denom) < 0.000001f) return false;
-        // 双向穿越都收（2026-08-16 修复：滞留样本破案）：发射器在墙背面时粒子流从平面
-        // 后方穿越，旧的方向过滤(denom<-0)把它们全部拒绝，表现为"径直穿过传送门不传送"。
-        // 与玩家/刚体传送的双向语义保持一致。无需担心传送后立刻回穿：传送落点在出口平面
-        // 前侧且沿映射速度远离，下一帧线段不会回到平面。
-
         // 检测平面沿法线外推：门贴墙/地板且粒子带碰撞时，墙体碰撞体在门平面处就把粒子弹走，
         // 粒子数学上永远穿不过门平面；把检测面推出墙面，粒子在撞墙前就传送。
         Vector3 planePoint = portalPlane.position + portalPlane.forward * particleTeleportPlaneOffset;
-        t = Vector3.Dot(planePoint - segStart, portalPlane.forward) / denom;
-        // 回溯窗对两个方向都生效（2026-08-16 二次修复）：墙后→前穿越的粒子是 denom>0，
-        // 上一轮把 denom>0 的回溯窗关成严格[0,1]，导致速度重建误差使 t 掉到<0 被拒收——
-        // 这正是"有一部分粒子直接穿过"的真凶（也解释了为何调大回溯窗无效：它当时只管 denom<0）。
-        // 刚传送完的粒子的防回穿改由"落点安全边距"保证（见 TeleportParticleThroughPortal），
-        // 不再靠收紧这里的窗口。
-        // 判定窗（2026-08-16 四次修复，重构为"法线距离窗"）：
-        // 旧窗按"帧位移线段长度"计量，斜粒子每帧在门法线方向前进的分量小，
-        // 同样窗值对它们覆盖的法线距离更短——越斜越快逃出窗，而隧穿的全是斜粒子。
-        // 改为沿门法线的前进距离（米）计量，与角度无关：
-        //   本帧穿越(t∈[0,1]) 或 已过检测面且法线漂移≤窗值 → 都算。
-        float forwardPastPlane = Vector3.Dot(segEnd - planePoint, portalPlane.forward);
-        bool crossesThisFrame = (t >= 0f && t <= 1f);
-        bool withinWindow = (forwardPastPlane >= 0f && forwardPastPlane <= particleTeleportRetroWindow);
-        if (!crossesThisFrame && !withinWindow) return false;
+        Vector3 normal = portalPlane.forward;
+        float zStart = Vector3.Dot(segStart - planePoint, normal);
+        float zEnd = Vector3.Dot(segEnd - planePoint, normal);
 
-        hitPoint = segStart + segDir * t;
-        Vector3 local = worldToLocal.MultiplyPoint(hitPoint);
-        if (LocalPointInPortalRect(local, shapeType)) return true;
-        // 补判当前位置（2026-08-16 三次修复）：斜着飞的粒子先在门框【外】穿过检测面、
-        // 再飘进门框内——只查穿越点会漏掉它们（等飘进框时已在检测面后方、回溯窗外）。
-        // 当前位置在门框内同样算穿越。落点边距保证回溯窗加大也不回穿，此处放宽是安全的。
-        Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
-        return LocalPointInPortalRect(localEnd, shapeType);
+        // 规则1：两端跨检测面符号翻转 = 本帧穿越（任意速度必抓：线段覆盖了两帧间的全部运动）
+        bool flipped = (zStart > 0f && zEnd <= 0f) || (zStart <= 0f && zEnd > 0f);
+        if (flipped)
+        {
+            // 符号翻转保证分母非零，t ∈ [0,1]
+            t = zStart / (zStart - zEnd);
+            hitPoint = segStart + (segEnd - segStart) * t;
+            Vector3 localHit = worldToLocal.MultiplyPoint(hitPoint);
+            if (LocalPointInPortalRect(localHit, shapeType)) return true;
+            // 补判当前位置（三轮修复）：斜着飞的粒子先在门框【外】穿过检测面、再飘进门框内——
+            // 只查穿越点会漏掉它们。落点安全边距保证不回穿，此处放宽是安全的。
+            Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
+            return LocalPointInPortalRect(localEnd, shapeType);
+        }
+
+        // 规则2：后侧追补窗（retroWindow=0 时本分支自然失效）
+        if (zEnd <= 0f && zEnd >= -particleTeleportRetroWindow)
+        {
+            t = 1f;
+            hitPoint = segEnd;
+            Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
+            return LocalPointInPortalRect(localEnd, shapeType);
+        }
+
+        return false;
     }
 
     // 把单颗粒子映射到另一侧：穿越点 from→to+经典半转，速度同映射，
@@ -3411,10 +3472,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Vector3 exitVel = localToWorldTo.MultiplyVector(localVel);
 
         // 落点安全边距（防回穿乒乓，必需）：halfTurn 会把入口检测面的 z=+offset 翻成出口侧
-        // z=-offset（落在出口平面后方）。把落点推过出口检测面，且超出法线距离窗一个裕量，
-        // 保证"刚传送完的粒子"落在窗外、永远不会被判定窗回抓（与角度/速度无关，固定边距）。
+        // z=-offset（落在出口平面后方）。把落点推过出口检测面即可。
+        // 六轮简化：旧版在这里额外加了一个 retroWindow 裕量（怕被判定窗回抓）；新版规则2只抓
+        // 检测面【后侧】，而出口粒子落在出口门【前侧】且沿映射速度远离，永远不会被任何规则回抓，
+        // 窗值裕量不再需要——出射点因此比旧版缩近了 retroWindow 米。
         Vector3 exitForward = localToWorldTo.MultiplyVector(Vector3.forward);
-        float landingPush = particleTeleportPlaneOffset * 2f + particleTeleportRetroWindow + 0.1f;
+        float landingPush = particleTeleportPlaneOffset * 2f + 0.1f;
 
         float remainingTime = Mathf.Max(0f, (1f - t) * dt);
         p.position = exitPos + exitForward * landingPush + exitVel * remainingTime;
