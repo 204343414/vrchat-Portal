@@ -18,7 +18,7 @@
 // ============================================================
 // ================================================================================
 // 交接文档 —— 写给下一个接手这份代码的人（人类或 LLM）
-// 最后更新：本轮对话结束时（传送枪合法放置检测 + 三形状判定 + 冷却消抖 之后）
+// 最后更新：2026-08-17（砍掉规则5撞墙近似反弹 + Local空间粒子手动清单 + 死代码清理，见十五轮）
 // ================================================================================
 //
 // 【项目结构，一共3个脚本】
@@ -281,29 +281,21 @@
 //           无实穿越时兜底命中也取最早。玩家侧补充排查线索：若天花板+地板门高速循环
 //           仍断裂，查场景里 teleportBlockFrames 是否为0（>0会在高速下让整段检测停摆），
 //           并开 debugTeleportCoreLog 抓异常跳变的 [T#] 行（z区间+t值直接暴露晚检测）。
-//     十四轮（2026-08-18，Local空间粒子支持=激光特效地基）：用户提出激光需求——
-//           低速粒子模拟笔直激光（不抖动不弧线），但激光特效通常是 Simulation Space=Local
-//           （moveWithTransform跟随枪体）。实现：新增 particleLocalSpaceSystems 清单
-//           （显式拖入，规避 ps.main.simulationSpace 的 Udon 白名单风险），循环内
-//           局部→世界转换判定（TransformPoint/TransformVector），传送/反弹结果统一按
-//           世界坐标计算，写回前 InverseTransform 转回局部（配对记录永远存世界坐标）。
-//           同轮性能审计（两门同屏掉帧）：脚本侧无死逻辑（过渡相机/渲染器扫描均有缓存守卫），
-//           掉帧主因是递归渲染本身——recursiveRenderLimit 默认3，两门同屏=多次全场景
-//           Camera.Render()，属传送门渲染固有价值成本；缓解=调低 recursiveRenderLimit。
-//     十三轮（2026-08-17，规则5语义收窄）：用户实测指出"没开碰撞粒子却在门边缘自己反弹"
-//           不符合预期——没碰撞=粒子本该自由穿墙，只有进门框才传送。规则5撞墙近似反弹
-//           默认改为【关】，tooltip收窄为单一适用场景：门嵌墙/地板+粒子开碰撞+高速隧穿墙面。
-//           漏检嫌疑样本上限3→6，便于定位剩余4~5颗/秒的残留（重点看样本的框内A/B标志：
-//           框内=True才是门的漏检；框外=粒子根本没进门，属正确行为或Unity碰撞/几何问题）。
-//     十二轮（2026-08-17，高速防隧穿收官）：速度100实测门框内零漏检依旧成立，
-//           残留"隧穿"全部是Unity离散碰撞拦不住的穿墙粒子（1.7米/帧>墙厚）。
-//           收官方案=规则5撞墙近似反弹（particleWallBounceAssist默认开）：
-//           线段前→后穿过检测面且穿越点在门框外 → 沿检测面镜像反弹（位置对称翻回、
-//           速度法向反转×0.6恢复系数）。原理：我们每帧握着所有粒子的完整位移线段，
-//           "粒子穿没穿过门所在墙面的平面"我们比Unity碰撞引擎看得更清楚——
-//           Unity碰撞失效的速度区间由管理器接管。前提：门嵌在墙/地板里（默认场景）；
-//           悬浮门关闭此开关。与规则4无冲突（反弹点框外、规则4只认框内）。
-//           至此粒子侧承诺：任意速度门框内必传+门面所在墙不穿（近似反弹）。
+//     十五轮（2026-08-17，用户裁决砍掉两项粒子辅助功能 + 死代码清理）：
+//           1) 规则5撞墙近似反弹整体移除：particleWallBounceAssist 字段、TryWallAssistBounce、
+//              诊断计数 particleDebugWallAssistCount 一并删除。原适用场景（门嵌墙+开碰撞+
+//              高速隧穿墙面）属Unity离散碰撞引擎极限，产品决策不再由脚本近似接管反弹。
+//           2) Local空间粒子手动清单整体移除：particleLocalSpaceSystems 字段、
+//              IsLocalSpaceParticleSystem、循环内 localMode 局部↔世界坐标转换与写回转回局部、
+//              排除拦截里的Local优先放行全部删除。理由：自动收集已覆盖系统注册，手动拖
+//              清单不合理。语义回到十四轮前：参与传送的系统一律按 World 空间处理，已注册的
+//              Local 系统会被按世界坐标错误映射（enableParticleTeleport 的 tooltip 声明不变：
+//              Local 暂不支持）。若未来要恢复，注意 ps.main.simulationSpace 有 Udon 白名单
+//              风险（这正是当初用手动清单的原因）。
+//           3) 死代码：debugTeleportLog 字段从未被任何代码读取（总开关tooltip未接线），删除。
+//           4) 性能备忘（沿自旧十四轮审计，仍有效）：两门同屏掉帧主因是递归渲染本身——
+//              recursiveRenderLimit 默认3，两门同屏=多次全场景 Camera.Render()，属传送门渲染
+//              固有价值成本；缓解=调低 recursiveRenderLimit。
 //     十一轮（2026-08-17，毕业后实测返修）：
 //           a) 放置发现"没工作"破案方向：旧版只扫"碰撞体自身子树+祖先链单点"，
 //              粒子系统挂在碰撞体【兄弟节点】（常见预制件结构）时完全扫不到 → 改为
@@ -372,8 +364,6 @@ public static class 传送门中文面板_标签表
         { "autoDiscoverParticleSystems", "粒子传送-自动收集开关" },
         { "particleDiscoveryRoots", "粒子传送-收集根(拖容器)" },
         { "particleTeleportExclusionRoots", "粒子传送-排除根(枪已自动排除)" },
-        { "particleWallBounceAssist", "粒子传送-撞墙近似反弹(高速防隧穿)" },
-        { "particleLocalSpaceSystems", "粒子传送-Local空间系统(激光拖这里)" },
         { "particleDiscoveryRadius", "粒子传送-自动收集半径" },
         { "particleDiscoveryRefreshInterval", "粒子传送-收集刷新间隔" },
         { "particleTeleportPlaneOffset", "粒子传送-检测面外推(防墙弹)" },
@@ -426,7 +416,6 @@ public static class 传送门中文面板_标签表
 
         { "dumpConfigSnapshotOnStart", "开局打印配置快照" },
 
-        { "debugTeleportLog", "调试-总日志开关" },
         { "debugTeleportCoreLog", "调试-核心传送日志" },
         { "debugLayerLog", "调试-图层切换日志" },
         { "debugTransitionLog", "调试-过渡相机日志" },

@@ -110,21 +110,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("收集根（可选）：特效物件没挂在传送门同一根节点下、自己又没有碰撞体时，把它们的容器物体拖进来。")]
     public GameObject[] particleDiscoveryRoots;
 
-    [Tooltip("Local空间粒子清单（十四轮，激光特效专用）：Simulation Space = Local 的粒子系统（比如挂在枪上、" +
-             "跟随物体移动的激光束）拖进这里。检测时自动把粒子位置/速度转成世界坐标判定，传送结果再转回局部坐标写回——" +
-             "激光不再需要靠高速粒子模拟，低速粒子也能笔直穿门。不拖进来的系统仍按 World 空间处理。")]
-    public ParticleSystem[] particleLocalSpaceSystems;
-
     [Tooltip("粒子传送排除根：这些物体（含其子层级）下的粒子系统不参与检测/传送。" +
              "传送枪自身层级已自动排除（枪的激光/枪口特效若参与传送会鬼畜）；其他不想被传送的特效拖进来即可。")]
     public Transform[] particleTeleportExclusionRoots;
-
-    [Tooltip("撞墙近似反弹（默认关，十三轮语义收窄）：只在一种场景开——门嵌在墙/地板里、" +
-             "粒子系统【开了碰撞】、且速度高到Unity碰撞开始隧穿墙面（每帧位移>墙厚，约速度80+）。" +
-             "它把'粒子线段穿过门所在墙面平面且穿越点在门框外'镜像反弹，模拟墙面碰撞。" +
-             "粒子没开碰撞时千万别开：没碰撞=粒子本来就该自由穿过墙面，开了会撞上隐形平面。" +
-             "悬浮在空中的门也不要开。")]
-    public bool particleWallBounceAssist = false;
 
     [Tooltip("自动发现半径：放置时发现(OverlapSphere)的半径，也是root扫描的距离过滤。门放哪扫到哪。")]
     public float particleDiscoveryRadius = 100f;
@@ -154,7 +142,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private int particleDebugStuckSamples = 0;
     private int particleDebugTruncatedSystems = 0;
     private int particleDebugBounceCount = 0;
-    private int particleDebugWallAssistCount = 0;
 
     private ParticleSystem.Particle[] particleTeleportBuffer;
     // 实测位移配对组（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命 + 粒子身份证(randomSeed) + 有效标记。
@@ -422,8 +409,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     public bool dumpConfigSnapshotOnStart = false;
 
     [Header("════════════ 同Collider专修/调试 ════════════")]
-    [Tooltip("总日志开关。关闭后本脚本不输出传送门日志。")]
-    public bool debugTeleportLog = false;
     [Tooltip("核心传送短日志：只输出 T# 和 OUT，推荐测试时开启。")]
     public bool debugTeleportCoreLog = false;
     [Tooltip("图层切换日志：28<->25。稳定后建议关闭，避免刷屏。")]
@@ -3055,7 +3040,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // 设计要点（六轮，window=0 零漏检架构）：
     // - 身份配对：randomSeed（出生时分配、终生不变的稳定ID）按槽位认同"同一颗粒子"；
     //   GetParticles 槽位顺序在粒子死亡时会洗牌（Unity官方论坛实证），配对失败即走"首见"路径。
-    // - 零漏检三条规则：
+    // - 零漏检四条规则：
     //   规则1 本帧穿越：配对实测位移（或出生反推）线段与检测面符号翻转求交——任意速度必抓；
     //         符号距离插值对退化线段也成立（门移动扫过静止粒子照样抓）；双向都收。
     //   规则2 后侧追补窗（retroWindow>0 时）：已在检测面后侧且深度<=窗值 → 补抓。
@@ -3074,8 +3059,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // - 性能闸门：白名单/收集根自动收集 + 距离闸门 + 缓冲初始大小（自动扩容）。
     // - 检测面沿法线外推 particleTeleportPlaneOffset：贴墙/地板门 + 带碰撞粒子的场景，
     //   粒子会被墙体在门平面处弹走永远穿不过平面，外推检测面让粒子撞墙前就传送。
-    // - 空间语义：默认按 World 空间处理；Simulation Space = Local 的系统（激光等）拖进
-    //   particleLocalSpaceSystems 清单即支持——判定用世界坐标，写回转回局部坐标。
+    // - 空间语义：只按 World 空间处理。Simulation Space = Local 的系统（如激光）不支持——
+    //   原 particleLocalSpaceSystems 手动清单及局部↔世界转换机制已按用户裁决整体移除；
+    //   Local 系统若被自动收集注册进来会被按世界坐标错误映射，不要混用。
     // ============================================================
 
     private void ProcessParticleTeleports()
@@ -3136,11 +3122,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 particleDebugFrameCounter = 0;
                 int rootListCount = discoveredParticleSystems != null ? discoveredParticleSystems.Length : 0;
-                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（其中反弹捕获 " + particleDebugBounceCount + "、撞墙反弹 " + particleDebugWallAssistCount + "），过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容）");
+                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（其中反弹捕获 " + particleDebugBounceCount + "），过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容）");
                 particleDebugTestedCount = 0;
                 particleDebugTeleportCount = 0;
                 particleDebugBounceCount = 0;
-                particleDebugWallAssistCount = 0;
                 particleDebugStuckCount = 0;
                 particleDebugStuckSamples = 0;
                 particleDebugTruncatedSystems = 0;
@@ -3182,12 +3167,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             ParticleSystem.Particle p = particleTeleportBuffer[i];
             uint seed = p.randomSeed;
 
-            // Local空间系统（激光等）：粒子位置/速度存的是系统局部坐标，先转世界坐标再判定；
-            // World空间系统零开销直通。
-            bool localMode = IsLocalSpaceParticleSystem(ps);
-            Transform sysT = localMode ? ps.transform : null;
-            Vector3 curPos = localMode ? sysT.TransformPoint(p.position) : p.position;
-            Vector3 worldVel = localMode ? sysT.TransformVector(p.velocity) : p.velocity;
+            // 只按 World 空间处理（Local空间清单机制已按用户裁决移除，见 ProcessParticleTeleports 头注）
+            Vector3 curPos = p.position;
+            Vector3 worldVel = p.velocity;
 
             // 身份配对（randomSeed 身份证）：本槽位上帧是同一颗粒子 → 实测位置当线段起点（精确，任意速度必抓）。
             bool paired = particlePrevValid != null && particlePrevValid[i] && particlePrevSeeds[i] == seed;
@@ -3318,25 +3300,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
 
             bool wasTeleported = false;
-            bool wasBounced = false;
-
-            // 规则5 撞墙近似反弹（十二轮）：没有任何传送命中 + 开关开启时，
-            // 检查本帧线段是否"前→后穿过检测面且穿越点在门框外"——那就是粒子在高速下
-            // 隧穿门所在墙面的瞬间（Unity离散碰撞拦不住的速度区间由我们接管）：
-            // 镜像反弹，粒子永远不会穿过墙面。先A后B，弹过一边就不再弹另一边。
-            if (!doA && !doB && particleWallBounceAssist)
-            {
-                if (TryWallAssistBounce(ref p, segStart, curPos, worldVel, portalPlaneA, worldToLocalA, shapeA))
-                {
-                    wasBounced = true;
-                    if (debugParticleTeleportLog) particleDebugWallAssistCount++;
-                }
-                else if (TryWallAssistBounce(ref p, segStart, curPos, worldVel, portalPlaneB, worldToLocalB, shapeB))
-                {
-                    wasBounced = true;
-                    if (debugParticleTeleportLog) particleDebugWallAssistCount++;
-                }
-            }
 
             if (doA)
             {
@@ -3351,19 +3314,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if (debugParticleTeleportLog) particleDebugTeleportCount++;
             }
 
-            // 统一写回（十四轮重构）：传送/反弹都写成【世界坐标】结果；
-            // Local空间系统在此刻转回系统局部坐标再入缓冲，配对记录则永远存世界坐标。
+            // 统一写回：传送结果按世界坐标落点写回（配对记录永远存世界坐标）
             Vector3 finalWorldPos = curPos;
             Vector3 finalWorldVel = worldVel;
-            if (wasTeleported || wasBounced)
+            if (wasTeleported)
             {
                 finalWorldPos = p.position;
                 finalWorldVel = p.velocity;
-                if (localMode)
-                {
-                    p.position = sysT.InverseTransformPoint(p.position);
-                    p.velocity = sysT.InverseTransformVector(p.velocity);
-                }
                 particleTeleportBuffer[i] = p;
                 changed = true;
             }
@@ -3537,24 +3494,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Debug.Log("[粒子传送][放置发现] 扫描完成：半径" + particleDiscoveryRadius + "m内命中" + hitCount + "个碰撞体，新注册" + registeredThisCall + "个粒子系统（当前注册总数" + placedDiscoveryCount + "）");
     }
 
-    // 是否为 Local 空间粒子系统（用户显式拖入清单；避免读 ps.main.simulationSpace 的白名单风险）。
-    private bool IsLocalSpaceParticleSystem(ParticleSystem ps)
-    {
-        if (particleLocalSpaceSystems == null || ps == null) return false;
-        for (int i = 0; i < particleLocalSpaceSystems.Length; i++)
-        {
-            if (particleLocalSpaceSystems[i] == ps) return true;
-        }
-        return false;
-    }
-
     // 粒子系统是否在排除根子树下（传送枪特效等不参与传送）。
     private bool IsParticleSystemExcluded(ParticleSystem ps)
     {
         if (ps == null) return true;
-        // 显式拖进 Local空间清单 = 用户明确要它参与传送（比如挂在枪上的激光），
-        // 优先于传送枪自动排除——否则枪载激光永远进不了传送逻辑。
-        if (IsLocalSpaceParticleSystem(ps)) return false;
         Transform t = ps.transform;
         // 传送枪自动排除：枪的激光/枪口特效是视觉特效，跟着门传送看起来鬼畜
         if (portalGun != null && IsTransformUnder(t, portalGun.transform)) return true;
@@ -3687,32 +3630,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
 
         return false;
-    }
-
-    // 撞墙近似反弹（十二轮）：线段前→后穿过检测面且穿越点在门框外 = 粒子正以Unity碰撞
-    // 拦不住的速度凿向门所在的墙。沿检测面做镜像：位置对称翻回、速度法向分量反转并乘
-    // 恢复系数0.6（近似常见碰撞设置的弹性，无法安全读取粒子Collision模块参数）。
-    // 只处理"朝墙飞"(前→后)的穿越；从墙后飞出的粒子不碰（它们已经出来了）。
-    // 与规则4不冲突：反弹点在门框外，规则4的门框内判定不会把它误当门面反弹去传送。
-    private bool TryWallAssistBounce(ref ParticleSystem.Particle p, Vector3 segStart, Vector3 curPos, Vector3 worldVel, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType)
-    {
-        Vector3 planePoint = portalPlane.position + portalPlane.forward * particleTeleportPlaneOffset;
-        Vector3 normal = portalPlane.forward;
-        float zStart = Vector3.Dot(segStart - planePoint, normal);
-        float zEnd = Vector3.Dot(curPos - planePoint, normal);
-        if (!(zStart > 0f && zEnd <= 0f)) return false;
-
-        float t = zStart / (zStart - zEnd);
-        Vector3 hitPoint = segStart + (curPos - segStart) * t;
-        // 穿越点在门框内 = 进门，归传送规则管，这里不碰
-        if (LocalPointInPortalRect(worldToLocal.MultiplyPoint(hitPoint), shapeType)) return false;
-
-        // 位置：把终点沿检测面镜像翻回（等价于剩余路程撞墙反弹）
-        p.position = curPos - normal * (2f * zEnd);
-        // 速度：法向分量反转 × 恢复系数，切向保留（用世界速度，Local系统由调用方转回局部）
-        Vector3 reflected = worldVel - normal * (2f * Vector3.Dot(worldVel, normal));
-        p.velocity = reflected * 0.6f;
-        return true;
     }
 
     // 把单颗粒子映射到另一侧：穿越点 from→to+经典半转，速度同映射，
