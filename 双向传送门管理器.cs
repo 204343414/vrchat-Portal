@@ -3045,7 +3045,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     //         数学上永远穿不过检测面，反弹信号就是"到过门口"的铁证；用反弹前速度映射，
     //         锚点投影到检测面防乒乓。继承 Unity 粒子碰撞的防隧穿，与速度无关。
     // - 缓冲自动扩容：活粒子顶满缓冲 → 自动翻倍补读，超出部分不再被永久漏掉。
-    // - 一帧至多一次穿越：两扇门都命中时取 t 更大（更晚）的一次，与粒子终点位置一致。
+    // - 一帧至多一次穿越：两门都命中取"门框内实穿越里 t 最早的"——先碰先进（九轮修复：
+    //   旧"取更晚"在剪刀重叠门+高速长线段下把粒子按错误的门映射，是高速滞留隧穿真凶）。
     // - 矩阵每帧只构造4次（A/B各一套worldToLocal/localToWorld，与 useScaleFreePortalMatrix
     //   的数学完全一致），粒子循环里只有 MultiplyPoint/MultiplyVector，无 TRS/inverse。
     // - 性能闸门：白名单/收集根自动收集 + 距离闸门 + 缓冲初始大小（自动扩容）。
@@ -3172,14 +3173,36 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             float tA;
             Vector3 hitA;
-            bool crossA = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneA, worldToLocalA, shapeA, out tA, out hitA);
+            int kindA;
+            bool crossA = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneA, worldToLocalA, shapeA, out tA, out hitA, out kindA);
             float tB;
             Vector3 hitB;
-            bool crossB = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneB, worldToLocalB, shapeB, out tB, out hitB);
+            int kindB;
+            bool crossB = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneB, worldToLocalB, shapeB, out tB, out hitB, out kindB);
 
-            // 一帧至多一次传送：两门都命中取更晚的一次
-            bool doA = crossA && (!crossB || tA >= tB);
-            bool doB = crossB && !doA;
+            // 一帧至多一次传送——先碰到哪扇门就进哪扇（九轮关键修复，"取更晚"是高速漏检真凶）：
+            // 剪刀形重叠门 + 高速长线段时，一根线段会同帧穿过两扇门的平面。粒子物理上是
+            // 先进了 t 更小的那扇门——旧逻辑取更晚的，把它按另一扇门映射，落点被甩到
+            // 某扇门后侧深处，此后配对成立、四条规则全不满足 → 永久滞留（可见隧穿）。
+            // 速度10线段短很少双穿（几乎不漏）、速度100线段1.7米频繁双穿（大量漏）——与实测完全吻合。
+            // 优先级：门框内实穿越(kind 1)取最早；两门都不是实穿越时，兜底命中(kind 2)也取最早。
+            bool doA = false;
+            bool doB = false;
+            if (crossA || crossB)
+            {
+                bool solidA = crossA && kindA == 1;
+                bool solidB = crossB && kindB == 1;
+                if (solidA || solidB)
+                {
+                    doA = solidA && (!solidB || tA <= tB);
+                    doB = solidB && !doA;
+                }
+                else
+                {
+                    doA = crossA && (!crossB || tA <= tB);
+                    doB = crossB && !doA;
+                }
+            }
 
             // 本帧局部坐标（规则3/规则4/诊断共用，每粒子只算一次）
             Vector3 localCurA = worldToLocalA.MultiplyPoint(curPos);
@@ -3486,10 +3509,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     //   检测面【前侧】正在靠近的粒子（门前窗值米内会被提前吸走），而真正过平面后的漏检粒子
     //   forwardPastPlane<0 永远进不了窗——这就是"窗=2 仍残留 1~2 颗隧穿"的病根（窗从没兜住入口侧漏检）。
     //   现改为真正的"后侧深度<=窗值"。窗=0 时本分支自然关闭，零漏检由规则1+调用方规则3保证。
-    private bool ParticleSegmentCrossesPortal(Vector3 segStart, Vector3 segEnd, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, out float t, out Vector3 hitPoint)
+    // hitKind: 1=交点在门框内的实穿越（物理事件，选择时最先发生者优先）；
+    //          2=兜底类命中（框外穿越+终点飘入框内 / 后侧追补窗，属状态补救，优先级低于实穿越）。
+    private bool ParticleSegmentCrossesPortal(Vector3 segStart, Vector3 segEnd, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, out float t, out Vector3 hitPoint, out int hitKind)
     {
         t = 0f;
         hitPoint = Vector3.zero;
+        hitKind = 0;
         if (portalPlane == null) return false;
 
         // 检测平面沿法线外推：门贴墙/地板且粒子带碰撞时，墙体碰撞体在门平面处就把粒子弹走，
@@ -3507,11 +3533,21 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             t = zStart / (zStart - zEnd);
             hitPoint = segStart + (segEnd - segStart) * t;
             Vector3 localHit = worldToLocal.MultiplyPoint(hitPoint);
-            if (LocalPointInPortalRect(localHit, shapeType)) return true;
+            if (LocalPointInPortalRect(localHit, shapeType))
+            {
+                hitKind = 1;
+                return true;
+            }
             // 补判当前位置（三轮修复）：斜着飞的粒子先在门框【外】穿过检测面、再飘进门框内——
             // 只查穿越点会漏掉它们。落点安全边距保证不回穿，此处放宽是安全的。
+            // 注意这是兜底类命中（kind 2）：穿越点在框外，不是"进门"物理事件。
             Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
-            return LocalPointInPortalRect(localEnd, shapeType);
+            if (LocalPointInPortalRect(localEnd, shapeType))
+            {
+                hitKind = 2;
+                return true;
+            }
+            return false;
         }
 
         // 规则2：后侧追补窗（retroWindow=0 时本分支自然失效）
@@ -3520,7 +3556,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             t = 1f;
             hitPoint = segEnd;
             Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
-            return LocalPointInPortalRect(localEnd, shapeType);
+            if (LocalPointInPortalRect(localEnd, shapeType))
+            {
+                hitKind = 2;
+                return true;
+            }
+            return false;
         }
 
         return false;
