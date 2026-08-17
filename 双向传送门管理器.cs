@@ -119,11 +119,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
              "粒子会在到达门平面之前先被墙体碰撞体弹走、数学上永远不穿过门平面；把检测面推出墙面，让粒子在撞墙前就传送。")]
     public float particleTeleportPlaneOffset = 0.05f;
 
-    [Tooltip("穿越判定窗（单位：米，沿门法线的前进距离），同时是'已漏检粒子'的追补深度。" +
-             "本帧穿越必抓；已过检测面的粒子只要法线漂移≤此窗值也抓——与角度无关，对斜粒子公平（旧版按'帧位移线段长度'计量，斜粒子每帧法线前进分量小，窗对它们实际更短，是斜粒子隧穿的真凶）。" +
-             "调大的代价：落点安全边距随之加大，粒子出射点离出口门更远。默认0.5够用；仍有隧穿拉到1~2。")]
+    [Tooltip("穿越判定窗（单位：米，沿门法线的前进距离），只对'无法配对实测位移、回退速度重建'的少数粒子生效的追补深度。" +
+             "已改用 randomSeed 种子配对实测位移后，本帧穿越的粒子无论快慢都必抓，此窗只需很小（默认0.3）。" +
+             "调大的代价：落点安全边距随之加大，粒子出射点离出口门更远（出射点=2*offset+此窗+0.1）。" +
+             "高速粒子隧穿基本已由种子配对根治，此窗保持小值即可，不要为了防隧穿盲目拉大。")]
     [Range(0f, 2f)]
-    public float particleTeleportRetroWindow = 0.5f;
+    public float particleTeleportRetroWindow = 0.3f;
 
     [Tooltip("粒子传送诊断日志：每60帧输出一次'检测了多少粒子/传送了多少次'。粒子隧穿不传送时用它定位卡在哪一环：检测数=0说明系统没被读取（Simulation Space不是World/系统没播放/距离闸门）；检测数>0但传送=0说明穿越判定不命中（空间语义/门框范围/方向）。")]
     public bool debugParticleTeleportLog = false;
@@ -135,10 +136,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private int particleDebugTruncatedSystems = 0;
 
     private ParticleSystem.Particle[] particleTeleportBuffer;
-    // 实测位移三件套（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命（配对校验用）+ 槽位归属系统。
+    // 实测位移三件套（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命 + 粒子身份证(randomSeed)。
+    // randomSeed 是粒子出生时分配、终生不变的稳定ID，是跨帧识别"同一颗粒子"的可靠钥匙
+    // （旧的"归属系统"配对太弱：同系统里寿命相近的两颗粒子会被误认成同一颗）。
     private Vector3[] particlePrevPositions;
     private float[] particlePrevLifetimes;
-    private ParticleSystem[] particlePrevOwners;
+    private uint[] particlePrevSeeds;
     private ParticleSystem[] discoveredParticleSystems;
     private float particleDiscoveryTimer = 0f;
 
@@ -3031,7 +3034,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             particleTeleportBuffer = new ParticleSystem.Particle[bufferSize];
             particlePrevPositions = new Vector3[bufferSize];
             particlePrevLifetimes = new float[bufferSize];
-            particlePrevOwners = new ParticleSystem[bufferSize];
+            particlePrevSeeds = new uint[bufferSize];
         }
 
         float dt = Time.deltaTime;
@@ -3110,17 +3113,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Vector3 curPos = p.position;
             float curLife = p.remainingLifetime;
 
-            // 实测位移（优先）：本槽位的上帧数据若属于同一系统且寿命连续（配对校验通过），
-            // 用真实位移当本帧线段——彻底消除速度重建误差（碰撞子步/力模块/模拟步长与渲染帧长
-            // 不一致等，误差随速度等比放大，正是高速隧穿的病灶）。
-            // 配对校验：粒子死亡后槽位会被新粒子复用、GetParticles压缩顺序会漂移，不能裸信下标；
-            // 剩余寿命与上帧差≈dt 才算同一颗粒子。校验失败/新粒子 → 回退速度重建（旧行为，无回归）。
-            bool paired = particlePrevOwners != null && particlePrevOwners[i] == ps;
-            if (paired)
-            {
-                float lifeDelta = particlePrevLifetimes[i] - curLife;
-                paired = lifeDelta > dt * 0.25f && lifeDelta < dt * 1.75f;
-            }
+            // 实测位移（优先）：本槽位上帧若是"同一颗粒子"，用真实位移当本帧线段——
+            // 彻底消除速度重建误差（碰撞子步/力模块/模拟步长与渲染帧长不一致等，
+            // 误差随速度等比放大，正是高速隧穿的病灶）。
+            // 身份判定用 randomSeed（粒子出生时分配、终生不变的稳定ID）：比旧的"归属系统+寿命连续"
+            // 可靠得多——同系统里寿命相近的两颗粒子不会被误认成同一颗。
+            // GetParticles 顺序基本稳定（粒子活着就待在自己的槽位），种子不匹配=槽位换了新粒子
+            // → 回退速度重建（仅一帧，无回归）。
+            bool paired = particlePrevSeeds != null && particlePrevSeeds[i] != 0 && particlePrevSeeds[i] == p.randomSeed;
             Vector3 segStart = paired ? particlePrevPositions[i] : (curPos - p.velocity * dt);
 
             // 无位移粒子不测试，但仍记录本帧数据供下帧配对
@@ -3128,7 +3128,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 particlePrevPositions[i] = curPos;
                 particlePrevLifetimes[i] = curLife;
-                particlePrevOwners[i] = ps;
+                particlePrevSeeds[i] = p.randomSeed;
                 continue;
             }
 
@@ -3189,7 +3189,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             ParticleSystem.Particle finalState = particleTeleportBuffer[i];
             particlePrevPositions[i] = finalState.position;
             particlePrevLifetimes[i] = finalState.remainingLifetime;
-            particlePrevOwners[i] = ps;
+            particlePrevSeeds[i] = finalState.randomSeed;
         }
 
         // 只有真的改过才写回，省掉无穿越帧的 SetParticles 开销
