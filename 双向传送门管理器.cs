@@ -114,12 +114,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
              "传送枪自身层级已自动排除（枪的激光/枪口特效若参与传送会鬼畜）；其他不想被传送的特效拖进来即可。")]
     public Transform[] particleTeleportExclusionRoots;
 
-    [Tooltip("撞墙近似反弹（十二轮，高速防隧穿收官）：带碰撞粒子速度一高，Unity的离散碰撞就拦不住" +
-             "（每帧位移>碰撞体厚度直接穿墙，速度100时约1.7米/帧）。本开关让管理器接管：粒子线段从前往后" +
-             "穿过检测面且穿越点在门框【外】（=撞墙不是进门）→ 沿平面镜像反弹，模拟墙面碰撞，" +
-             "粒子在任何速度下都不会穿过门所在的墙。适用前提：门嵌在墙/地板里（本项目默认场景）；" +
-             "悬浮在空中的门请关闭此开关，否则粒子会撞上隐形平面。")]
-    public bool particleWallBounceAssist = true;
+    [Tooltip("撞墙近似反弹（默认关，十三轮语义收窄）：只在一种场景开——门嵌在墙/地板里、" +
+             "粒子系统【开了碰撞】、且速度高到Unity碰撞开始隧穿墙面（每帧位移>墙厚，约速度80+）。" +
+             "它把'粒子线段穿过门所在墙面平面且穿越点在门框外'镜像反弹，模拟墙面碰撞。" +
+             "粒子没开碰撞时千万别开：没碰撞=粒子本来就该自由穿过墙面，开了会撞上隐形平面。" +
+             "悬浮在空中的门也不要开。")]
+    public bool particleWallBounceAssist = false;
 
     [Tooltip("自动发现半径：放置时发现(OverlapSphere)的半径，也是root扫描的距离过滤。门放哪扫到哪。")]
     public float particleDiscoveryRadius = 100f;
@@ -3356,7 +3356,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 float off = particleTeleportPlaneOffset;
                 bool suspectA = zA <= off && zA > off - 0.5f;
                 bool suspectB = zB <= off && zB > off - 0.5f;
-                if ((suspectA || suspectB) && particleDebugStuckSamples < 3)
+                if ((suspectA || suspectB) && particleDebugStuckSamples < 6)
                 {
                     particleDebugStuckSamples++;
                     bool inRectA = LocalPointInPortalRect(localCurA, shapeA);
