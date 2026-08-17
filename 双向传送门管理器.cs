@@ -147,7 +147,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // → 走"首见"路径（出生反推 + 首见后侧兜底），保证零漏检。
     // particlePrevValid 显式标记"本槽位有记录"（替代旧的 seed!=0 技巧，seed 恰好为 0 的粒子也能正常配对）。
     private Vector3[] particlePrevPositions;
-    private float[] particlePrevLifetimes;
     private uint[] particlePrevSeeds;
     private bool[] particlePrevValid;
     // 上帧实测速度：规则4"反弹捕获"用——配对粒子的门法向速度一帧内由"朝门"反转为"离门"，
@@ -156,7 +155,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private ParticleSystem[] discoveredParticleSystems;
     private float particleDiscoveryTimer = 0f;
 
-    // 放置时发现：OverlapSphere 缓冲 + 注册表（固定容量，Udon无动态数组）
+    // 放置时发现：OverlapSphere 缓冲(512) + 注册表（满员自动翻倍扩容，十轮收尾）
     private Collider[] discoveryOverlapBuffer;
     private ParticleSystem[] placedDiscoverySystems;
     private int placedDiscoveryCount = 0;
@@ -3321,7 +3320,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             // 记录本帧实测数据（若刚传送，用写回缓冲后的最终状态，下帧线段从出口侧起算）
             ParticleSystem.Particle finalState = particleTeleportBuffer[i];
             particlePrevPositions[i] = finalState.position;
-            particlePrevLifetimes[i] = finalState.remainingLifetime;
             particlePrevSeeds[i] = finalState.randomSeed;
             particlePrevVelocities[i] = finalState.velocity;
             particlePrevValid[i] = true;
@@ -3334,13 +3332,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
-    // 粒子数组扩容（六个数组同生灭）：扩容后配对记录清零，本帧全体粒子按"首见"规则处理，零漏检。
+    // 粒子数组扩容（五个数组同生灭）：扩容后配对记录清零，本帧全体粒子按"首见"规则处理，零漏检。
     private void GrowParticleArrays(int newSize)
     {
         int size = Mathf.Max(32, newSize);
         particleTeleportBuffer = new ParticleSystem.Particle[size];
         particlePrevPositions = new Vector3[size];
-        particlePrevLifetimes = new float[size];
         particlePrevSeeds = new uint[size];
         particlePrevValid = new bool[size];
         particlePrevVelocities = new Vector3[size];
@@ -3435,10 +3432,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (!enableParticleTeleport || !autoDiscoverParticleSystems) return;
         if (portalPlaneA == null || portalPlaneB == null) return;
 
-        if (discoveryOverlapBuffer == null) discoveryOverlapBuffer = new Collider[256];
+        if (discoveryOverlapBuffer == null) discoveryOverlapBuffer = new Collider[512];
         if (placedDiscoverySystems == null) placedDiscoverySystems = new ParticleSystem[64];
 
         int hitCount = Physics.OverlapSphereNonAlloc(center, particleDiscoveryRadius, discoveryOverlapBuffer, ~0, QueryTriggerInteraction.Collide);
+        // 截断告警：半径内碰撞体顶满缓冲时，超出的碰撞体携带的粒子系统扫不到（NonAlloc语义无法枚举完整集合）
+        if (hitCount >= discoveryOverlapBuffer.Length)
+        {
+            Debug.LogWarning("[粒子传送] 放置时发现：半径" + particleDiscoveryRadius + "m内碰撞体超过" + discoveryOverlapBuffer.Length + "个被截断，可能有粒子系统漏注册（把粒子Discovery半径调小或手动白名单补上）");
+        }
         for (int i = 0; i < hitCount; i++)
         {
             Collider col = discoveryOverlapBuffer[i];
@@ -3472,7 +3474,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     {
         if (ps == null) return;
         if (placedDiscoverySystems == null) return;
-        if (placedDiscoveryCount >= placedDiscoverySystems.Length) return;
+        // 注册表满了自动翻倍扩容（旧行为是静默丢弃——密集世界里第65个之后的系统会无声漏注册）
+        if (placedDiscoveryCount >= placedDiscoverySystems.Length)
+        {
+            ParticleSystem[] bigger = new ParticleSystem[placedDiscoverySystems.Length * 2];
+            for (int c = 0; c < placedDiscoveryCount; c++) bigger[c] = placedDiscoverySystems[c];
+            placedDiscoverySystems = bigger;
+        }
 
         for (int i = 0; i < placedDiscoveryCount; i++)
         {
