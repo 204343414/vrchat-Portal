@@ -56,7 +56,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Header("════════════ 碰撞控制 ════════════")]
     public 传送枪 portalGun;
 
-    [Tooltip("玩家进入传送门前后多远开始临时切换图层。实际判定深度 = noClipDepth + colliderDisableBuffer + 速度缓冲；想让切换更早/更晚，优先微调这个值。")]
+    [Tooltip("玩家进入传送门前后多远开始临时切换图层。实际判定深度 = noClipDepth + colliderDisableBuffer + 速度缓冲。" +
+             "速度缓冲 = 玩家速度×物理步长×2（八轮起不再钳死1.5米，上限50米仅防异常值），保证任意速度的玩家在到达墙面前一帧，墙已切到穿透层。想让切换更早/更晚，优先微调这个值。")]
     public float colliderDisableBuffer = 0.15f;
 
     [Tooltip("被传送枪标记的墙/地板/屏蔽碰撞体的原始实体层。当前推荐 17 = Walkthrough：挡刚体/物品，不挡玩家。")]
@@ -83,6 +84,98 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     [Tooltip("Clip Volume 穿透逻辑开关。关闭则完全不做批量切换，回退到只切单markedCollider的旧行为。")]
     public bool enableClipVolumePassThrough = true;
+
+    [Header("════════════ 粒子传送 ════════════")]
+    [Tooltip("启用粒子传送：白名单粒子系统里穿过A/B门平面的粒子会被映射到另一侧（位置+速度同门映射）。" +
+             "【重要】参与系统的 Simulation Space 必须是 World（ParticleSystem主模块设置），Local空间暂不支持。")]
+    public bool enableParticleTeleport = true;
+
+    [Tooltip("参与传送的粒子系统白名单：只处理明确挂进来的系统，防止误挂超大粒子量的系统拖垮帧率。不挂任何系统时本功能零开销。")]
+    public ParticleSystem[] portalParticleSystems;
+
+    [Tooltip("粒子缓冲初始大小。六轮升级：活粒子顶满缓冲时会自动翻倍扩容并补读（扩容帧全体粒子按'首见'规则处理，后侧兜底接管，零漏检），此值只是初始分配，不再构成上限。")]
+    [Range(32, 2048)]
+    public int particleTeleportBufferSize = 1024;
+
+    [Tooltip("粒子系统【原点】离两扇门都超过这个距离时整体跳过（性能闸门，按系统原点算不是按粒子位置）。远处系统喷射的粒子飞进门区也不会被处理——有这种特效就把这个值加大。")]
+    public float particleTeleportMaxDistance = 100f;
+
+    [Tooltip("自动收集粒子系统：开启后有三路来源——" +
+             "1) 放置时发现：传送枪放门成功时/Start时，用OverlapSphere枚举门周围半径内的碰撞体，顺藤摸瓜找它们层级里的粒子系统自动注册（免手拖，推荐主用）；" +
+             "2) 本物体 transform.root 子树定时扫描（预制件自带特效零配置生效）；" +
+             "3) 下方'收集根'物体子树（以上都覆盖不到时的兜底，可选）。" +
+             "诚实边界：Udon 无法枚举没有碰撞体的物体，完全独立且无碰撞体的粒子系统仍需白名单/收集根。")]
+    public bool autoDiscoverParticleSystems = true;
+
+    [Tooltip("收集根（可选）：特效物件没挂在传送门同一根节点下、自己又没有碰撞体时，把它们的容器物体拖进来。")]
+    public GameObject[] particleDiscoveryRoots;
+
+    [Tooltip("Local空间粒子清单（十四轮，激光特效专用）：Simulation Space = Local 的粒子系统（比如挂在枪上、" +
+             "跟随物体移动的激光束）拖进这里。检测时自动把粒子位置/速度转成世界坐标判定，传送结果再转回局部坐标写回——" +
+             "激光不再需要靠高速粒子模拟，低速粒子也能笔直穿门。不拖进来的系统仍按 World 空间处理。")]
+    public ParticleSystem[] particleLocalSpaceSystems;
+
+    [Tooltip("粒子传送排除根：这些物体（含其子层级）下的粒子系统不参与检测/传送。" +
+             "传送枪自身层级已自动排除（枪的激光/枪口特效若参与传送会鬼畜）；其他不想被传送的特效拖进来即可。")]
+    public Transform[] particleTeleportExclusionRoots;
+
+    [Tooltip("撞墙近似反弹（默认关，十三轮语义收窄）：只在一种场景开——门嵌在墙/地板里、" +
+             "粒子系统【开了碰撞】、且速度高到Unity碰撞开始隧穿墙面（每帧位移>墙厚，约速度80+）。" +
+             "它把'粒子线段穿过门所在墙面平面且穿越点在门框外'镜像反弹，模拟墙面碰撞。" +
+             "粒子没开碰撞时千万别开：没碰撞=粒子本来就该自由穿过墙面，开了会撞上隐形平面。" +
+             "悬浮在空中的门也不要开。")]
+    public bool particleWallBounceAssist = false;
+
+    [Tooltip("自动发现半径：放置时发现(OverlapSphere)的半径，也是root扫描的距离过滤。门放哪扫到哪。")]
+    public float particleDiscoveryRadius = 100f;
+
+    [Tooltip("自动收集刷新间隔（秒）。门可以被传送枪移动，定期重新扫描保证参与列表跟上。")]
+    public float particleDiscoveryRefreshInterval = 5f;
+
+    [Tooltip("粒子传送平面外推距离：检测平面沿门法线向外推这么多。带碰撞粒子有两层保护：" +
+             "1) 此值大于粒子碰撞半径(≈粒子尺寸×Collision模块Radius Scale的一半)时，粒子在撞墙前先穿过检测面被规则1收走（视觉最干净）；" +
+             "2) 没调那么大也没关系——粒子被门的墙弹回时会被规则4'反弹捕获'传送（墙边最多可见一帧反弹）。" +
+             "想要'撞墙前就被吸进门'的视觉就把此值调大到超过粒子碰撞半径（Collision模块勾Visualize Bounds可看见碰撞球）。")]
+    public float particleTeleportPlaneOffset = 0.05f;
+
+    [Tooltip("后侧追补深度（米，沿门法线越过检测面之后的深度）。六轮语义修正：旧版符号写反了——" +
+             "旧条件抓的是门【前侧】正在靠近的粒子（甚至会把门前窗值米内的粒子提前吸走），后侧漏检从来抓不到，这是'窗=2仍残留隧穿'的病根。" +
+             "现已改为真正的'已过检测面且深度<=此值'追补。种子配对+出生反推+首见后侧兜底之后，此窗=0 也能一个不漏；" +
+             ">0 只是给槽位洗牌等极端情况多一层保险。调大代价：落点安全边距随之加大（出射点=2*offset+此窗+0.1），推荐 0~0.3。")]
+    [Range(0f, 2f)]
+    public float particleTeleportRetroWindow = 0f;
+
+    [Tooltip("粒子传送诊断日志：每60帧输出一次'检测了多少粒子/传送了多少次'。粒子隧穿不传送时用它定位卡在哪一环：检测数=0说明系统没被读取（Simulation Space不是World/系统没播放/距离闸门）；检测数>0但传送=0说明穿越判定不命中（空间语义/门框范围/方向）。")]
+    public bool debugParticleTeleportLog = false;
+    private int particleDebugFrameCounter = 0;
+    private int particleDebugTestedCount = 0;
+    private int particleDebugTeleportCount = 0;
+    private int particleDebugStuckCount = 0;
+    private int particleDebugStuckSamples = 0;
+    private int particleDebugTruncatedSystems = 0;
+    private int particleDebugBounceCount = 0;
+    private int particleDebugWallAssistCount = 0;
+
+    private ParticleSystem.Particle[] particleTeleportBuffer;
+    // 实测位移配对组（与缓冲同尺寸同生灭）：上帧实测位置 + 上帧剩余寿命 + 粒子身份证(randomSeed) + 有效标记。
+    // randomSeed 是粒子出生时分配、终生不变的稳定ID，是跨帧识别"同一颗粒子"的可靠钥匙
+    // （旧的"归属系统"配对太弱：同系统里寿命相近的两颗粒子会被误认成同一颗）。
+    // GetParticles 的槽位顺序在有粒子死亡时会洗牌（Unity官方论坛实证），配对失败=槽位换了粒子
+    // → 走"首见"路径（出生反推 + 首见后侧兜底），保证零漏检。
+    // particlePrevValid 显式标记"本槽位有记录"（替代旧的 seed!=0 技巧，seed 恰好为 0 的粒子也能正常配对）。
+    private Vector3[] particlePrevPositions;
+    private uint[] particlePrevSeeds;
+    private bool[] particlePrevValid;
+    // 上帧实测速度：规则4"反弹捕获"用——配对粒子的门法向速度一帧内由"朝门"反转为"离门"，
+    // 说明它被门位置的墙体碰撞体弹回（碰撞粒子在穿越检测面前就反弹时的唯一可观测信号）。
+    private Vector3[] particlePrevVelocities;
+    private ParticleSystem[] discoveredParticleSystems;
+    private float particleDiscoveryTimer = 0f;
+
+    // 放置时发现：OverlapSphere 缓冲(512) + 注册表（满员自动翻倍扩容，十轮收尾）
+    private Collider[] discoveryOverlapBuffer;
+    private ParticleSystem[] placedDiscoverySystems;
+    private int placedDiscoveryCount = 0;
 
     [Header("════════════ 性能优化 ════════════")]
     public bool enableVisibilityOptimization = true;
@@ -143,6 +236,18 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private Transform[] cloneTargetPortals = new Transform[MAX_RIGIDBODY_CLONES]; // clone的"映射源门"：rb在这扇门一侧，clone被映射到对面
     private bool[] clonePendingActivation = new bool[MAX_RIGIDBODY_CLONES]; // 初次VRCInstantiate后先不激活，本帧末位置算好再激活
     private int cloneCount = 0;
+    // 材质跟随缓存：每个clone的渲染器配对（本体渲染器数组 <-> clone渲染器数组）。
+    // 创建时由 SyncCloneMaterials 写入，UpdateRigidbodyClonePoses 每帧用 RepointCloneMaterials 校正，
+    // 保证clone渲染器永远指向本体当前的材质实例（含动画控制器正在驱动的动画值，比如材质变色）。
+    // 为什么必须每帧校正而不是只在创建时赋值一次：StripCloneComponents 对clone身上的 Animator 调用的
+    // Destroy() 是【帧末延迟生效】的；Animator 真正被销毁时，Unity 会把被它动画过的渲染器材质
+    // 还原回文件夹里的默认资产，clone创建时那次材质赋值会被这次还原静默撤销。
+    private Renderer[][] cloneMaterialSyncOriginalRenderers = new Renderer[MAX_RIGIDBODY_CLONES][];
+    private Renderer[][] cloneMaterialSyncCloneRenderers = new Renderer[MAX_RIGIDBODY_CLONES][];
+    // MaterialPropertyBlock 同步缓冲：联网查证（Unity官方文档/论坛）确认，Animator 对材质属性的动画
+    // 不写进材质本身，而是通过渲染器的 MaterialPropertyBlock 应用——只共享材质引用永远拿不到动画值。
+    // 每帧对本体渲染器 GetPropertyBlock 进这个 block、再 SetPropertyBlock 到 clone 渲染器；block 复用，零GC。
+    private MaterialPropertyBlock clonePropertyBlockSyncBuffer;
     // clone 组件清理类型列表（Udon不支持自定义类上的static字段，改成实例字段，Start里初始化）
     private System.Type[] cloneDestroyTypes;
     // 复用刚体检测用的rbOverlapBuffer已经在ProcessRigidbodyForPortal里，clone更新只在那个流程里做
@@ -366,7 +471,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("传送 traveller 使用根骨/玩家位置而不是头部。推荐开启：歪头不会触发传送，TeleportTo 也不再从头部反推 root；关闭则回到旧头部模式。")]
     public bool useRootAsTraveller = true;
 
-    [Tooltip("混合 traveller：门平面内 XY 使用根骨/root，穿越深度 Z 使用头部/head。推荐开启：避免歪头横向影响，又避免地板/天花板门脚先触发导致头卡天花板。")]
+    [Tooltip("混合 traveller（推荐开启）：用【头部】判定是否穿过了门平面（检测点），用【根骨】计算实际传送落点（映射点）。所有门朝向统一标准：头穿过门平面→传送。关闭则退回检测与落点都用root的旧模式（脚过平面就触发，斜门下落易漏检）。")]
     public bool useHybridRootXYHeadZTraveller = true;
 
     [Tooltip("出口侧保险：如果计算出的出口 traveller 落在入口侧/门背面，则只沿出口法线拉回到正确侧一点点。主要防45度斜面/角色控制器误差导致来回鬼畜。")]
@@ -544,6 +649,21 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     {
         localPlayer = Networking.LocalPlayer;
 
+        // 粒子传送：开启自动收集时先跑一次初始发现
+        if (enableParticleTeleport && autoDiscoverParticleSystems)
+        {
+            DiscoverParticleSystems();
+            // 放置时发现：以两扇门的初始位置为中心各扫一遍
+            if (portalPlaneA != null) DiscoverParticleSystemsAround(portalPlaneA.position);
+            if (portalPlaneB != null) DiscoverParticleSystemsAround(portalPlaneB.position);
+        }
+        else
+        {
+            // 十一轮：堵死最后的静默路径——初始发现没跑时亲口说明原因，
+            // 避免"放置发现没工作又没日志"的排查死胡同
+            Debug.Log("[粒子传送][初始发现] 跳过：enableParticleTeleport=" + enableParticleTeleport + " autoDiscoverParticleSystems=" + autoDiscoverParticleSystems);
+        }
+
         // 初始化 clone 要销毁的组件类型列表（Udon不支持自定义static字段，Start里构建实例数组）
         cloneDestroyTypes = new System.Type[]
         {
@@ -656,12 +776,36 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (portalPlaneA == null || portalPlaneB == null) return;
 
         // 性能优化：本帧 speedBuffer 只算一次，供下面碰撞穿透判定复用（算法不变，见字段注释）。
-        cachedSpeedBufferThisFrame = Mathf.Clamp(localPlayer.GetVelocity().magnitude * Time.deltaTime * 2.0f, 0f, 1.5f);
+        // 八轮修复（玩家高速隧穿破案）：旧版把缓冲钳死在1.5米——下落速度>45m/s后缓冲停止生长，
+        // 每帧位移超过 noClipDepth+colliderDisableBuffer+1.5（约2米）时，玩家一帧从切层区外
+        // 直接跳过整个区域砸到地板/天花板碰撞体上：碰撞先于传送触发（停下）或胶囊隧穿薄板
+        // （掉出去）——正是"天花板+地板门无空气阻力无限坠落加速循环"高速断裂的病根。
+        // 现改为：缓冲 = 速度 × 步长 × 2，安全上限放到50米（仅防异常值，正常速度永不到顶）。
+        // 步长取 max(渲染dt, 物理dt)：真正解算碰撞的是物理步（VRChat的FixedUpdate锁刷新率），
+        // 高帧率下渲染dt小于物理步长，只用渲染dt会低估一帧的真实位移。
+        float stepDt = Mathf.Max(Time.deltaTime, Time.fixedDeltaTime);
+        float speedBuffer = localPlayer.GetVelocity().magnitude * stepDt * 2.0f;
+        cachedSpeedBufferThisFrame = Mathf.Clamp(speedBuffer, 0f, 50f);
 
         // 刚体传送处理（优先保证能检测到，先用高频）
         if (enableRigidbodyTeleport)
         {
             ProcessRigidbodyTravellers();
+        }
+
+        // 粒子传送（白名单 + 自动收集的系统，只处理离门足够近的）
+        if (enableParticleTeleport)
+        {
+            if (autoDiscoverParticleSystems)
+            {
+                particleDiscoveryTimer += Time.deltaTime;
+                if (particleDiscoveryTimer >= particleDiscoveryRefreshInterval)
+                {
+                    particleDiscoveryTimer = 0f;
+                    DiscoverParticleSystems();
+                }
+            }
+            ProcessParticleTeleports();
         }
 
         // PATCH: 延迟速度重发，防止 VRChat 接地吃速度
@@ -1144,38 +1288,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     }
 
     // ============================================================
-    // 配置快照导出：把当前 Inspector 关键配置 + A/B 门下所有子物体信息打印到控制台。
-    // 只在 Start() 里按 dumpConfigSnapshotOnStart 开关跑一次，不影响运行时（LateUpdate）性能。
-    // 不用 TPLog（会被 debugTeleportLog 总开关吃掉），直接 Debug.Log，保证这个开关独立生效。
+    // 配置快照导出（已停用）：历史上的调试输出已在 P2 清理中原子删除。
+    // dumpConfigSnapshotOnStart 字段保留（公共序列化字段，场景里可能存有值，删字段有风险），
+    // 对应调用链保留为一个显式的空实现。
+    // 原有的 DumpGlobalConfigSnapshot / DumpPortalGunConfigSnapshot / DumpPortalHierarchySnapshot /
+    // GetPortalShapeName 四个函数经排查全工程无任何调用点，已作为死代码删除。
     // ============================================================
-
-    string GetPortalShapeName(int shape)
-    {
-        if (shape == PORTAL_SHAPE_CIRCLE) return "圆形(0)";
-        if (shape == PORTAL_SHAPE_TRIANGLE) return "三角形(1)";
-        if (shape == PORTAL_SHAPE_BOX) return "方框(2)";
-        if (shape == PORTAL_SHAPE_UNSET) return "未设置(-1，跟随旧开关)";
-        return "未知值(" + shape + ")";
-    }
 
     void DumpConfigSnapshot()
     {
         // P2：已原子删除配置快照调试输出
-        return;
-    }
-
-    void DumpGlobalConfigSnapshot()
-    {
-        return;
-    }
-
-    void DumpPortalGunConfigSnapshot()
-    {
-        return;
-    }
-
-    void DumpPortalHierarchySnapshot(string label, Transform root, Transform plane, Camera cam, Material mat, int resolvedShape, int rawShape)
-    {
         return;
     }
 
@@ -1369,10 +1491,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return isPortalA ? previousTeleportLocalA : previousTeleportLocalB;
     }
 
-    bool IsFlatPortal(Transform portal)
+    /// "朝上门"判定（仅供内部使用）：法线有明显竖直分量（地板/天花板/45°斜坡等）。
+    /// 重要：本函数只用于 TeleportSebStyle 里选择【传送落点映射配方】，完全不参与触发判定
+    /// （触发检测点永远是 head，见 TravellerLocalForPortal），所以不需要也不提供可调阈值。
+    /// 0.5 常量（坡度约≤60°算朝上门）即使分类有偏差，也只影响落点微调的配方选择，
+    /// 出口侧保险(enableExitSideCorrection)会兜底，不会造成漏传/方向错误。
+    bool IsUpwardFacingPortal(Transform portal)
     {
         if (portal == null) return false;
-        return Mathf.Abs(Vector3.Dot(portal.forward, Vector3.up)) > flatPortalDotThreshold;
+        return Mathf.Abs(Vector3.Dot(portal.forward, Vector3.up)) > 0.5f;
     }
 
     Vector3 TravellerLocalForPortal(Transform portal, Vector3 rootWorld, Vector3 headWorld)
@@ -1390,17 +1517,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         Vector3 headLocal = LocalPointForPortal(portal, headWorld);
 
-        if (IsFlatPortal(portal))
-        {
-            // 地板/天花板：门面内 XY 用 root，穿越深度 Z 用 head。
-            // 这样不会脚先传导致头卡天花板，也不会歪头改变门面内落点。
-            return new Vector3(rootLocal.x, rootLocal.y, headLocal.z);
-        }
-
-        // 墙面：门面横向 X 用 root，门面高度 Y 用 head，穿越深度 Z 用 root。
-        // 原因：VRCPlayerApi.GetPosition() 更像脚底/胶囊底部；若墙面门 localY 用 root，普通走门会因 y 太低而在门框外。
-        // 但深度 Z 仍用 root，避免玩家只把头探过墙就触发整个人传送。
-        return new Vector3(rootLocal.x, headLocal.y, rootLocal.z);
+        // 统一检测规则（与门朝向无关）：穿越检测点恒为【head】——头穿过门平面即传送，
+        // 与玩家视角一致（SebLague 原版也是相机过平面触发）。地板/天花板/斜坡/墙面同一标准，
+        // 不存在"按门的角度决定提前/延后传送"的机制。
+        // 刻意不做 root XY + head Z 之类的混搭：斜向门（如45°斜坡）上 head 与 root 的
+        // 门平面内 XY 会相差"玩家竖直身高在门平面上的投影"（45°约1.1米）；混搭点不在身体上，
+        // 直直下落穿斜门时检测 XY 会偏离头部实际穿平面位置约1.1米 → 门框检查失败 → 穿模漏检。
+        // 纯 head 点在任何朝向下都无歧义：XY=头穿平面的位置，Z=头的深度。
+        // 实际传送落点由 TeleportPointLocalForPortal(root) 单独计算：头判定穿越、根骨算落点。
+        return headLocal;
     }
 
     Vector3 TeleportPointLocalForPortal(Transform portal, Vector3 rootWorld, Vector3 headWorld)
@@ -1505,27 +1630,46 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         if (!alreadyActive || oldCollider != markedCollider)
         {
-            // 如果传送门重新打到了新物体，先尽量把旧物体恢复，避免旧物体永久停在 29。
+            // 如果传送门重新打到了新物体，先尽量把旧物体恢复，避免旧物体永久停在穿透层。
             if (alreadyActive && oldCollider != null && oldCollider != markedCollider)
             {
                 GameObject oldObj = oldCollider.gameObject;
-                if (oldObj != null && rememberedLayer >= 0 && oldObj.layer == playerPassThroughLayer)
+                // rememberedLayer 万一被污染成穿透层本身，优先用 clip volume 追踪表里的真原始值兜底
+                int restoreTo = rememberedLayer;
+                if (restoreTo == playerPassThroughLayer)
                 {
-                    oldObj.layer = rememberedLayer;
+                    int clipOriginal = FindClipVolumeOriginalLayer(oldCollider);
+                    if (clipOriginal >= 0 && clipOriginal != playerPassThroughLayer) restoreTo = clipOriginal;
+                }
+                if (oldObj != null && restoreTo >= 0 && oldObj.layer == playerPassThroughLayer)
+                {
+                    oldObj.layer = restoreTo;
                 }
             }
 
             int original = obj.layer;
-            // 共享 Collider 时，后进入的一侧可能看到的已经是 29；这时沿用另一侧记录的原始 layer。
+            // 看到的已经是穿透层：真正的原始 layer 在"当初切它的那个系统"手里，按可信度依次取回：
+            // 1) 另一侧 markedCollider 的记录（共享 Collider 场景：A/B 打在同一个碰撞体上）；
+            // 2) Clip Volume 追踪表（剪刀穿模场景：本门 markedCollider 被对面门的 clipVolume 先切了，
+            //    典型：A门clipVolume包住穿模过来的、B门所在的斜面；传送同帧的 afterTeleport
+            //    调用发生在 clipVolume 还原之前，必然读到穿透层）。
+            // 都取不到才退而记录穿透层本身（此时场景里它大概率本来就是穿透层）。
+            // 历史教训：把穿透层误记成"原始layer"，离开时"还原"成穿透层，物体永远回不到默认层。
             if (original == playerPassThroughLayer)
             {
-                if (isPortalA && layerOverrideBActive && layerOverrideColliderB == markedCollider && originalLayerB >= 0)
+                if (isPortalA && layerOverrideBActive && layerOverrideColliderB == markedCollider && originalLayerB >= 0 && originalLayerB != playerPassThroughLayer)
                 {
                     original = originalLayerB;
                 }
-                else if (!isPortalA && layerOverrideAActive && layerOverrideColliderA == markedCollider && originalLayerA >= 0)
+                else if (!isPortalA && layerOverrideAActive && layerOverrideColliderA == markedCollider && originalLayerA >= 0 && originalLayerA != playerPassThroughLayer)
                 {
                     original = originalLayerA;
+                }
+
+                if (original == playerPassThroughLayer)
+                {
+                    int clipOriginal = FindClipVolumeOriginalLayer(markedCollider);
+                    if (clipOriginal >= 0 && clipOriginal != playerPassThroughLayer) original = clipOriginal;
                 }
             }
             SetLayerOverrideState(isPortalA, true, original, markedCollider);
@@ -1566,6 +1710,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         int restoreLayer = GetOriginalLayer(isPortalA);
         if (restoreLayer < 0) restoreLayer = solidCollisionLayer;
+
+        // 防御兜底：记录值万一被污染成穿透层本身（"还原"等于没还原、物体永远卡在穿透层），
+        // 再查一次 clip volume 追踪表里的真原始值。正常路径下记录时已修正，这里防的是残余竞态。
+        if (restoreLayer == playerPassThroughLayer)
+        {
+            int clipOriginal = FindClipVolumeOriginalLayer(markedCollider);
+            if (clipOriginal >= 0 && clipOriginal != playerPassThroughLayer) restoreLayer = clipOriginal;
+        }
 
         if (obj.layer == playerPassThroughLayer)
         {
@@ -1747,15 +1899,26 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
             else
             {
-                // 2. 扫掠补救：线段与 z=±triggerOffset 平面求交，防止高速隧穿漏检
+                // 2. 扫掠补救：线段与 z=±triggerOffset 平面求交，防止高速隧穿漏检。
+                // 除了"从平面外侧进入"的经典情况，还覆盖【死区穿越完成】情况：
+                // 上一帧 traveller 恰好落在死区(|z|<=offset，side=0)时，经典路径(oldSide!=0)
+                // 和"必须从外侧进入"的旧扫掠门槛都哑火，玩家能整段穿过门而不触发（下落穿过
+                // 斜向门时高发：穿越点XY在门框外、滑进死区后XY才进门框）。此时只要 lastBodySide
+                // 明确记录了来向，就承认这次"从死区穿出触发平面"是一次完整穿越。
+                // lastBodySide 门槛同时防误触发：传送出口恰好落在触发平面边界时，
+                // TeleportSebStyle 会把 lastBodySide 种成出口侧方向，朝远离门的方向运动
+                // 不会满足"来向相反"，不会立刻反向重传。
                 float prevZ = previousTravellerLocal.z;
                 float currZ = currentTravellerLocal.z;
                 float dz = currZ - prevZ;
                 if (Mathf.Abs(dz) > 0.0001f)
                 {
-                    // 检查 z = +triggerOffset（从正侧进入）
+                    // 检查 z = +triggerOffset：a) 从正侧外侧进入；b) 死区内穿出且来向是负侧(lastBodySide==-1)
+                    bool prevInDeadZone = prevZ > -teleportTriggerOffset && prevZ < teleportTriggerOffset;
+                    bool plusFromOutside = prevZ > teleportTriggerOffset;
+                    bool plusFromDeadZone = prevInDeadZone && lastBodySide == -1;
                     float tPlus = (teleportTriggerOffset - prevZ) / dz;
-                    if (tPlus >= 0f && tPlus <= 1f && prevZ > teleportTriggerOffset)
+                    if (tPlus >= 0f && tPlus <= 1f && (plusFromOutside || plusFromDeadZone))
                     {
                         crossingT = Mathf.Clamp01(tPlus);
                         crossingLocal = Vector3.Lerp(previousTravellerLocal, currentTravellerLocal, crossingT);
@@ -1766,11 +1929,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                             newSide = currZ < -teleportTriggerOffset ? -1 : 0;
                         }
                     }
-                    // 检查 z = -triggerOffset（从负侧进入）
+                    // 检查 z = -triggerOffset：a) 从负侧外侧进入；b) 死区内穿出且来向是正侧(lastBodySide==1)
                     if (!crossedPlane)
                     {
+                        bool minusFromOutside = prevZ < -teleportTriggerOffset;
+                        bool minusFromDeadZone = prevInDeadZone && lastBodySide == 1;
                         float tMinus = (-teleportTriggerOffset - prevZ) / dz;
-                        if (tMinus >= 0f && tMinus <= 1f && prevZ < -teleportTriggerOffset)
+                        if (tMinus >= 0f && tMinus <= 1f && (minusFromOutside || minusFromDeadZone))
                         {
                             crossingT = Mathf.Clamp01(tMinus);
                             crossingLocal = Vector3.Lerp(previousTravellerLocal, currentTravellerLocal, crossingT);
@@ -1861,7 +2026,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Vector3 localVelAtCrossing = LocalDirForPortal(fromPlane, velAtCrossing);
         localVelAtCrossing = ApplyOptionalMomentumSnapping(fromPlane, toPlane, velAtCrossing, localVelAtCrossing);
 
-        bool flatHybridTraveller = useRootAsTraveller && useHybridRootXYHeadZTraveller && IsFlatPortal(fromPlane);
+        bool flatHybridTraveller = useRootAsTraveller && useHybridRootXYHeadZTraveller && IsUpwardFacingPortal(fromPlane);
 
         // flat hybrid：用 root XY（无漂移）+ head Z（正确穿越深度）构造混合映射点。
         //   旧版全用 crossingLocal（head 点）→ XY 有 headFromRoot 漂移。
@@ -1927,9 +2092,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 // mappedCrossingLocal = rootXY + headZ → 混合点。
                 // newMappedPointPos 是混合点的世界坐标：门面内位置来自 root（无漂移），深度来自 head。
-                if (IsFlatPortal(toPlane))
+                if (IsUpwardFacingPortal(toPlane))
                 {
-                    // 出口也是平面门：沿出口法线把深度从 head 调整到 root。
+                    // 出口也是朝上门（地板/天花板/斜坡）：沿出口法线把深度从 head 调整到 root。
                     // headFromRoot 在出口法线方向的分量 = head 和 root 的深度差。
                     float hfrDepth = Vector3.Dot(headFromRoot, toPlane.forward);
                     newTeleportPos = newMappedPointPos - toPlane.forward * hfrDepth;
@@ -2045,7 +2210,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             Vector3 localToB_afterTeleport = TravellerLocalForPortal(portalPlaneB, newTeleportPos, cameraHeadAfterTeleport);
             Vector3 teleportLocalToB_afterTeleport = TeleportPointLocalForPortal(portalPlaneB, newTeleportPos, cameraHeadAfterTeleport);
-            lastBodySideB = SideFromLocalZ(localToB_afterTeleport.z);
+            // 出口修正可能把落点精确推到触发平面边界上，SideFromLocalZ 边界返回 0；
+            // 此时必须用预期出口侧种子兜底，否则下一帧经典检测 oldSide==0 哑火，
+            // 玩家可能直接穿过出口门所在平面而不触发（下落/低速场景高发）。
+            int spawnSideB = SideFromLocalZ(localToB_afterTeleport.z);
+            lastBodySideB = spawnSideB != 0 ? spawnSideB : (entryOldSide == 0 ? 1 : entryOldSide);
             SetTravellerTracking(true, false, TravellerLocalForPortal(portalPlaneA, playerRoot, playerHead));
             SetTeleportTrackingLocal(true, TeleportPointLocalForPortal(portalPlaneA, playerRoot, playerHead));
             SetTravellerTracking(false, true, localToB_afterTeleport);
@@ -2070,7 +2239,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             Vector3 localToA_afterTeleport = TravellerLocalForPortal(portalPlaneA, newTeleportPos, cameraHeadAfterTeleport);
             Vector3 teleportLocalToA_afterTeleport = TeleportPointLocalForPortal(portalPlaneA, newTeleportPos, cameraHeadAfterTeleport);
-            lastBodySideA = SideFromLocalZ(localToA_afterTeleport.z);
+            // 同 fromAtoB 分支：边界落点 side==0 时用预期出口侧种子兜底。
+            int spawnSideA = SideFromLocalZ(localToA_afterTeleport.z);
+            lastBodySideA = spawnSideA != 0 ? spawnSideA : (entryOldSide == 0 ? 1 : entryOldSide);
             SetTravellerTracking(false, false, TravellerLocalForPortal(portalPlaneB, playerRoot, playerHead));
             SetTeleportTrackingLocal(false, TeleportPointLocalForPortal(portalPlaneB, playerRoot, playerHead));
             SetTravellerTracking(true, true, localToA_afterTeleport);
@@ -2185,7 +2356,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         SyncPortalRenderTextureBindings();
 
-        // 头在传送门体积内时：跳过 oblique 裁剪 + 强制渲染（Seb 风格直接算，不用可调阈值）。
+        // 头在传送门体积内时：跳过 oblique 斜裁剪（历史补丁：避免贴近裁剪面时法线翻转导致
+        // 反向裁切/画面消失）。已知并接受副作用：贴门时门后墙背面区域可能漏进传送门画面；
+        // 实测(2026-08-15)贴门强制斜裁剪的画面更糟，故锁定跳过行为，不再提供开关。
+        // teleportTriggerOffset 保持 ≥0.1（默认0.3）可让正常游玩不进入贴面退化区（见交接文档）。
         bool headInsideVolumeA = IsHeadInsidePortalVolume(portalPlaneA, viewerPos, ResolvePortalShape(true));
         bool headInsideVolumeB = IsHeadInsidePortalVolume(portalPlaneB, viewerPos, ResolvePortalShape(false));
 
@@ -2853,6 +3027,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
+    // 刚体彻底离开 A/B 两侧追踪时，把材质 renderQueue 还原回 3000（兑现本小节"离开还原"的注释承诺）。
+    // 之前只进不出：刚体离开门区域后 renderQueue 永远停在 3001，直到世界重载。
+    // 另一扇门仍在追踪时（比如刚体刚穿门、对面门已接管）不能还原，否则遮罩效果断裂。
+    private void RestorePortalOverlayIfUntracked(Rigidbody rb)
+    {
+        if (rb == null) return;
+        if (IsRigidbodyTrackedByEitherPortal(rb)) return;
+        RemovePortalOverlayFromGameObject(rb.gameObject);
+    }
+
     // ============================================================
     // 刚体传送核心：SebLague traveller 逻辑的 Udon 固定数组版
     // ============================================================
@@ -2864,6 +3048,698 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 等价于 Seb 原版每个 Portal 在 LateUpdate 里 HandleTravellers。
         ProcessRigidbodyForPortal(true);
         ProcessRigidbodyForPortal(false);
+    }
+
+    // ============================================================
+    // 粒子传送：白名单系统里穿过门平面的粒子，位置+速度按门映射传到另一侧。
+    // 设计要点（六轮，window=0 零漏检架构）：
+    // - 身份配对：randomSeed（出生时分配、终生不变的稳定ID）按槽位认同"同一颗粒子"；
+    //   GetParticles 槽位顺序在粒子死亡时会洗牌（Unity官方论坛实证），配对失败即走"首见"路径。
+    // - 零漏检三条规则：
+    //   规则1 本帧穿越：配对实测位移（或出生反推）线段与检测面符号翻转求交——任意速度必抓；
+    //         符号距离插值对退化线段也成立（门移动扫过静止粒子照样抓）；双向都收。
+    //   规则2 后侧追补窗（retroWindow>0 时）：已在检测面后侧且深度<=窗值 → 补抓。
+    //         （六轮修正：旧版窗符号写反，抓的是门前侧靠近的粒子，后侧漏检从来抓不到。）
+    //   规则3 首见后侧兜底：未配对粒子当前位置已在检测面后侧且在门框内 → 立即传送——
+    //         覆盖一切"穿越那一刻无记录"的情况（出生即穿越/出生在墙后/注册晚了/槽位洗牌/缓冲扩容帧）。
+    //   规则4 反弹捕获（七轮，带碰撞粒子专用）：配对粒子门法向速度一帧内反转（朝门→离门）
+    //         且在门框内近门平面 → 它被门的墙碰撞体弹回。检测面外推<粒子碰撞半径时粒子
+    //         数学上永远穿不过检测面，反弹信号就是"到过门口"的铁证；用反弹前速度映射，
+    //         锚点投影到检测面防乒乓。继承 Unity 粒子碰撞的防隧穿，与速度无关。
+    // - 缓冲自动扩容：活粒子顶满缓冲 → 自动翻倍补读，超出部分不再被永久漏掉。
+    // - 一帧至多一次穿越：两门都命中取"门框内实穿越里 t 最早的"——先碰先进（九轮修复：
+    //   旧"取更晚"在剪刀重叠门+高速长线段下把粒子按错误的门映射，是高速滞留隧穿真凶）。
+    // - 矩阵每帧只构造4次（A/B各一套worldToLocal/localToWorld，与 useScaleFreePortalMatrix
+    //   的数学完全一致），粒子循环里只有 MultiplyPoint/MultiplyVector，无 TRS/inverse。
+    // - 性能闸门：白名单/收集根自动收集 + 距离闸门 + 缓冲初始大小（自动扩容）。
+    // - 检测面沿法线外推 particleTeleportPlaneOffset：贴墙/地板门 + 带碰撞粒子的场景，
+    //   粒子会被墙体在门平面处弹走永远穿不过平面，外推检测面让粒子撞墙前就传送。
+    // - 空间语义：默认按 World 空间处理；Simulation Space = Local 的系统（激光等）拖进
+    //   particleLocalSpaceSystems 清单即支持——判定用世界坐标，写回转回局部坐标。
+    // ============================================================
+
+    private void ProcessParticleTeleports()
+    {
+        // 十一轮修：旧门控"白名单为空就整体return"是自动收集功能加入前的遗留——
+        // 用户清空白名单只靠自动收集时，已注册系统全都不被处理、诊断日志也静默消失。
+        // 现在：四路注册源全空才跳过。
+        bool hasWhitelist = portalParticleSystems != null && portalParticleSystems.Length > 0;
+        bool hasDiscovered = discoveredParticleSystems != null && discoveredParticleSystems.Length > 0;
+        bool hasPlaced = placedDiscoverySystems != null && placedDiscoveryCount > 0;
+        if (!hasWhitelist && !hasDiscovered && !hasPlaced) return;
+        if (portalPlaneA == null || portalPlaneB == null) return;
+
+        int bufferSize = Mathf.Max(32, particleTeleportBufferSize);
+        if (particleTeleportBuffer == null || particleTeleportBuffer.Length < bufferSize)
+        {
+            GrowParticleArrays(bufferSize);
+        }
+
+        float dt = Time.deltaTime;
+        if (dt <= 0f) return;
+
+        // 本帧门户矩阵缓存（scale-free，与 LocalPointForPortal 的默认数学一致）
+        Matrix4x4 worldToLocalA = Matrix4x4.TRS(portalPlaneA.position, portalPlaneA.rotation, Vector3.one).inverse;
+        Matrix4x4 localToWorldA = Matrix4x4.TRS(portalPlaneA.position, portalPlaneA.rotation, Vector3.one);
+        Matrix4x4 worldToLocalB = Matrix4x4.TRS(portalPlaneB.position, portalPlaneB.rotation, Vector3.one).inverse;
+        Matrix4x4 localToWorldB = Matrix4x4.TRS(portalPlaneB.position, portalPlaneB.rotation, Vector3.one);
+        int shapeA = ResolvePortalShape(true);
+        int shapeB = ResolvePortalShape(false);
+        float maxDistSqr = particleTeleportMaxDistance * particleTeleportMaxDistance;
+
+        for (int s = 0; s < portalParticleSystems.Length; s++)
+        {
+            ProcessSingleParticleSystem(portalParticleSystems[s], worldToLocalA, localToWorldA, worldToLocalB, localToWorldB, shapeA, shapeB, dt, maxDistSqr);
+        }
+        // 自动收集列表与手动白名单分开遍历；万一重复，第二遍看到的是已传送后的状态，不会二次传送
+        if (discoveredParticleSystems != null)
+        {
+            for (int s = 0; s < discoveredParticleSystems.Length; s++)
+            {
+                ProcessSingleParticleSystem(discoveredParticleSystems[s], worldToLocalA, localToWorldA, worldToLocalB, localToWorldB, shapeA, shapeB, dt, maxDistSqr);
+            }
+        }
+        // 放置时发现注册表（第三路）
+        if (placedDiscoverySystems != null)
+        {
+            for (int s = 0; s < placedDiscoveryCount; s++)
+            {
+                ProcessSingleParticleSystem(placedDiscoverySystems[s], worldToLocalA, localToWorldA, worldToLocalB, localToWorldB, shapeA, shapeB, dt, maxDistSqr);
+            }
+        }
+
+        // 诊断日志：每60帧汇总一次，定位"隧穿不传送"卡在哪一环
+        if (debugParticleTeleportLog)
+        {
+            particleDebugFrameCounter++;
+            if (particleDebugFrameCounter >= 60)
+            {
+                particleDebugFrameCounter = 0;
+                int rootListCount = discoveredParticleSystems != null ? discoveredParticleSystems.Length : 0;
+                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（其中反弹捕获 " + particleDebugBounceCount + "、撞墙反弹 " + particleDebugWallAssistCount + "），过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：白名单" + portalParticleSystems.Length + " + root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容）");
+                particleDebugTestedCount = 0;
+                particleDebugTeleportCount = 0;
+                particleDebugBounceCount = 0;
+                particleDebugWallAssistCount = 0;
+                particleDebugStuckCount = 0;
+                particleDebugStuckSamples = 0;
+                particleDebugTruncatedSystems = 0;
+            }
+        }
+    }
+
+    // 单个粒子系统一帧的穿越检测与传送。
+    private void ProcessSingleParticleSystem(ParticleSystem ps, Matrix4x4 worldToLocalA, Matrix4x4 localToWorldA, Matrix4x4 worldToLocalB, Matrix4x4 localToWorldB, int shapeA, int shapeB, float dt, float maxDistSqr)
+    {
+        if (ps == null) return;
+        // 排除根拦截（十一轮）：无论该系统从哪条路径注册进来（白名单/root扫描/放置发现），
+        // 只要挂在排除根（默认含传送枪）下就不处理——枪的激光特效被传送会鬼畜。
+        if (IsParticleSystemExcluded(ps)) return;
+
+        // 距离闸门：离两扇门都太远 → 整个系统跳过
+        Vector3 sysPos = ps.transform.position;
+        if ((sysPos - portalPlaneA.position).sqrMagnitude > maxDistSqr &&
+            (sysPos - portalPlaneB.position).sqrMagnitude > maxDistSqr)
+        {
+            return;
+        }
+
+        int aliveCount = ps.GetParticles(particleTeleportBuffer);
+        if (aliveCount <= 0) return;
+        // 缓冲自动扩容：活粒子顶满缓冲时超出部分会被完全漏掉（不是晚一帧，是永久漏）。
+        // 扩容翻倍后补读；新缓冲配对记录清零，本帧全体粒子走"首见"规则（规则3兜住后侧），零漏检。
+        if (aliveCount >= particleTeleportBuffer.Length)
+        {
+            if (debugParticleTeleportLog) particleDebugTruncatedSystems++;
+            GrowParticleArrays(aliveCount * 2);
+            aliveCount = ps.GetParticles(particleTeleportBuffer);
+            if (aliveCount <= 0) return;
+        }
+
+        bool changed = false;
+        for (int i = 0; i < aliveCount; i++)
+        {
+            ParticleSystem.Particle p = particleTeleportBuffer[i];
+            uint seed = p.randomSeed;
+
+            // Local空间系统（激光等）：粒子位置/速度存的是系统局部坐标，先转世界坐标再判定；
+            // World空间系统零开销直通。
+            bool localMode = IsLocalSpaceParticleSystem(ps);
+            Transform sysT = localMode ? ps.transform : null;
+            Vector3 curPos = localMode ? sysT.TransformPoint(p.position) : p.position;
+            Vector3 worldVel = localMode ? sysT.TransformVector(p.velocity) : p.velocity;
+
+            // 身份配对（randomSeed 身份证）：本槽位上帧是同一颗粒子 → 实测位置当线段起点（精确，任意速度必抓）。
+            bool paired = particlePrevValid != null && particlePrevValid[i] && particlePrevSeeds[i] == seed;
+
+            Vector3 segStart;
+            if (paired)
+            {
+                segStart = particlePrevPositions[i];
+            }
+            else
+            {
+                // 首见/槽位洗牌：用速度反推线段起点。
+                //   新生粒子（age<=0.5秒）：反推到出生瞬间——恒速粒子精确，抓"出生当帧就已越过
+                //   检测面的高速粒子"；即使受力模块让反推偏离，规则3首见后侧兜底也会收走。
+                //   老粒子：只反推一帧——受力曲线长时反推会产生幻影线段，宁可保守；漏了由规则3兜。
+                float age = p.startLifetime - p.remainingLifetime;
+                float span = (age >= 0f && age <= 0.5f) ? Mathf.Max(age, dt) : dt;
+                segStart = curPos - worldVel * span;
+            }
+
+            if (debugParticleTeleportLog) particleDebugTestedCount++;
+
+            float tA;
+            Vector3 hitA;
+            int kindA;
+            bool crossA = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneA, worldToLocalA, shapeA, out tA, out hitA, out kindA);
+            float tB;
+            Vector3 hitB;
+            int kindB;
+            bool crossB = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneB, worldToLocalB, shapeB, out tB, out hitB, out kindB);
+
+            // 一帧至多一次传送——先碰到哪扇门就进哪扇（九轮关键修复，"取更晚"是高速漏检真凶）：
+            // 剪刀形重叠门 + 高速长线段时，一根线段会同帧穿过两扇门的平面。粒子物理上是
+            // 先进了 t 更小的那扇门——旧逻辑取更晚的，把它按另一扇门映射，落点被甩到
+            // 某扇门后侧深处，此后配对成立、四条规则全不满足 → 永久滞留（可见隧穿）。
+            // 速度10线段短很少双穿（几乎不漏）、速度100线段1.7米频繁双穿（大量漏）——与实测完全吻合。
+            // 优先级：门框内实穿越(kind 1)取最早；两门都不是实穿越时，兜底命中(kind 2)也取最早。
+            bool doA = false;
+            bool doB = false;
+            if (crossA || crossB)
+            {
+                bool solidA = crossA && kindA == 1;
+                bool solidB = crossB && kindB == 1;
+                if (solidA || solidB)
+                {
+                    doA = solidA && (!solidB || tA <= tB);
+                    doB = solidB && !doA;
+                }
+                else
+                {
+                    doA = crossA && (!crossB || tA <= tB);
+                    doB = crossB && !doA;
+                }
+            }
+
+            // 本帧局部坐标（规则3/规则4/诊断共用，每粒子只算一次）
+            Vector3 localCurA = worldToLocalA.MultiplyPoint(curPos);
+            Vector3 localCurB = worldToLocalB.MultiplyPoint(curPos);
+
+            // 规则3 首见后侧兜底（window=0 零漏检的安全网）：未配对粒子当前位置已在
+            // 检测面后侧且在门框内 → 立即传送。覆盖一切"穿越那一刻无记录"的情况：
+            // 出生即越过检测面、出生在墙后（发射器在墙背面）、注册晚了、GetParticles 槽位洗牌、
+            // 缓冲扩容帧。纯位置判定，不依赖任何历史，不依赖窗值。
+            // 无乒乓风险：刚传送完的粒子落在出口门【前侧】（房间侧）且沿映射速度远离，永不落进本规则。
+            if (!doA && !doB && !paired)
+            {
+                bool behindA = localCurA.z <= particleTeleportPlaneOffset && LocalPointInPortalRect(localCurA, shapeA);
+                bool behindB = localCurB.z <= particleTeleportPlaneOffset && LocalPointInPortalRect(localCurB, shapeB);
+                // 两门都命中（剪刀形重叠门）时，取穿入深度更深的一扇：更深=更"已经过去了"
+                if (behindA && (!behindB || localCurA.z <= localCurB.z))
+                {
+                    doA = true;
+                    hitA = curPos;
+                    tA = 1f;
+                }
+                else if (behindB)
+                {
+                    doB = true;
+                    hitB = curPos;
+                    tB = 1f;
+                }
+            }
+
+            // 规则4 反弹捕获（七轮新增，继承 Unity 粒子碰撞的防隧穿）：
+            // 配对粒子的门法向速度本帧发生反转（朝门→离门）且当前位置在门平面附近的门框内
+            // → 它被门位置的墙体碰撞体弹回了。当检测面外推距离 < 粒子碰撞半径（≈粒子尺寸×
+            // Collision模块Radius Scale，官方文档：碰撞球半径按粒子实际尺寸的百分比）时，
+            // 带碰撞粒子在数学上永远穿不过检测面，规则1/2/3 全部失效——反弹本身就是"到达门面"
+            // 的最强信号，与速度无关（这正是用户实测"速度100开碰撞绝不穿墙"的同款机制：
+            // 碰撞引擎替我们把"到过门口"压缩成了一帧内清晰的速度反转）。
+            // 细节：
+            // - 速度映射用反弹【前】的速度（当作没反弹直接穿过去）：出口速度才会离开门飞；
+            //   用反弹后速度映射，出口粒子会一头扎进出口墙。
+            // - 位置锚点投影到检测面上：保证落点恒在出口检测面前侧，杜绝乒乓。
+            // - 帧内顺序（官方执行顺序图）：粒子模拟在所有脚本 Update 之后——本帧读到的反转
+            //   是上一帧模拟产生的反弹，粒子在墙边最多可见一帧即被收走。
+            Vector3 mappingVel = worldVel;
+            if (!doA && !doB && paired)
+            {
+                float vnPrevA = Vector3.Dot(particlePrevVelocities[i], portalPlaneA.forward);
+                float vnCurA = Vector3.Dot(worldVel, portalPlaneA.forward);
+                float vnPrevB = Vector3.Dot(particlePrevVelocities[i], portalPlaneB.forward);
+                float vnCurB = Vector3.Dot(worldVel, portalPlaneB.forward);
+                bool bounceA = vnPrevA < -0.1f && vnCurA > 0.1f && localCurA.z > -0.2f && localCurA.z < particleTeleportPlaneOffset + 1f && LocalPointInPortalRect(localCurA, shapeA);
+                bool bounceB = vnPrevB < -0.1f && vnCurB > 0.1f && localCurB.z > -0.2f && localCurB.z < particleTeleportPlaneOffset + 1f && LocalPointInPortalRect(localCurB, shapeB);
+                if (bounceA || bounceB)
+                {
+                    // 两门都命中（剪刀形重叠门）时，取法向速度反转更剧烈的一扇
+                    bool pickA = bounceA && (!bounceB || (vnCurA - vnPrevA) >= (vnCurB - vnPrevB));
+                    Vector3 localCur = pickA ? localCurA : localCurB;
+                    Matrix4x4 l2w = pickA ? localToWorldA : localToWorldB;
+                    Vector3 anchorWorld = l2w.MultiplyPoint(new Vector3(localCur.x, localCur.y, particleTeleportPlaneOffset));
+                    mappingVel = particlePrevVelocities[i];
+                    if (pickA)
+                    {
+                        doA = true;
+                        hitA = anchorWorld;
+                        tA = 1f;
+                    }
+                    else
+                    {
+                        doB = true;
+                        hitB = anchorWorld;
+                        tB = 1f;
+                    }
+                    if (debugParticleTeleportLog) particleDebugBounceCount++;
+                }
+            }
+
+            bool wasTeleported = false;
+            bool wasBounced = false;
+
+            // 规则5 撞墙近似反弹（十二轮）：没有任何传送命中 + 开关开启时，
+            // 检查本帧线段是否"前→后穿过检测面且穿越点在门框外"——那就是粒子在高速下
+            // 隧穿门所在墙面的瞬间（Unity离散碰撞拦不住的速度区间由我们接管）：
+            // 镜像反弹，粒子永远不会穿过墙面。先A后B，弹过一边就不再弹另一边。
+            if (!doA && !doB && particleWallBounceAssist)
+            {
+                if (TryWallAssistBounce(ref p, segStart, curPos, worldVel, portalPlaneA, worldToLocalA, shapeA))
+                {
+                    wasBounced = true;
+                    if (debugParticleTeleportLog) particleDebugWallAssistCount++;
+                }
+                else if (TryWallAssistBounce(ref p, segStart, curPos, worldVel, portalPlaneB, worldToLocalB, shapeB))
+                {
+                    wasBounced = true;
+                    if (debugParticleTeleportLog) particleDebugWallAssistCount++;
+                }
+            }
+
+            if (doA)
+            {
+                TeleportParticleThroughPortal(ref p, hitA, mappingVel, tA, dt, worldToLocalA, localToWorldB);
+                wasTeleported = true;
+                if (debugParticleTeleportLog) particleDebugTeleportCount++;
+            }
+            else if (doB)
+            {
+                TeleportParticleThroughPortal(ref p, hitB, mappingVel, tB, dt, worldToLocalB, localToWorldA);
+                wasTeleported = true;
+                if (debugParticleTeleportLog) particleDebugTeleportCount++;
+            }
+
+            // 统一写回（十四轮重构）：传送/反弹都写成【世界坐标】结果；
+            // Local空间系统在此刻转回系统局部坐标再入缓冲，配对记录则永远存世界坐标。
+            Vector3 finalWorldPos = curPos;
+            Vector3 finalWorldVel = worldVel;
+            if (wasTeleported || wasBounced)
+            {
+                finalWorldPos = p.position;
+                finalWorldVel = p.velocity;
+                if (localMode)
+                {
+                    p.position = sysT.InverseTransformPoint(p.position);
+                    p.velocity = sysT.InverseTransformVector(p.velocity);
+                }
+                particleTeleportBuffer[i] = p;
+                changed = true;
+            }
+
+            // 诊断探针：
+            // 滞留计数 = 在实际平面(z<0)后侧未被传送。六轮后此值应收敛到接近0（只剩门框外的后侧粒子）；
+            // 样本只采"检测面后侧且深度浅(0~0.5m)"的未传送粒子——那才是刚穿越却没被传送的真隧穿嫌疑。
+            if (debugParticleTeleportLog && !wasTeleported)
+            {
+                float zA = localCurA.z;
+                float zB = localCurB.z;
+                if (zA < -0.01f || zB < -0.01f) particleDebugStuckCount++;
+
+                float off = particleTeleportPlaneOffset;
+                bool suspectA = zA <= off && zA > off - 0.5f;
+                bool suspectB = zB <= off && zB > off - 0.5f;
+                if ((suspectA || suspectB) && particleDebugStuckSamples < 6)
+                {
+                    particleDebugStuckSamples++;
+                    bool inRectA = LocalPointInPortalRect(localCurA, shapeA);
+                    bool inRectB = LocalPointInPortalRect(localCurB, shapeB);
+                    Debug.Log("[粒子传送][漏检嫌疑] zA=" + zA.ToString("F3") + " zB=" + zB.ToString("F3") + " 框内A=" + inRectA + " 框内B=" + inRectB + " 配对=" + paired + " 速度=" + worldVel.magnitude.ToString("F1") + " 种子=" + seed.ToString());
+                }
+            }
+
+            // 记录本帧实测数据（世界坐标）：刚传送/反弹的用映射后落点，下帧线段从出口侧起算
+            particlePrevPositions[i] = finalWorldPos;
+            particlePrevSeeds[i] = seed;
+            particlePrevVelocities[i] = finalWorldVel;
+            particlePrevValid[i] = true;
+        }
+
+        // 只有真的改过才写回，省掉无穿越帧的 SetParticles 开销
+        if (changed)
+        {
+            ps.SetParticles(particleTeleportBuffer, aliveCount);
+        }
+    }
+
+    // 粒子数组扩容（五个数组同生灭）：扩容后配对记录清零，本帧全体粒子按"首见"规则处理，零漏检。
+    private void GrowParticleArrays(int newSize)
+    {
+        int size = Mathf.Max(32, newSize);
+        particleTeleportBuffer = new ParticleSystem.Particle[size];
+        particlePrevPositions = new Vector3[size];
+        particlePrevSeeds = new uint[size];
+        particlePrevValid = new bool[size];
+        particlePrevVelocities = new Vector3[size];
+    }
+
+    // 自动收集：从两类根收集粒子系统，保留原点离任一门 particleDiscoveryRadius 以内的：
+    //   1) transform.root 子树（零配置来源）：预制件落地后，自带特效以及与门户挂在同一根
+    //      节点下的所有粒子系统自动纳入。Udon 沙箱禁止全场景枚举API（FindObjectsOfType、
+    //      Scene.GetRootGameObjects 均不在白名单——后者在 VRChat 官方反馈板有创作者请求，
+    //      至今未开放），沿层级树 GetComponentsInChildren 是白名单内的最优路径。
+    //   2) particleDiscoveryRoots（用户指定的收集根，可选）：特效挂在别的根节点下时手动拖入。
+    // Start 与每 particleDiscoveryRefreshInterval 秒各跑一次（门可被传送枪移动，需要定期重扫）。
+    private void DiscoverParticleSystems()
+    {
+        if (portalPlaneA == null || portalPlaneB == null) return;
+
+        float radiusSqr = particleDiscoveryRadius * particleDiscoveryRadius;
+
+        // transform.root 子树（零配置来源）
+        Transform selfRoot = transform.root;
+        ParticleSystem[] rootSystems = null;
+        if (selfRoot != null)
+        {
+            rootSystems = selfRoot.GetComponentsInChildren<ParticleSystem>(true);
+        }
+
+        // 两遍式（Udon无动态数组）：第一遍数总数，第二遍填充
+        int total = rootSystems != null ? rootSystems.Length : 0;
+        int manualRoots = particleDiscoveryRoots != null ? particleDiscoveryRoots.Length : 0;
+        for (int r = 0; r < manualRoots; r++)
+        {
+            GameObject root = particleDiscoveryRoots[r];
+            if (root == null) continue;
+            ParticleSystem[] under = root.GetComponentsInChildren<ParticleSystem>(true);
+            if (under == null) continue;
+            total += under.Length;
+        }
+        if (total == 0)
+        {
+            discoveredParticleSystems = null;
+            return;
+        }
+
+        ParticleSystem[] collected = new ParticleSystem[total];
+        int idx = CollectParticleSystemsNearPortals(rootSystems, collected, 0, radiusSqr);
+        for (int r = 0; r < manualRoots; r++)
+        {
+            GameObject root = particleDiscoveryRoots[r];
+            if (root == null) continue;
+            ParticleSystem[] under = root.GetComponentsInChildren<ParticleSystem>(true);
+            if (under == null) continue;
+            idx = CollectParticleSystemsNearPortals(under, collected, idx, radiusSqr);
+        }
+        // 尾部可能有null（距离过滤掉的），遍历端已有null检查；
+        // 与手动白名单重复的系统被二次处理时已是传送后状态，无二次传送。
+        discoveredParticleSystems = collected;
+    }
+
+    // 把系统中离任一门足够近的粒子系统填入 dest，返回新的写入下标。
+    private int CollectParticleSystemsNearPortals(ParticleSystem[] systems, ParticleSystem[] dest, int idx, float radiusSqr)
+    {
+        if (systems == null) return idx;
+        for (int i = 0; i < systems.Length; i++)
+        {
+            ParticleSystem ps = systems[i];
+            if (ps == null) continue;
+            Vector3 sysPos = ps.transform.position;
+            if ((sysPos - portalPlaneA.position).sqrMagnitude <= radiusSqr ||
+                (sysPos - portalPlaneB.position).sqrMagnitude <= radiusSqr)
+            {
+                if (idx < dest.Length)
+                {
+                    dest[idx] = ps;
+                    idx++;
+                }
+            }
+        }
+        return idx;
+    }
+
+    // ============================================================
+    // 放置时发现：传送枪放门成功后调用（Start时也按初始门位置各扫一次）。
+    // OverlapSphereNonAlloc 枚举半径内碰撞体 → 对每个碰撞体向上爬层级(找祖先的粒子系统)、
+    // 向下 GetComponentsInChildren(找子物体里的粒子系统) → 去重注册。
+    // 为什么不用触发器：粒子不触发 OnTriggerEnter（已查证/实测），且这里要找的是
+    // "哪些系统存在"而不是"哪颗粒子到达"，物理查询+层级遍历才是对的工具。
+    // 诚实边界：没有碰撞体的独立物体无法被枚举到，那部分靠 root 扫描/收集根/白名单。
+    // ============================================================
+
+    public void DiscoverParticleSystemsAround(Vector3 center)
+    {
+        if (!enableParticleTeleport) { Debug.Log("[粒子传送][放置发现] 跳过：粒子传送未启用"); return; }
+        if (!autoDiscoverParticleSystems) { Debug.Log("[粒子传送][放置发现] 跳过：自动收集开关关闭"); return; }
+        if (portalPlaneA == null || portalPlaneB == null) { Debug.Log("[粒子传送][放置发现] 跳过：门Transform未就绪"); return; }
+
+        if (discoveryOverlapBuffer == null) discoveryOverlapBuffer = new Collider[512];
+        if (placedDiscoverySystems == null) placedDiscoverySystems = new ParticleSystem[64];
+
+        int hitCount = Physics.OverlapSphereNonAlloc(center, particleDiscoveryRadius, discoveryOverlapBuffer, ~0, QueryTriggerInteraction.Collide);
+        // 截断告警：半径内碰撞体顶满缓冲时，超出的碰撞体携带的粒子系统扫不到（NonAlloc语义无法枚举完整集合）
+        if (hitCount >= discoveryOverlapBuffer.Length)
+        {
+            Debug.LogWarning("[粒子传送][放置发现] 半径" + particleDiscoveryRadius + "m内碰撞体超过" + discoveryOverlapBuffer.Length + "个被截断，可能有粒子系统漏注册");
+        }
+
+        int registeredThisCall = 0;
+        for (int i = 0; i < hitCount; i++)
+        {
+            Collider col = discoveryOverlapBuffer[i];
+            if (col == null) continue;
+
+            // 十一轮结构盲区修复：先向上爬到最高祖先（最多8层防长链），再从祖先整体向下扫。
+            // 旧版只扫"碰撞体自身子树+祖先链上的单点"——粒子系统挂在碰撞体的【兄弟节点】
+            // （常见预制件结构：根/兄弟挂ParticleSystem，碰撞挂在另一个子物体上）时完全扫不到，
+            // 这正是"放置时自动检测没工作"的头号嫌疑。从最高祖先向下扫 = 祖先+兄弟+全部后代一次覆盖。
+            Transform top = col.transform;
+            for (int up = 0; up < 8 && top.parent != null; up++) top = top.parent;
+
+            ParticleSystem[] under = top.gameObject.GetComponentsInChildren<ParticleSystem>(true);
+            if (under == null) continue;
+            for (int d = 0; d < under.Length; d++)
+            {
+                if (under[d] != null && RegisterDiscoveredParticleSystem(under[d])) registeredThisCall++;
+            }
+        }
+        Debug.Log("[粒子传送][放置发现] 扫描完成：半径" + particleDiscoveryRadius + "m内命中" + hitCount + "个碰撞体，新注册" + registeredThisCall + "个粒子系统（当前注册总数" + placedDiscoveryCount + "）");
+    }
+
+    // 是否为 Local 空间粒子系统（用户显式拖入清单；避免读 ps.main.simulationSpace 的白名单风险）。
+    private bool IsLocalSpaceParticleSystem(ParticleSystem ps)
+    {
+        if (particleLocalSpaceSystems == null || ps == null) return false;
+        for (int i = 0; i < particleLocalSpaceSystems.Length; i++)
+        {
+            if (particleLocalSpaceSystems[i] == ps) return true;
+        }
+        return false;
+    }
+
+    // 粒子系统是否在排除根子树下（传送枪特效等不参与传送）。
+    private bool IsParticleSystemExcluded(ParticleSystem ps)
+    {
+        if (ps == null) return true;
+        // 显式拖进 Local空间清单 = 用户明确要它参与传送（比如挂在枪上的激光），
+        // 优先于传送枪自动排除——否则枪载激光永远进不了传送逻辑。
+        if (IsLocalSpaceParticleSystem(ps)) return false;
+        Transform t = ps.transform;
+        // 传送枪自动排除：枪的激光/枪口特效是视觉特效，跟着门传送看起来鬼畜
+        if (portalGun != null && IsTransformUnder(t, portalGun.transform)) return true;
+        if (particleTeleportExclusionRoots != null)
+        {
+            for (int i = 0; i < particleTeleportExclusionRoots.Length; i++)
+            {
+                if (particleTeleportExclusionRoots[i] != null && IsTransformUnder(t, particleTeleportExclusionRoots[i])) return true;
+            }
+        }
+        return false;
+    }
+
+    // t 是否在 root 子树下（等价 Transform.IsChildOf；手搓父链遍历，零API白名单风险）
+    private bool IsTransformUnder(Transform t, Transform root)
+    {
+        if (t == null || root == null) return false;
+        while (t != null)
+        {
+            if (t == root) return true;
+            t = t.parent;
+        }
+        return false;
+    }
+
+    // 去重注册：已存在于 放置注册表/手动白名单/root扫描列表 的系统不重复登记。
+    // 返回 true = 本次确实新注册（供放置发现统计）。
+    private bool RegisterDiscoveredParticleSystem(ParticleSystem ps)
+    {
+        if (ps == null) return false;
+        if (placedDiscoverySystems == null) return false;
+        if (IsParticleSystemExcluded(ps)) return false;
+        // 注册表满了自动翻倍扩容（旧行为是静默丢弃——密集世界里第65个之后的系统会无声漏注册）
+        if (placedDiscoveryCount >= placedDiscoverySystems.Length)
+        {
+            ParticleSystem[] bigger = new ParticleSystem[placedDiscoverySystems.Length * 2];
+            for (int c = 0; c < placedDiscoveryCount; c++) bigger[c] = placedDiscoverySystems[c];
+            placedDiscoverySystems = bigger;
+        }
+
+        for (int i = 0; i < placedDiscoveryCount; i++)
+        {
+            if (placedDiscoverySystems[i] == ps) return false;
+        }
+        if (portalParticleSystems != null)
+        {
+            for (int i = 0; i < portalParticleSystems.Length; i++)
+            {
+                if (portalParticleSystems[i] == ps) return false;
+            }
+        }
+        if (discoveredParticleSystems != null)
+        {
+            for (int i = 0; i < discoveredParticleSystems.Length; i++)
+            {
+                if (discoveredParticleSystems[i] == ps) return false;
+            }
+        }
+
+        placedDiscoverySystems[placedDiscoveryCount] = ps;
+        placedDiscoveryCount++;
+        Debug.Log("[粒子传送] 放置时发现自动注册: " + ps.name);
+        return true;
+    }
+
+    // 粒子线段与门检测面求交（六轮重写：符号距离插值 + 后侧窗符号修正）。
+    // 符号距离 z = dot(点 - 检测面点, 门法线)：>0 = 前侧（房间侧），<=0 = 后侧。
+    // 规则1 本帧穿越：线段两端跨检测面符号翻转 → 插值求穿越点，双向都收：
+    //   - 前→后：正常进门；后→前：墙后发射器朝门外喷（与一轮"双向穿越都收"决议一致）；
+    //   - 用 z 插值而不是 denom 除法：退化线段（粒子静止、门被传送枪移动扫过粒子）照样能抓到。
+    //   - 穿越点在门框内算穿越；穿越点在框外但终点已飘进门框（斜粒子）也算（三轮补判，保留）。
+    // 规则2 后侧追补窗：已在检测面后侧且深度<=retroWindow → 补抓。
+    //   六轮关键修正：旧版 withinWindow 的符号写反了——dot(segEnd-planePoint, forward)>=0 抓的其实是
+    //   检测面【前侧】正在靠近的粒子（门前窗值米内会被提前吸走），而真正过平面后的漏检粒子
+    //   forwardPastPlane<0 永远进不了窗——这就是"窗=2 仍残留 1~2 颗隧穿"的病根（窗从没兜住入口侧漏检）。
+    //   现改为真正的"后侧深度<=窗值"。窗=0 时本分支自然关闭，零漏检由规则1+调用方规则3保证。
+    // hitKind: 1=交点在门框内的实穿越（物理事件，选择时最先发生者优先）；
+    //          2=兜底类命中（框外穿越+终点飘入框内 / 后侧追补窗，属状态补救，优先级低于实穿越）。
+    private bool ParticleSegmentCrossesPortal(Vector3 segStart, Vector3 segEnd, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, out float t, out Vector3 hitPoint, out int hitKind)
+    {
+        t = 0f;
+        hitPoint = Vector3.zero;
+        hitKind = 0;
+        if (portalPlane == null) return false;
+
+        // 检测平面沿法线外推：门贴墙/地板且粒子带碰撞时，墙体碰撞体在门平面处就把粒子弹走，
+        // 粒子数学上永远穿不过门平面；把检测面推出墙面，粒子在撞墙前就传送。
+        Vector3 planePoint = portalPlane.position + portalPlane.forward * particleTeleportPlaneOffset;
+        Vector3 normal = portalPlane.forward;
+        float zStart = Vector3.Dot(segStart - planePoint, normal);
+        float zEnd = Vector3.Dot(segEnd - planePoint, normal);
+
+        // 规则1：两端跨检测面符号翻转 = 本帧穿越（任意速度必抓：线段覆盖了两帧间的全部运动）
+        bool flipped = (zStart > 0f && zEnd <= 0f) || (zStart <= 0f && zEnd > 0f);
+        if (flipped)
+        {
+            // 符号翻转保证分母非零，t ∈ [0,1]
+            t = zStart / (zStart - zEnd);
+            hitPoint = segStart + (segEnd - segStart) * t;
+            Vector3 localHit = worldToLocal.MultiplyPoint(hitPoint);
+            if (LocalPointInPortalRect(localHit, shapeType))
+            {
+                hitKind = 1;
+                return true;
+            }
+            // 补判当前位置（三轮修复）：斜着飞的粒子先在门框【外】穿过检测面、再飘进门框内——
+            // 只查穿越点会漏掉它们。落点安全边距保证不回穿，此处放宽是安全的。
+            // 注意这是兜底类命中（kind 2）：穿越点在框外，不是"进门"物理事件。
+            Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
+            if (LocalPointInPortalRect(localEnd, shapeType))
+            {
+                hitKind = 2;
+                return true;
+            }
+            return false;
+        }
+
+        // 规则2：后侧追补窗（retroWindow=0 时本分支自然失效）
+        if (zEnd <= 0f && zEnd >= -particleTeleportRetroWindow)
+        {
+            t = 1f;
+            hitPoint = segEnd;
+            Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
+            if (LocalPointInPortalRect(localEnd, shapeType))
+            {
+                hitKind = 2;
+                return true;
+            }
+            return false;
+        }
+
+        return false;
+    }
+
+    // 撞墙近似反弹（十二轮）：线段前→后穿过检测面且穿越点在门框外 = 粒子正以Unity碰撞
+    // 拦不住的速度凿向门所在的墙。沿检测面做镜像：位置对称翻回、速度法向分量反转并乘
+    // 恢复系数0.6（近似常见碰撞设置的弹性，无法安全读取粒子Collision模块参数）。
+    // 只处理"朝墙飞"(前→后)的穿越；从墙后飞出的粒子不碰（它们已经出来了）。
+    // 与规则4不冲突：反弹点在门框外，规则4的门框内判定不会把它误当门面反弹去传送。
+    private bool TryWallAssistBounce(ref ParticleSystem.Particle p, Vector3 segStart, Vector3 curPos, Vector3 worldVel, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType)
+    {
+        Vector3 planePoint = portalPlane.position + portalPlane.forward * particleTeleportPlaneOffset;
+        Vector3 normal = portalPlane.forward;
+        float zStart = Vector3.Dot(segStart - planePoint, normal);
+        float zEnd = Vector3.Dot(curPos - planePoint, normal);
+        if (!(zStart > 0f && zEnd <= 0f)) return false;
+
+        float t = zStart / (zStart - zEnd);
+        Vector3 hitPoint = segStart + (curPos - segStart) * t;
+        // 穿越点在门框内 = 进门，归传送规则管，这里不碰
+        if (LocalPointInPortalRect(worldToLocal.MultiplyPoint(hitPoint), shapeType)) return false;
+
+        // 位置：把终点沿检测面镜像翻回（等价于剩余路程撞墙反弹）
+        p.position = curPos - normal * (2f * zEnd);
+        // 速度：法向分量反转 × 恢复系数，切向保留（用世界速度，Local系统由调用方转回局部）
+        Vector3 reflected = worldVel - normal * (2f * Vector3.Dot(worldVel, normal));
+        p.velocity = reflected * 0.6f;
+        return true;
+    }
+
+    // 把单颗粒子映射到另一侧：穿越点 from→to+经典半转，速度同映射，
+    // 再把穿越后剩余的那段时间按映射后速度继续积分（与刚体穿越的 postCross 思路一致）。
+    private void TeleportParticleThroughPortal(ref ParticleSystem.Particle p, Vector3 hitPoint, Vector3 vel, float t, float dt, Matrix4x4 worldToLocalFrom, Matrix4x4 localToWorldTo)
+    {
+        Vector3 localHit = worldToLocalFrom.MultiplyPoint(hitPoint);
+        Vector3 localVel = worldToLocalFrom.MultiplyVector(vel);
+        if (useClassicHalfTurn)
+        {
+            localHit = LocalHalfTurn(localHit);
+            localVel = LocalHalfTurn(localVel);
+        }
+        Vector3 exitPos = localToWorldTo.MultiplyPoint(localHit);
+        Vector3 exitVel = localToWorldTo.MultiplyVector(localVel);
+
+        // 落点安全边距（防回穿乒乓，必需）：halfTurn 会把入口检测面的 z=+offset 翻成出口侧
+        // z=-offset（落在出口平面后方）。把落点推过出口检测面即可。
+        // 六轮简化：旧版在这里额外加了一个 retroWindow 裕量（怕被判定窗回抓）；新版规则2只抓
+        // 检测面【后侧】，而出口粒子落在出口门【前侧】且沿映射速度远离，永远不会被任何规则回抓，
+        // 窗值裕量不再需要——出射点因此比旧版缩近了 retroWindow 米。
+        Vector3 exitForward = localToWorldTo.MultiplyVector(Vector3.forward);
+        float landingPush = particleTeleportPlaneOffset * 2f + 0.1f;
+
+        float remainingTime = Mathf.Max(0f, (1f - t) * dt);
+        p.position = exitPos + exitForward * landingPush + exitVel * remainingTime;
+        p.velocity = exitVel;
     }
 
     private void ProcessRigidbodyForPortal(bool isPortalA)
@@ -2949,6 +3825,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 else if (normalSpeed > rbPostCrossNormalSpeedEpsilon) initialSide = -1;
             }
 
+            int countBeforeAdd = count;
             count = AddRigidbodyTrackerToArrays(
                 rb,
                 rbOffsetFromPortal,
@@ -2962,8 +3839,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 false
             );
 
-            // 遮罩叠加：被追踪的刚体临时应用透明遮罩，渲染在传送门画面之上
-            ApplyPortalOverlayToGameObject(rb.gameObject);
+            // 遮罩叠加：被追踪的刚体临时应用透明遮罩，渲染在传送门画面之上。
+            // 必须只在刚体【新加入追踪】那一帧执行：AddRigidbodyTrackerToArrays 对已在追踪的刚体原样返回，
+            // 不加这道门会导致每个被追踪刚体每帧都跑一次 GetComponentsInChildren<Renderer>（纯浪费+GC）。
+            // 离开追踪后由下方 RestorePortalOverlayIfUntracked 还原 renderQueue。
+            if (count != countBeforeAdd)
+            {
+                ApplyPortalOverlayToGameObject(rb.gameObject);
+            }
 
             if (rb.gameObject.layer != rigidbodyPassThroughLayer)
             {
@@ -2998,6 +3881,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                RestorePortalOverlayIfUntracked(rb);
                 continue;
             }
             if (heldByGun && !allowHeldRigidbodyTeleport)
@@ -3005,6 +3889,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                RestorePortalOverlayIfUntracked(rb);
                 continue;
             }
 
@@ -3079,6 +3964,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 }
 
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                // 穿门交接路径：上面已把刚体加入对面门的追踪，RestorePortalOverlayIfUntracked 内部会
+                // 因"仍被追踪"而跳过还原——这里调用只为保持所有移除路径的统一不变式。
+                RestorePortalOverlayIfUntracked(rb);
                 continue;
             }
 
@@ -3090,6 +3978,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+                RestorePortalOverlayIfUntracked(rb);
                 continue;
             }
 
@@ -3558,6 +4447,25 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return false;
     }
 
+    // 查 Clip Volume 追踪表：col 若正被 A/B 任一侧 clip volume 追踪，返回当时记录的原始 layer；否则 -1。
+    // 语义："谁切的谁记录了真原始值"——clip volume 只在 layer != 穿透层时才接管并记录，
+    // 所以表里的值一定是切换前的真实 layer，可作为 markedCollider 系统被污染时的真值来源。
+    // 剪刀穿模场景：A门clipVolume包住穿模过来的、B门所在的斜面，B的markedCollider逻辑
+    // 第一次读到斜面时它已经在穿透层，必须靠这张表找回真原始层。
+    private int FindClipVolumeOriginalLayer(Collider col)
+    {
+        if (col == null) return -1;
+        for (int i = 0; i < clipVolumeTrackedCountA; i++)
+        {
+            if (clipVolumeTrackedCollidersA[i] == col) return clipVolumeOriginalLayersA[i];
+        }
+        for (int i = 0; i < clipVolumeTrackedCountB; i++)
+        {
+            if (clipVolumeTrackedCollidersB[i] == col) return clipVolumeOriginalLayersB[i];
+        }
+        return -1;
+    }
+
     private void AddColliderToTracked(Collider col, int originalLayer, Collider[] tracked, int[] originalLayers, ref int count)
     {
         // 去重
@@ -3612,6 +4520,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         GameObject original = rb.gameObject;
         if (original == null) return;
 
+        // 先分配slot号：材质跟随缓存（SyncCloneMaterials）要挂在这个slot下，
+        // 必须在 VRCInstantiate 可能提前 return 之前确定。
+        int idx = cloneCount;
+
         // VRCInstantiate 本地拷贝（非网络同步）
         GameObject clone = VRCInstantiate(original);
         if (clone == null) return;
@@ -3623,13 +4535,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 销毁clone上所有Rigidbody/Pickup/Udon/音效/粒子/动画等组件，只保留 Transform+Renderer+MeshFilter+Collider
         StripCloneComponents(clone);
 
-        // 材质同步：把原物体每个Renderer的"运行时material实例"共享给clone对应的Renderer。
-        SyncCloneMaterials(original, clone);
+        // 材质同步 + 跟随缓存：把原物体每个Renderer当前引用的材质实例（含动画控制器正在驱动的
+        // 动画值，比如材质变色）赋给clone对应Renderer，并缓存渲染器配对供每帧校正。
+        // 注意：这一次赋值可能被帧末的"clone Animator销毁还原"撤销，真正兜底靠 RepointCloneMaterials。
+        SyncCloneMaterials(original, clone, idx);
 
         // layer保持和原物体一致（用户要求），不手动改
 
-        // 记录clone映射
-        int idx = cloneCount;
+        // 记录clone映射（slot号 idx 已在 VRCInstantiate 之前分配，材质跟随缓存依赖它）
         cloneOriginalRigidbodies[idx] = rb;
         cloneGameObjects[idx] = clone;
         cloneTargetPortals[idx] = fromPortal;
@@ -3650,19 +4563,67 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         cloneTargetPortals[idx] = newFromPortal;
     }
 
-    // clone的组件清理已经在上面做了，这里只做材质共享同步
-    private void SyncCloneMaterials(GameObject original, GameObject clone)
+    // 材质同步 + 跟随缓存：把本体渲染器当前引用的材质（sharedMaterials 读取不会强制实例化，
+    // 不会对本体产生副作用；若本体材质正被动画控制器实例化驱动，这里拿到的就是带当前动画值的实例）
+    // 赋给clone对应渲染器，同时把渲染器配对缓存下来，供 UpdateRigidbodyClonePoses 每帧校正。
+    private void SyncCloneMaterials(GameObject original, GameObject clone, int cloneIdx)
     {
         if (original == null || clone == null) return;
         Renderer[] origRenderers = original.GetComponentsInChildren<Renderer>(true);
         Renderer[] cloneRenderers = clone.GetComponentsInChildren<Renderer>(true);
+
+        if (cloneIdx >= 0 && cloneIdx < MAX_RIGIDBODY_CLONES)
+        {
+            cloneMaterialSyncOriginalRenderers[cloneIdx] = origRenderers;
+            cloneMaterialSyncCloneRenderers[cloneIdx] = cloneRenderers;
+        }
+
         int count = Mathf.Min(origRenderers.Length, cloneRenderers.Length);
         for (int i = 0; i < count; i++)
         {
             Renderer origR = origRenderers[i];
             Renderer cloneR = cloneRenderers[i];
             if (origR == null || cloneR == null) continue;
-            cloneR.sharedMaterials = origR.materials;
+            cloneR.sharedMaterials = origR.sharedMaterials;
+        }
+    }
+
+    // 材质实时跟随（双层校正）：
+    // 第一层 - 材质引用校正：把clone渲染器的材质重新指回本体渲染器当前持有的实例，
+    //   覆盖"clone的Animator被Destroy(帧末延迟)时材质被还原回资产"、"本体换了材质实例"等场景。
+    // 第二层 - MaterialPropertyBlock 同步（动画值真正所在的地方）：联网查证（Unity官方文档/论坛）确认，
+    //   Animator 对材质属性的动画不写进材质本身，而是通过渲染器的 MaterialPropertyBlock 应用；
+    //   因此只做材质共享/复制永远同步不到动画值（这就是第一版修复无效的根因）。
+    //   每帧对本体渲染器 GetPropertyBlock（官方文档：传入的block会被完全覆盖，无残留），
+    //   再 SetPropertyBlock 到clone渲染器。GetPropertyBlock/SetPropertyBlock/new MaterialPropertyBlock()
+    //   均为官方API，且已联网查证 UdonSharp 支持（有多个真实VRChat世界用例）。
+    //   注意：不使用 HasPropertyBlock 做门控——它只认 SetPropertyBlock 写入的块，可能漏掉动画驱动的块。
+    private void RepointCloneMaterials(int cloneIdx)
+    {
+        if (cloneIdx < 0 || cloneIdx >= MAX_RIGIDBODY_CLONES) return;
+        Renderer[] origRenderers = cloneMaterialSyncOriginalRenderers[cloneIdx];
+        Renderer[] cloneRenderers = cloneMaterialSyncCloneRenderers[cloneIdx];
+        if (origRenderers == null || cloneRenderers == null) return;
+
+        if (clonePropertyBlockSyncBuffer == null) clonePropertyBlockSyncBuffer = new MaterialPropertyBlock();
+
+        int count = Mathf.Min(origRenderers.Length, cloneRenderers.Length);
+        for (int i = 0; i < count; i++)
+        {
+            Renderer origR = origRenderers[i];
+            Renderer cloneR = cloneRenderers[i];
+            if (origR == null || cloneR == null) continue;
+
+            // 第一层：材质引用校正（slot0 sharedMaterial做廉价探针，单引用读取无数组分配；引用真变了才整体重写）
+            if (cloneR.sharedMaterial != origR.sharedMaterial)
+            {
+                cloneR.sharedMaterials = origR.sharedMaterials;
+            }
+
+            // 第二层：PropertyBlock 同步。无条件每帧取+写：动画每一帧都可能改block里的值，
+            // 且clone首次可见前本函数必定先跑一次（UpdateRigidbodyClonePoses 在激活clone前调用）。
+            origR.GetPropertyBlock(clonePropertyBlockSyncBuffer);
+            cloneR.SetPropertyBlock(clonePropertyBlockSyncBuffer);
         }
     }
 
@@ -3703,6 +4664,87 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
     }
 
+    // 手持刚体"松手提交"：握持期间枪独占刚体位置、传送门系统只显示clone镜像；
+    // 松手瞬间若刚体伸进了某扇门，一次性把它传送到另一侧（镜像位置）。
+    // 只在释放时调用一次、不参与每帧定位，不会与枪的 MovePosition 拉扯（无鬼畜）。
+    // 两级判定：
+    //   优先级1：有活跃clone → 映射方向明确，本体在该门平面后侧 → 对齐到clone位姿。
+    //   优先级2：无clone → 纯几何判定（本体过某门平面且落在门框内 → 镜像传送到另一侧）。
+    //     这一级必不可少：深捅（枪几乎贴到/穿过门面）时握持点(枪口前1米)会超过
+    //     追踪深度(noClipDepth+rbTriggerDepthExtension≈1.1米)，追踪被移除、clone被销毁；
+    //     只靠clone就会在松手时漏提交，刚体留在门后墙体里——正是"松手出现在门后面"的根因。
+    // 防拽回闸门：本体已在另一扇门的门前区域内（"已经出来了"的状态）→ 不提交，
+    // 防止门位靠近/交叠的场景里把本体错误拽回。
+    public void CommitHeldRigidbodyToClone(Rigidbody rb)
+    {
+        if (rb == null) return;
+        if (!enableRigidbodyTeleport) return;
+
+        // 优先级1：有活跃clone
+        int idx = FindCloneIndexForRigidbody(rb);
+        if (idx >= 0)
+        {
+            GameObject clone = cloneGameObjects[idx];
+            Transform fromPortal = cloneTargetPortals[idx];
+            if (clone == null || fromPortal == null) return;
+            // 本体不在该门平面后侧（正常握持/已出出口的状态）：不提交
+            if (LocalPointForPortal(fromPortal, rb.position).z >= 0f) return;
+
+            Vector3 targetPos = clone.transform.position;
+            Quaternion targetRot = clone.transform.rotation;
+            rb.position = targetPos;
+            rb.rotation = targetRot;
+            rb.transform.position = targetPos;
+            rb.transform.rotation = targetRot;
+            rb.velocity = Vector3.zero;
+            rb.angularVelocity = Vector3.zero;
+            DestroyRigidbodyClone(rb);
+            return;
+        }
+
+        // 优先级2：无clone（深捅掉出追踪），几何直判
+        if (portalPlaneA != null && TryCommitInsertedHeldBody(rb, portalPlaneA, portalPlaneB)) return;
+        if (portalPlaneB != null) TryCommitInsertedHeldBody(rb, portalPlaneB, portalPlaneA);
+    }
+
+    // 松手提交优先级2：本体已过 fromPlane 平面且落在门框内 → 按 clone/传送同款数学镜像到 toPlane 侧。
+    private bool TryCommitInsertedHeldBody(Rigidbody rb, Transform fromPlane, Transform toPlane)
+    {
+        if (fromPlane == null || toPlane == null) return false;
+
+        Vector3 localPos = LocalPointForPortal(fromPlane, rb.position);
+        if (localPos.z >= 0f) return false;
+        if (!LocalPointInPortalRect(localPos, ResolvePortalShape(fromPlane == portalPlaneA))) return false;
+
+        // 防拽回：本体已处于另一扇门的门前追踪区域内（大概率是"已经出来了"的状态）→ 不提交
+        Vector3 localAtExit = LocalPointForPortal(toPlane, rb.position);
+        float exitTrackDepth = noClipDepth + rbTriggerDepthExtension;
+        if (localAtExit.z >= 0f && localAtExit.z <= exitTrackDepth && LocalPointInPortalRect(localAtExit, ResolvePortalShape(toPlane == portalPlaneA))) return false;
+
+        // 镜像位姿：与 clone/TeleportRigidbodySebStyle 完全相同的数学（from→to + 经典半转）
+        Vector3 mappedLocal = localPos;
+        Quaternion mappedRot = Quaternion.Inverse(fromPlane.rotation) * rb.rotation;
+        if (useClassicHalfTurn)
+        {
+            Quaternion halfTurn = LocalHalfTurn();
+            mappedLocal = halfTurn * mappedLocal;
+            mappedRot = halfTurn * mappedRot;
+        }
+        Vector3 targetPos = WorldPointFromPortal(toPlane, mappedLocal);
+        Quaternion targetRot = toPlane.rotation * mappedRot;
+
+        // 与 TeleportRigidbodySebStyle 同款双写：rb.position 是物理引擎内部值，
+        // transform 不同步的话本帧渲染会看到旧位置。
+        rb.position = targetPos;
+        rb.rotation = targetRot;
+        rb.transform.position = targetPos;
+        rb.transform.rotation = targetRot;
+        // 手持期间是kinematic，velocity无意义；清零避免释放瞬间带着脏速度飞出去。
+        rb.velocity = Vector3.zero;
+        rb.angularVelocity = Vector3.zero;
+        return true;
+    }
+
     private void DestroyRigidbodyClone(Rigidbody rb)
     {
         int idx = FindCloneIndexForRigidbody(rb);
@@ -3721,11 +4763,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             cloneGameObjects[idx] = cloneGameObjects[last];
             cloneTargetPortals[idx] = cloneTargetPortals[last];
             clonePendingActivation[idx] = clonePendingActivation[last];
+            cloneMaterialSyncOriginalRenderers[idx] = cloneMaterialSyncOriginalRenderers[last];
+            cloneMaterialSyncCloneRenderers[idx] = cloneMaterialSyncCloneRenderers[last];
         }
         cloneOriginalRigidbodies[last] = null;
         cloneGameObjects[last] = null;
         cloneTargetPortals[last] = null;
         clonePendingActivation[last] = false;
+        cloneMaterialSyncOriginalRenderers[last] = null;
+        cloneMaterialSyncCloneRenderers[last] = null;
         cloneCount = last;
     }
 
@@ -3743,6 +4789,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             cloneGameObjects[i] = null;
             cloneTargetPortals[i] = null;
             clonePendingActivation[i] = false;
+            cloneMaterialSyncOriginalRenderers[i] = null;
+            cloneMaterialSyncCloneRenderers[i] = null;
         }
         cloneCount = 0;
     }
@@ -3783,11 +4831,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     cloneGameObjects[i] = cloneGameObjects[last];
                     cloneTargetPortals[i] = cloneTargetPortals[last];
                     clonePendingActivation[i] = clonePendingActivation[last];
+                    cloneMaterialSyncOriginalRenderers[i] = cloneMaterialSyncOriginalRenderers[last];
+                    cloneMaterialSyncCloneRenderers[i] = cloneMaterialSyncCloneRenderers[last];
                 }
                 cloneOriginalRigidbodies[last] = null;
                 cloneGameObjects[last] = null;
                 cloneTargetPortals[last] = null;
                 clonePendingActivation[last] = false;
+                cloneMaterialSyncOriginalRenderers[last] = null;
+                cloneMaterialSyncCloneRenderers[last] = null;
                 cloneCount = last;
                 i--;
                 continue;
@@ -3822,6 +4874,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             clone.transform.position = worldPos;
             clone.transform.rotation = worldRot;
+
+            // 材质实时跟随（含动画控制器驱动的变色等）：为什么需要每帧校正见 RepointCloneMaterials 注释。
+            // 放在激活判定之前，保证clone首次可见时材质就已经是对的。
+            RepointCloneMaterials(idx);
 
             bool firstFrame = clonePendingActivation[idx];
             if (firstFrame) clonePendingActivation[idx] = false;

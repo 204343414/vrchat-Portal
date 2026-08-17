@@ -402,7 +402,6 @@ public class 传送枪 : UdonSharpBehaviour
         {
             Collider col = hit.collider;
             if (col == null) return false;
-            Rigidbody rb = col.attachedRigidbody;
             // 近处刚体应由第一段直接抓取处理；如果到了这里仍被它挡住，就不要穿门抓更远物体。
             return true;
         }
@@ -473,6 +472,13 @@ public class 传送枪 : UdonSharpBehaviour
 
         // 还原 Kinematic（允许物理）
         rb.isKinematic = false;
+
+        // 松手提交：刚体若已伸进传送门（有活跃clone镜像在另一侧），把本体对齐到clone位置。
+        // 必须在清映射之前调用，且只此一次——握持期间不做任何跨门重定位，避免与MovePosition拉扯。
+        if (portalManager != null)
+        {
+            portalManager.CommitHeldRigidbodyToClone(rb);
+        }
 
         heldTargetMappedThroughPortal = false;
         heldTargetFromPortal = null;
@@ -826,6 +832,16 @@ public class 传送枪 : UdonSharpBehaviour
             portal.position = portalPos;
             portal.rotation = portalRot;
 
+            // 放置时发现：以门的新位置为中心扫描半径内的粒子系统自动注册（免手拖）
+            if (portalManager != null)
+            {
+                portalManager.DiscoverParticleSystemsAround(portalPos);
+            }
+            else
+            {
+                Debug.LogWarning("[传送枪] portalManager 未接线：放置时粒子自动发现被跳过（把管理器拖进传送枪的 portalManager 槽位）");
+            }
+
             if (debugPortalGunLog)
             {
                 Debug.Log(
@@ -939,11 +955,14 @@ public class 传送枪 : UdonSharpBehaviour
         int lastDirUp = 0;
         int lastDirRight = 0;
 
+        // 迭代缓冲：在循环外一次性分配、每轮复用（每轮所有元素都会被完整重写），
+        // 避免单次放置校验最多 placementMaxIterations × 3 个临时小数组的分配。
+        float[] gaps = new float[4];      // 每个角实际测到的“候选门面到墙面”的间隙（沿法线方向，正值=有空隙，负值=已嵌入）
+        float[] badness = new float[4];   // 每个角与理想间隙(targetGap)的偏差绝对值，纠偏和合法性判定都基于这个量
+        bool[] cornerValid = new bool[4];
+
         for (int iteration = 0; iteration < placementMaxIterations; iteration++)
         {
-            float[] gaps = new float[4];      // 每个角实际测到的“候选门面到墙面”的间隙（沿法线方向，正值=有空隙，负值=已嵌入）
-            float[] badness = new float[4];   // 每个角与理想间隙(targetGap)的偏差绝对值，纠偏和合法性判定都基于这个量
-            bool[] cornerValid = new bool[4];
 
             for (int i = 0; i < 4; i++)
             {
