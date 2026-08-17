@@ -119,11 +119,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
              "粒子会在到达门平面之前先被墙体碰撞体弹走、数学上永远不穿过门平面；把检测面推出墙面，让粒子在撞墙前就传送。")]
     public float particleTeleportPlaneOffset = 0.05f;
 
-    [Tooltip("穿越回溯窗（以'帧位移线段长度'为单位），同时是'已漏检粒子'的追补深度：值越大，能抓住越久之前的漏检穿越。" +
-             "调大的代价：落点安全边距随之加大（防回穿所需），粒子出射点会离出口门稍远一点点并快速飞离，属正常。" +
-             "默认6已覆盖常见隧穿存量；仍有隧穿继续往上拉。")]
-    [Range(0f, 8f)]
-    public float particleTeleportRetroWindow = 6f;
+    [Tooltip("穿越判定窗（单位：米，沿门法线的前进距离），同时是'已漏检粒子'的追补深度。" +
+             "本帧穿越必抓；已过检测面的粒子只要法线漂移≤此窗值也抓——与角度无关，对斜粒子公平（旧版按'帧位移线段长度'计量，斜粒子每帧法线前进分量小，窗对它们实际更短，是斜粒子隧穿的真凶）。" +
+             "调大的代价：落点安全边距随之加大，粒子出射点离出口门更远。默认0.5够用；仍有隧穿拉到1~2。")]
+    [Range(0f, 2f)]
+    public float particleTeleportRetroWindow = 0.5f;
 
     [Tooltip("粒子传送诊断日志：每60帧输出一次'检测了多少粒子/传送了多少次'。粒子隧穿不传送时用它定位卡在哪一环：检测数=0说明系统没被读取（Simulation Space不是World/系统没播放/距离闸门）；检测数>0但传送=0说明穿越判定不命中（空间语义/门框范围/方向）。")]
     public bool debugParticleTeleportLog = false;
@@ -3376,7 +3376,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 这正是"有一部分粒子直接穿过"的真凶（也解释了为何调大回溯窗无效：它当时只管 denom<0）。
         // 刚传送完的粒子的防回穿改由"落点安全边距"保证（见 TeleportParticleThroughPortal），
         // 不再靠收紧这里的窗口。
-        if (t < -particleTeleportRetroWindow || t > 1f) return false;
+        // 判定窗（2026-08-16 四次修复，重构为"法线距离窗"）：
+        // 旧窗按"帧位移线段长度"计量，斜粒子每帧在门法线方向前进的分量小，
+        // 同样窗值对它们覆盖的法线距离更短——越斜越快逃出窗，而隧穿的全是斜粒子。
+        // 改为沿门法线的前进距离（米）计量，与角度无关：
+        //   本帧穿越(t∈[0,1]) 或 已过检测面且法线漂移≤窗值 → 都算。
+        float forwardPastPlane = Vector3.Dot(segEnd - planePoint, portalPlane.forward);
+        bool crossesThisFrame = (t >= 0f && t <= 1f);
+        bool withinWindow = (forwardPastPlane >= 0f && forwardPastPlane <= particleTeleportRetroWindow);
+        if (!crossesThisFrame && !withinWindow) return false;
 
         hitPoint = segStart + segDir * t;
         Vector3 local = worldToLocal.MultiplyPoint(hitPoint);
@@ -3403,14 +3411,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Vector3 exitVel = localToWorldTo.MultiplyVector(localVel);
 
         // 落点安全边距（防回穿乒乓，必需）：halfTurn 会把入口检测面的 z=+offset 翻成出口侧
-        // z=-offset（落在出口平面后方）。若就此交给粒子自己飞，慢速粒子下一帧会再次穿过
-        // 出口检测面被双向回溯窗抓个正着 → 传送回去 → 乒乓。
-        // 边距公式推导：把落点推过出口检测面，且富余量覆盖回溯窗整窗
-        // （需 landingPush > 2*offset + vdt*(retroWindow+1)，取 retroWindow+1.5 留裕量），
-        // 保证"刚传送完的粒子"相对出口检测面的 t 恒小于 -retroWindow，永不被回抓。
+        // z=-offset（落在出口平面后方）。把落点推过出口检测面，且超出法线距离窗一个裕量，
+        // 保证"刚传送完的粒子"落在窗外、永远不会被判定窗回抓（与角度/速度无关，固定边距）。
         Vector3 exitForward = localToWorldTo.MultiplyVector(Vector3.forward);
-        float exitNormalSpeed = Mathf.Max(0f, Vector3.Dot(exitVel, exitForward));
-        float landingPush = particleTeleportPlaneOffset * 2f + exitNormalSpeed * dt * (particleTeleportRetroWindow + 1.5f) + 0.05f;
+        float landingPush = particleTeleportPlaneOffset * 2f + particleTeleportRetroWindow + 0.1f;
 
         float remainingTime = Mathf.Max(0f, (1f - t) * dt);
         p.position = exitPos + exitForward * landingPush + exitVel * remainingTime;
