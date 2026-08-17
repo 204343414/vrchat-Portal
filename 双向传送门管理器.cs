@@ -56,7 +56,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Header("════════════ 碰撞控制 ════════════")]
     public 传送枪 portalGun;
 
-    [Tooltip("玩家进入传送门前后多远开始临时切换图层。实际判定深度 = noClipDepth + colliderDisableBuffer + 速度缓冲；想让切换更早/更晚，优先微调这个值。")]
+    [Tooltip("玩家进入传送门前后多远开始临时切换图层。实际判定深度 = noClipDepth + colliderDisableBuffer + 速度缓冲。" +
+             "速度缓冲 = 玩家速度×物理步长×2（八轮起不再钳死1.5米，上限50米仅防异常值），保证任意速度的玩家在到达墙面前一帧，墙已切到穿透层。想让切换更早/更晚，优先微调这个值。")]
     public float colliderDisableBuffer = 0.15f;
 
     [Tooltip("被传送枪标记的墙/地板/屏蔽碰撞体的原始实体层。当前推荐 17 = Walkthrough：挡刚体/物品，不挡玩家。")]
@@ -753,7 +754,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (portalPlaneA == null || portalPlaneB == null) return;
 
         // 性能优化：本帧 speedBuffer 只算一次，供下面碰撞穿透判定复用（算法不变，见字段注释）。
-        cachedSpeedBufferThisFrame = Mathf.Clamp(localPlayer.GetVelocity().magnitude * Time.deltaTime * 2.0f, 0f, 1.5f);
+        // 八轮修复（玩家高速隧穿破案）：旧版把缓冲钳死在1.5米——下落速度>45m/s后缓冲停止生长，
+        // 每帧位移超过 noClipDepth+colliderDisableBuffer+1.5（约2米）时，玩家一帧从切层区外
+        // 直接跳过整个区域砸到地板/天花板碰撞体上：碰撞先于传送触发（停下）或胶囊隧穿薄板
+        // （掉出去）——正是"天花板+地板门无空气阻力无限坠落加速循环"高速断裂的病根。
+        // 现改为：缓冲 = 速度 × 步长 × 2，安全上限放到50米（仅防异常值，正常速度永不到顶）。
+        // 步长取 max(渲染dt, 物理dt)：真正解算碰撞的是物理步（VRChat的FixedUpdate锁刷新率），
+        // 高帧率下渲染dt小于物理步长，只用渲染dt会低估一帧的真实位移。
+        float stepDt = Mathf.Max(Time.deltaTime, Time.fixedDeltaTime);
+        float speedBuffer = localPlayer.GetVelocity().magnitude * stepDt * 2.0f;
+        cachedSpeedBufferThisFrame = Mathf.Clamp(speedBuffer, 0f, 50f);
 
         // 刚体传送处理（优先保证能检测到，先用高频）
         if (enableRigidbodyTeleport)
