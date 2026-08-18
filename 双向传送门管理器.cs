@@ -135,6 +135,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     [Tooltip("粒子传送诊断日志：每60帧输出一次'检测了多少粒子/传送了多少次'。粒子隧穿不传送时用它定位卡在哪一环：检测数=0说明系统没被读取（Simulation Space不是World/系统没播放/距离闸门）；检测数>0但传送=0说明穿越判定不命中（空间语义/门框范围/方向）。")]
     public bool debugParticleTeleportLog = false;
+
+    [Tooltip("门框判定按粒子尺寸外扩（十八轮）：粒子是面片不是点，把门框判定外扩'每颗粒子startSize的一半'（上限1m），" +
+             "粒子身体压到门框边缘也算进洞——就是'按粒子长宽判断'的便宜实现（碰撞模块的Radius Scale在Udon读不到，只能用出生尺寸近似）。" +
+             "规则1/2/3/4 的框内判定统一生效；对拉伸光束，startSize就是光束宽度。")]
+    public bool particleUseSizeInflatedCheck = true;
+
     private int particleDebugFrameCounter = 0;
     private int particleDebugTestedCount = 0;
     private int particleDebugTeleportCount = 0;
@@ -142,6 +148,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private int particleDebugStuckSamples = 0;
     private int particleDebugTruncatedSystems = 0;
     private int particleDebugBounceCount = 0;
+    // 十八轮：每帧事件日志限流（疯狂刷屏问题）——每60帧窗口打印前25条+之后每100条1条，其余计数进汇总
+    private int particleDebugEventLogged = 0;
+    private int particleDebugEventSkipped = 0;
 
     private ParticleSystem.Particle[] particleTeleportBuffer;
     // 十六轮：配对历史改为【按系统槽位隔离】的固定池（PARTICLE_PAIRING_SLOTS 个系统 ×
@@ -1467,6 +1476,30 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
 
         // PORTAL_SHAPE_BOX，以及任何异常值都兜底为方框（矩形）判定 - 原版
+        return Mathf.Abs(localPoint.x) < hx && Mathf.Abs(localPoint.y) < hy;
+    }
+
+    // 十八轮：按粒子半尺寸外扩的门框判定（用户提出"粒子有长宽"语义的便宜实现）。
+    // 外扩上限1m防异常startSize；外扩<=1mm时退化为原判定。三角形按相同比例外扩（等比例缩放）。
+    bool InflatedPointInPortalRect(Vector3 localPoint, int shapeType, float inflateHalf)
+    {
+        if (!particleUseSizeInflatedCheck) return LocalPointInPortalRect(localPoint, shapeType);
+        if (inflateHalf <= 0.001f) return LocalPointInPortalRect(localPoint, shapeType);
+
+        float hx = portalTriggerWidth * 0.5f + inflateHalf;
+        float hy = portalTriggerHeight * 0.5f + inflateHalf;
+        if (hx <= 0.0001f || hy <= 0.0001f) return false;
+
+        if (shapeType == PORTAL_SHAPE_TRIANGLE)
+        {
+            return PointInPortalTriangle(localPoint.x, localPoint.y, hx, hy);
+        }
+        if (shapeType == PORTAL_SHAPE_CIRCLE)
+        {
+            float nx = localPoint.x / hx;
+            float ny = localPoint.y / hy;
+            return nx * nx + ny * ny <= 1f;
+        }
         return Mathf.Abs(localPoint.x) < hx && Mathf.Abs(localPoint.y) < hy;
     }
 
@@ -3149,13 +3182,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 particleDebugFrameCounter = 0;
                 int rootListCount = discoveredParticleSystems != null ? discoveredParticleSystems.Length : 0;
-                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（其中反弹捕获 " + particleDebugBounceCount + "），过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容）");
+                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（其中反弹捕获 " + particleDebugBounceCount + "），过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容；事件日志共" + particleDebugEventLogged + "条，限流省略" + particleDebugEventSkipped + "条）");
                 particleDebugTestedCount = 0;
                 particleDebugTeleportCount = 0;
                 particleDebugBounceCount = 0;
                 particleDebugStuckCount = 0;
                 particleDebugStuckSamples = 0;
                 particleDebugTruncatedSystems = 0;
+                particleDebugEventLogged = 0;
+                particleDebugEventSkipped = 0;
             }
         }
     }
@@ -3221,6 +3256,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             int pairIdx = (sysSlot >= 0 && i < PARTICLE_PAIRING_STRIDE) ? sysSlot * PARTICLE_PAIRING_STRIDE + i : -1;
             bool paired = pairIdx >= 0 && particlePrevValid[pairIdx] && particlePrevSeeds[pairIdx] == seed;
 
+            // 十八轮：按粒子尺寸外扩门框判定（粒子是面片不是点；上限1m防异常值）。
+            // startSize 与 randomSeed 同属 Particle 结构体纯数据字段，无模块白名单风险。
+            float halfSize = Mathf.Min(p.startSize * 0.5f, 1f);
+
             Vector3 segStart;
             if (paired)
             {
@@ -3242,11 +3281,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             float tA;
             Vector3 hitA;
             int kindA;
-            bool crossA = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneA, worldToLocalA, shapeA, out tA, out hitA, out kindA);
+            bool crossA = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneA, worldToLocalA, shapeA, halfSize, out tA, out hitA, out kindA);
             float tB;
             Vector3 hitB;
             int kindB;
-            bool crossB = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneB, worldToLocalB, shapeB, out tB, out hitB, out kindB);
+            bool crossB = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneB, worldToLocalB, shapeB, halfSize, out tB, out hitB, out kindB);
 
             // 一帧至多一次传送——先碰到哪扇门就进哪扇（九轮关键修复，"取更晚"是高速漏检真凶）：
             // 剪刀形重叠门 + 高速长线段时，一根线段会同帧穿过两扇门的平面。粒子物理上是
@@ -3285,8 +3324,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             // 无乒乓风险：刚传送完的粒子落在出口门【前侧】（房间侧）且沿映射速度远离，永不落进本规则。
             if (!doA && !doB && !paired)
             {
-                bool behindA = localCurA.z <= particleTeleportPlaneOffset && LocalPointInPortalRect(localCurA, shapeA);
-                bool behindB = localCurB.z <= particleTeleportPlaneOffset && LocalPointInPortalRect(localCurB, shapeB);
+                bool behindA = localCurA.z <= particleTeleportPlaneOffset && InflatedPointInPortalRect(localCurA, shapeA, halfSize);
+                bool behindB = localCurB.z <= particleTeleportPlaneOffset && InflatedPointInPortalRect(localCurB, shapeB, halfSize);
                 // 两门都命中（剪刀形重叠门）时，取穿入深度更深的一扇：更深=更"已经过去了"
                 if (behindA && (!behindB || localCurA.z <= localCurB.z))
                 {
@@ -3316,8 +3355,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 Vector3 mapB = worldVel;
                 float strengthA = 0f;
                 float strengthB = 0f;
-                bool bounceA = TryBounceCapturePortal(portalPlaneA, worldToLocalA, shapeA, particlePrevPositions[pairIdx], particlePrevVelocities[pairIdx], curPos, worldVel, dt, out anchorA, out mapA, out strengthA);
-                bool bounceB = TryBounceCapturePortal(portalPlaneB, worldToLocalB, shapeB, particlePrevPositions[pairIdx], particlePrevVelocities[pairIdx], curPos, worldVel, dt, out anchorB, out mapB, out strengthB);
+                bool bounceA = TryBounceCapturePortal(portalPlaneA, worldToLocalA, shapeA, halfSize, particlePrevPositions[pairIdx], particlePrevVelocities[pairIdx], curPos, worldVel, dt, out anchorA, out mapA, out strengthA);
+                bool bounceB = TryBounceCapturePortal(portalPlaneB, worldToLocalB, shapeB, halfSize, particlePrevPositions[pairIdx], particlePrevVelocities[pairIdx], curPos, worldVel, dt, out anchorB, out mapB, out strengthB);
                 if (bounceA || bounceB)
                 {
                     // 两门都命中（剪刀形重叠门）时，取法向速度反转更剧烈的一扇
@@ -3349,7 +3388,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if (debugParticleTeleportLog)
                 {
                     particleDebugTeleportCount++;
-                    Debug.Log("[粒子传送][事件] 规则" + ruleHit + " A→B 种子=" + seed + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
+                    particleDebugEventLogged++;
+                    // 十八轮限流：每60帧窗口打印前25条+之后每100条1条，防疯狂刷屏；省略数进汇总
+                    if (particleDebugEventLogged <= 25 || (particleDebugEventLogged % 100) == 0)
+                    {
+                        Debug.Log("[粒子传送][事件] 规则" + ruleHit + " A→B 系统=" + ps.name + " 种子=" + seed + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
+                    }
+                    else
+                    {
+                        particleDebugEventSkipped++;
+                    }
                 }
             }
             else if (doB)
@@ -3359,7 +3407,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if (debugParticleTeleportLog)
                 {
                     particleDebugTeleportCount++;
-                    Debug.Log("[粒子传送][事件] 规则" + ruleHit + " B→A 种子=" + seed + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
+                    particleDebugEventLogged++;
+                    if (particleDebugEventLogged <= 25 || (particleDebugEventLogged % 100) == 0)
+                    {
+                        Debug.Log("[粒子传送][事件] 规则" + ruleHit + " B→A 系统=" + ps.name + " 种子=" + seed + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
+                    }
+                    else
+                    {
+                        particleDebugEventSkipped++;
+                    }
                 }
             }
 
@@ -3397,7 +3453,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     particleDebugStuckSamples++;
                     bool inRectA = LocalPointInPortalRect(localCurA, shapeA);
                     bool inRectB = LocalPointInPortalRect(localCurB, shapeB);
-                    Debug.Log("[粒子传送][漏检嫌疑] zA=" + zA.ToString("F3") + " zB=" + zB.ToString("F3") + " 框内A=" + inRectA + " 框内B=" + inRectB + " 配对=" + paired + " 速度=" + worldVel.magnitude.ToString("F1") + " 种子=" + seed.ToString());
+                    Debug.Log("[粒子传送][漏检嫌疑] 系统=" + ps.name + " zA=" + zA.ToString("F3") + " zB=" + zB.ToString("F3") + " 框内A=" + inRectA + " 框内B=" + inRectB + " 配对=" + paired + " 速度=" + worldVel.magnitude.ToString("F1") + " 种子=" + seed.ToString());
                 }
             }
 
@@ -3431,7 +3487,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // 映射速度=反弹【前】速度（当作没反弹直接穿过去，出口粒子才会离开门飞）。
     // 帧内顺序：粒子模拟在所有脚本 Update 之后，本帧读到的反转是最近一次模拟产生的
     // 反弹，粒子在墙边最多可见一帧即被收走。
-    private bool TryBounceCapturePortal(Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, Vector3 prevPos, Vector3 prevVel, Vector3 curPos, Vector3 curVel, float dt, out Vector3 anchorWorld, out Vector3 mappingVel, out float flipStrength)
+    private bool TryBounceCapturePortal(Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, float inflateHalf, Vector3 prevPos, Vector3 prevVel, Vector3 curPos, Vector3 curVel, float dt, out Vector3 anchorWorld, out Vector3 mappingVel, out float flipStrength)
     {
         anchorWorld = curPos;
         mappingVel = curVel;
@@ -3453,7 +3509,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Vector3 bouncePoint = prevPos + prevVel * tb;
         Vector3 local = worldToLocal.MultiplyPoint(bouncePoint);
         if (local.z < PARTICLE_BOUNCE_Z_MIN || local.z > PARTICLE_BOUNCE_Z_MAX) return false;
-        if (!LocalPointInPortalRect(local, shapeType)) return false;
+        if (!InflatedPointInPortalRect(local, shapeType, inflateHalf)) return false;
 
         // 锚点：反弹点沿门法线投影到检测面（z=offset），与旧版锚点语义一致
         anchorWorld = bouncePoint + n * (particleTeleportPlaneOffset - local.z);
@@ -3708,7 +3764,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     //   现改为真正的"后侧深度<=窗值"。窗=0 时本分支自然关闭，零漏检由规则1+调用方规则3保证。
     // hitKind: 1=交点在门框内的实穿越（物理事件，选择时最先发生者优先）；
     //          2=兜底类命中（框外穿越+终点飘入框内 / 后侧追补窗，属状态补救，优先级低于实穿越）。
-    private bool ParticleSegmentCrossesPortal(Vector3 segStart, Vector3 segEnd, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, out float t, out Vector3 hitPoint, out int hitKind)
+    private bool ParticleSegmentCrossesPortal(Vector3 segStart, Vector3 segEnd, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, float inflateHalf, out float t, out Vector3 hitPoint, out int hitKind)
     {
         t = 0f;
         hitPoint = Vector3.zero;
@@ -3730,7 +3786,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             t = zStart / (zStart - zEnd);
             hitPoint = segStart + (segEnd - segStart) * t;
             Vector3 localHit = worldToLocal.MultiplyPoint(hitPoint);
-            if (LocalPointInPortalRect(localHit, shapeType))
+            if (InflatedPointInPortalRect(localHit, shapeType, inflateHalf))
             {
                 hitKind = 1;
                 return true;
@@ -3739,7 +3795,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             // 只查穿越点会漏掉它们。落点安全边距保证不回穿，此处放宽是安全的。
             // 注意这是兜底类命中（kind 2）：穿越点在框外，不是"进门"物理事件。
             Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
-            if (LocalPointInPortalRect(localEnd, shapeType))
+            if (InflatedPointInPortalRect(localEnd, shapeType, inflateHalf))
             {
                 hitKind = 2;
                 return true;
@@ -3753,7 +3809,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             t = 1f;
             hitPoint = segEnd;
             Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
-            if (LocalPointInPortalRect(localEnd, shapeType))
+            if (InflatedPointInPortalRect(localEnd, shapeType, inflateHalf))
             {
                 hitKind = 2;
                 return true;

@@ -281,6 +281,17 @@
 //           无实穿越时兜底命中也取最早。玩家侧补充排查线索：若天花板+地板门高速循环
 //           仍断裂，查场景里 teleportBlockFrames 是否为0（>0会在高速下让整段检测停摆），
 //           并开 debugTeleportCoreLog 抓异常跳变的 [T#] 行（z区间+t值直接暴露晚检测）。
+//     十八轮（2026-08-18，粒子尺寸外扩判定 + 日志限流）：
+//           1) 用户提出"粒子有长宽碰撞盒"思路：门框判定原来只查粒子【中心点】，粒子是面片
+//              不是点——身体压到门框边缘的中心外粒子会被漏掉。实现便宜版：每颗粒子读
+//              startSize（与randomSeed同属Particle结构体纯数据字段，无模块白名单风险），
+//              门框判定外扩 startSize/2（上限1m）。规则1/2/3/4的框内判定统一生效
+//              （InflatedPointInPortalRect）。开关 particleUseSizeInflatedCheck 默认开。
+//              诚实边界：碰撞模块Radius Scale在Udon读不到，外扩是近似；拉伸光束的startSize
+//              即光束宽度（正是横向外扩所需维度）。
+//           2) 事件日志限流（用户反馈刷屏）：每60帧窗口打印前25条+之后每100条1条，
+//              汇总行报告"事件日志共N条，限流省略M条"。事件/漏检嫌疑日志新增系统名——
+//              多系统场景直接看出漏的是哪个系统。
 //     十七轮（2026-08-18，规则4v2反弹点重建=高速带碰撞粒子零漏捕获）：
 //           病因：带碰撞粒子高速冲向门（速度≥~40时），帧内前半段撞墙反弹、帧末已弹回
 //           门前数米——旧规则4检查"帧末位置须在门面前1.05m窗口内"，高速反弹直接跳出
@@ -410,6 +421,7 @@ public static class 传送门中文面板_标签表
         { "particleDiscoveryRefreshInterval", "粒子传送-收集刷新间隔" },
         { "particleTeleportPlaneOffset", "粒子传送-检测面外推(防墙弹)" },
         { "particleTeleportRetroWindow", "粒子传送-后侧追补深度(0=零漏检)" },
+        { "particleUseSizeInflatedCheck", "粒子传送-按粒子尺寸外扩门框判定" },
 
         { "enableVisibilityOptimization", "启用可见性优化" },
         { "maxRenderDistance", "最大渲染距离" },
