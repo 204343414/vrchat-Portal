@@ -3326,11 +3326,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             float tA;
             Vector3 hitA;
             int kindA;
-            bool crossA = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneA, worldToLocalA, shapeA, halfSize, out tA, out hitA, out kindA);
+            bool crossA = ParticleSegmentCrossesPortal(segStart, curPos, worldVel, portalPlaneA, worldToLocalA, shapeA, halfSize, out tA, out hitA, out kindA);
             float tB;
             Vector3 hitB;
             int kindB;
-            bool crossB = ParticleSegmentCrossesPortal(segStart, curPos, portalPlaneB, worldToLocalB, shapeB, halfSize, out tB, out hitB, out kindB);
+            bool crossB = ParticleSegmentCrossesPortal(segStart, curPos, worldVel, portalPlaneB, worldToLocalB, shapeB, halfSize, out tB, out hitB, out kindB);
 
             // 一帧至多一次传送——先碰到哪扇门就进哪扇（九轮关键修复，"取更晚"是高速漏检真凶）：
             // 剪刀形重叠门 + 高速长线段时，一根线段会同帧穿过两扇门的平面。粒子物理上是
@@ -3380,9 +3380,17 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 {
                     doA = true;
                     capturedDepth = particleTeleportPlaneOffset - localCurA.z;
-                    // 二十二轮：捕获点投影回检测面——深度是采样伪影，映射进出口会把出口
-                    // 光束沿出口法线推远"深度"米（两根筷子偏移的根源），投影后出射锚定出口门面。
-                    hitA = curPos + portalPlaneA.forward * capturedDepth;
+                    // 二十三轮：规则3同规则2改为沿运动线反推过面点（直线精确），
+                    // 切线飞行时退化为沿法线投影。出口x/y=真实过面点，不再随漂移位置散射。
+                    float vn3 = Vector3.Dot(worldVel, portalPlaneA.forward);
+                    if (vn3 < -0.01f || vn3 > 0.01f)
+                    {
+                        hitA = curPos - worldVel * ((localCurA.z - particleTeleportPlaneOffset) / vn3);
+                    }
+                    else
+                    {
+                        hitA = curPos + portalPlaneA.forward * capturedDepth;
+                    }
                     tA = 1f;
                     ruleHit = 3;
                 }
@@ -3390,7 +3398,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 {
                     doB = true;
                     capturedDepth = particleTeleportPlaneOffset - localCurB.z;
-                    hitB = curPos + portalPlaneB.forward * capturedDepth;
+                    float vn3 = Vector3.Dot(worldVel, portalPlaneB.forward);
+                    if (vn3 < -0.01f || vn3 > 0.01f)
+                    {
+                        hitB = curPos - worldVel * ((localCurB.z - particleTeleportPlaneOffset) / vn3);
+                    }
+                    else
+                    {
+                        hitB = curPos + portalPlaneB.forward * capturedDepth;
+                    }
                     tB = 1f;
                     ruleHit = 3;
                 }
@@ -3828,7 +3844,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     //   现改为真正的"后侧深度<=窗值"。窗=0 时本分支自然关闭，零漏检由规则1+调用方规则3保证。
     // hitKind: 1=交点在门框内的实穿越（物理事件，选择时最先发生者优先）；
     //          2=兜底类命中（框外穿越+终点飘入框内 / 后侧追补窗，属状态补救，优先级低于实穿越）。
-    private bool ParticleSegmentCrossesPortal(Vector3 segStart, Vector3 segEnd, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, float inflateHalf, out float t, out Vector3 hitPoint, out int hitKind)
+    private bool ParticleSegmentCrossesPortal(Vector3 segStart, Vector3 segEnd, Vector3 curVel, Transform portalPlane, Matrix4x4 worldToLocal, int shapeType, float inflateHalf, out float t, out Vector3 hitPoint, out int hitKind)
     {
         t = 0f;
         hitPoint = Vector3.zero;
@@ -3872,13 +3888,23 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 任何有限窗都追不上（用户实测速度1000复现：框内=True的粒子卡在窗外深处）。
         // 现在深度不限（particleTeleportRetroWindow<=0），框内是唯一也是足够的守卫：
         // 框外的墙后粒子永不误抓。retroWindow>0 时退化为老式深度上限（旧场景兼容用）。
-        // 二十二轮：hitPoint 投影回检测面——深度是采样伪影，若按当前深位置映射，出口光束会沿
-        // 出口门法线被推远"深度"米（用户实测"两根筷子"偏移的根源，出射被甩出30~60米）。
-        // 投影后出射锚定出口门面；框内判定仍用粒子当前真实位置 segEnd。
+        // 二十三轮出射锚定终版：hitPoint 改为【沿粒子自身运动线反推与检测面的交点】——
+        // 直线运动下精确等于真实过面点。此前两版锚定（当前深位置/沿法线投影）都会让出口
+        // x/y 随"漂进框时的随机位置"散射（用户实测：斜射时出口光束像水中折射、位置随机）。
+        // 反推后出口 x/y = 光束真实过面点，同一光束的所有粒子（无论规则1还是规则2抓到）
+        // 映射到同一个点 → 出口是一根连续直线。切线飞行（法向速度≈0）时退化为沿法线投影。
         if (zEnd <= 0f && (particleTeleportRetroWindow <= 0f || zEnd >= -particleTeleportRetroWindow))
         {
             t = 1f;
-            hitPoint = segEnd - normal * zEnd;
+            float vnCur = Vector3.Dot(curVel, normal);
+            if (vnCur < -0.01f || vnCur > 0.01f)
+            {
+                hitPoint = segEnd - curVel * (zEnd / vnCur);
+            }
+            else
+            {
+                hitPoint = segEnd - normal * zEnd;
+            }
             Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
             if (InflatedPointInPortalRect(localEnd, shapeType, inflateHalf))
             {
