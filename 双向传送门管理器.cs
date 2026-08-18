@@ -167,14 +167,14 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // 说明它被门位置的墙体碰撞体弹回（碰撞粒子在穿越检测面前就反弹时的唯一可观测信号）。
     private Vector3[] particlePrevVelocities = new Vector3[PARTICLE_PAIRING_SLOTS * PARTICLE_PAIRING_STRIDE];
 
-    // 传送后免疫（十六轮）：本槽位最近一次传送发生的帧号。种子配对成立 + 距上次传送
-    // 不足 PARTICLE_TELEPORT_IMMUNE_FRAMES 帧 → 跳过全部规则，打断"同一颗粒子反复传送
-    // （停几下抽搐再走）"的循环。落点有0.2米前推边距，出口粒子不可能在2帧内合法地
-    // 再进任何门；高速粒子<100m/s时2帧位移≈3.3米，若两门超近距离贴身摆放请留意此窗。
-    private const int PARTICLE_TELEPORT_IMMUNE_FRAMES = 2;
-    private int[] particlePrevTeleportFrame = new int[PARTICLE_PAIRING_SLOTS * PARTICLE_PAIRING_STRIDE];
-    // 帧计数器初始值远大于免疫窗：避免开局前两帧所有粒子被误判为"刚传送过"。
-    private int particleTeleportFrameCounter = 1000;
+    // 传送后防回弹设计（十六轮终稿，用户裁决）：【不做时间型免疫帧】——Portal 语义要求
+    // 激光粒子可短时间内反复套娃穿门（A→B→A…），帧数免疫会吞掉第三次合法进洞、制造
+    // 新的"穿墙"。防回弹靠三条状态型保证：
+    //   1) 出口落点前推 landingPush(2*offset+0.1)，恒在出口门前侧；
+    //   2) 半转映射后出口速度必然背离出口门平面（几何不变量，与速度大小无关）；
+    //   3) 规则本身状态型：规则1要求真实穿越、规则3要求未配对、规则4要求速度反转。
+    // 若实测仍有"反复传送"，用 [粒子传送][事件] 日志定位是具体哪条规则在重抓，修该规则。
+    // （玩家侧同哲学：teleportBlockFrames 默认0关闭，实际守卫是出口侧修正+lastBodySide。）
 
     // Custom 空间警告去重（每系统只警告一次，最多记8个）
     private ParticleSystem[] customSpaceWarnedSystems = new ParticleSystem[8];
@@ -3082,9 +3082,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // - 性能闸门：白名单/收集根自动收集 + 距离闸门 + 缓冲初始大小（自动扩容）。
     // - 检测面沿法线外推 particleTeleportPlaneOffset：贴墙/地板门 + 带碰撞粒子的场景，
     //   粒子会被墙体在门平面处弹走永远穿不过平面，外推检测面让粒子撞墙前就传送。
-    // - 空间语义（十六轮起自动分流）：每系统处理时读主模块 simulationSpace——
-    //   World(0)直通世界坐标；Local(1)粒子坐标先经系统Transform转世界判定、写回时转回局部；
-    //   Custom(2)按Local处理（假设customSimulationSpace=自身Transform，警告一次）。
+    // - 空间语义（自动分流）：每系统处理时读主模块 simulationSpace，枚举数值按 Unity
+    //   参考源码（ParticleSystemEnums.cs）：Local=0 经系统Transform局部↔世界转换；
+    //   World=1 直通世界坐标；Custom=2 按Local处理（假设customSimulationSpace=自身
+    //   Transform，警告一次）。
     // ============================================================
 
     private void ProcessParticleTeleports()
@@ -3095,8 +3096,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         bool hasPlaced = placedDiscoverySystems != null && placedDiscoveryCount > 0;
         if (!hasDiscovered && !hasPlaced) return;
         if (portalPlaneA == null || portalPlaneB == null) return;
-
-        particleTeleportFrameCounter++;
 
         int bufferSize = Mathf.Max(32, particleTeleportBufferSize);
         if (particleTeleportBuffer == null || particleTeleportBuffer.Length < bufferSize)
@@ -3157,10 +3156,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     {
         if (ps == null) return;
 
-        // 十六轮：自动空间识别（ps.main.simulationSpace 已用编译探针实测通过 UdonSharp 白名单）。
-        // World=0 直通；Local=1 按系统Transform局部↔世界转换；Custom=2 按Local处理并警告一次。
+        // 自动空间识别（ps.main.simulationSpace 已用编译探针实测通过 UdonSharp 白名单）。
+        // 枚举数值以 Unity 官方参考源码为准（ParticleSystemEnums.cs）：
+        //   Local=0（按系统Transform局部↔世界转换，写回转回局部）
+        //   World=1（直通）
+        //   Custom=2（按Local处理，假设customSimulationSpace=自身Transform，警告一次）
+        // ⚠️ 十六轮首版把 Local/World 数值写反，导致 World 粒子被双重变换、Local 粒子被
+        //   按世界坐标直读——实测"传送 0 次"回归，就是这一行。
         int simSpace = (int)ps.main.simulationSpace;
-        bool localMode = simSpace != 0;
+        bool localMode = (simSpace == 0 || simSpace == 2);
         if (simSpace == 2) WarnCustomSpaceOnce(ps);
 
         // 排除根拦截（黑名单）：枪载【World空间】系统（枪口特效）自动排除防鬼畜；
@@ -3207,17 +3211,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             // 配对槽位索引（池满 sysSlot<0 或单系统超出 STRIDE → 全部按"未配对"处理）
             int pairIdx = (sysSlot >= 0 && i < PARTICLE_PAIRING_STRIDE) ? sysSlot * PARTICLE_PAIRING_STRIDE + i : -1;
             bool paired = pairIdx >= 0 && particlePrevValid[pairIdx] && particlePrevSeeds[pairIdx] == seed;
-
-            // 传送后免疫（十六轮）：同一种子刚被传送过 → 本帧只更新历史、跳过全部规则。
-            // 打断"同一颗粒子反复传送（停几下抽搐再走）"的循环；新粒子种子不同不受影响。
-            if (paired && particleTeleportFrameCounter <= particlePrevTeleportFrame[pairIdx] + PARTICLE_TELEPORT_IMMUNE_FRAMES)
-            {
-                particlePrevPositions[pairIdx] = curPos;
-                particlePrevSeeds[pairIdx] = seed;
-                particlePrevVelocities[pairIdx] = worldVel;
-                particlePrevValid[pairIdx] = true;
-                continue;
-            }
 
             Vector3 segStart;
             if (paired)
@@ -3355,7 +3348,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 TeleportParticleThroughPortal(ref p, hitA, mappingVel, tA, dt, worldToLocalA, localToWorldB);
                 wasTeleported = true;
-                if (pairIdx >= 0) particlePrevTeleportFrame[pairIdx] = particleTeleportFrameCounter;
                 if (debugParticleTeleportLog)
                 {
                     particleDebugTeleportCount++;
@@ -3366,7 +3358,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 TeleportParticleThroughPortal(ref p, hitB, mappingVel, tB, dt, worldToLocalB, localToWorldA);
                 wasTeleported = true;
-                if (pairIdx >= 0) particlePrevTeleportFrame[pairIdx] = particleTeleportFrameCounter;
                 if (debugParticleTeleportLog)
                 {
                     particleDebugTeleportCount++;
@@ -3632,8 +3623,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     {
         if (ps == null) return false;
         if (placedDiscoverySystems == null) return false;
-        // 十六轮：注册时同样按空间分流排除（Local枪载系统放行；World枪载系统不注册）
-        bool localMode = (int)ps.main.simulationSpace != 0;
+        // 注册时同样按空间分流排除（Local枪载系统放行；World枪载系统不注册）。
+        // 枚举数值：Local=0 World=1 Custom=2（Unity 参考源码 ParticleSystemEnums.cs）。
+        int regSimSpace = (int)ps.main.simulationSpace;
+        bool localMode = (regSimSpace == 0 || regSimSpace == 2);
         if (IsParticleSystemExcluded(ps, localMode)) return false;
         // 注册表满了自动翻倍扩容（旧行为是静默丢弃——密集世界里第65个之后的系统会无声漏注册）
         if (placedDiscoveryCount >= placedDiscoverySystems.Length)
