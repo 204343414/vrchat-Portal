@@ -186,7 +186,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // 传送后防回弹设计（十六轮终稿，用户裁决）：【不做时间型免疫帧】——Portal 语义要求
     // 激光粒子可短时间内反复套娃穿门（A→B→A…），帧数免疫会吞掉第三次合法进洞、制造
     // 新的"穿墙"。防回弹靠三条状态型保证：
-    //   1) 出口落点前推 landingPush(2*offset+0.1)，恒在出口门前侧；
+    //   1) 出口落点前推：沿出口光束方向0.2m+切线兜底沿出口侧法线≥0.05m（二十四轮起，
+    //      恒在出口门的前侧；旧法线推法随二十四轮重构废弃）；
     //   2) 半转映射后出口速度必然背离出口门平面（几何不变量，与速度大小无关）；
     //   3) 规则本身状态型：规则1要求真实穿越、规则3要求未配对、规则4要求速度反转。
     // 若实测仍有"反复传送"，用 [粒子传送][事件] 日志定位是具体哪条规则在重抓，修该规则。
@@ -3456,7 +3457,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             if (doA)
             {
-                TeleportParticleThroughPortal(ref p, hitA, mappingVel, tA, dt, worldToLocalA, localToWorldB);
+                TeleportParticleThroughPortal(ref p, hitA, mappingVel, portalPlaneA, worldToLocalA, localToWorldB);
                 wasTeleported = true;
                 if (debugParticleTeleportLog)
                 {
@@ -3466,7 +3467,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     if (particleDebugEventLogged <= 25 || (particleDebugEventLogged % 100) == 0)
                     {
                         // 二十二轮新增：入深（捕获时离入口检测面的深度；规则1≈0）+ 出射面距
-                        // （出射点到出口检测面的距离，应≈0.2左右=landingPush；远大于此=锚定异常）
+                        // （出射点到出口门平面的距离；二十四轮后应≈±0.05~0.2，符号随门的
+                        // forward朝向——正值=forward侧。远大于此=锚定异常/剩余积分残留）
                         float exitPlaneDist = Vector3.Dot(p.position - portalPlaneB.position, portalPlaneB.forward);
                         Debug.Log("[粒子传送][事件] 规则" + ruleHit + " A→B 系统=" + ps.name + " 种子=" + seed + " 入深=" + capturedDepth.ToString("F2") + " 出射面距=" + exitPlaneDist.ToString("F2") + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
                     }
@@ -3478,7 +3480,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
             else if (doB)
             {
-                TeleportParticleThroughPortal(ref p, hitB, mappingVel, tB, dt, worldToLocalB, localToWorldA);
+                TeleportParticleThroughPortal(ref p, hitB, mappingVel, portalPlaneB, worldToLocalB, localToWorldA);
                 wasTeleported = true;
                 if (debugParticleTeleportLog)
                 {
@@ -3917,11 +3919,22 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return false;
     }
 
-    // 把单颗粒子映射到另一侧：穿越点 from→to+经典半转，速度同映射，
-    // 再把穿越后剩余的那段时间按映射后速度继续积分（与刚体穿越的 postCross 思路一致）。
-    private void TeleportParticleThroughPortal(ref ParticleSystem.Particle p, Vector3 hitPoint, Vector3 vel, float t, float dt, Matrix4x4 worldToLocalFrom, Matrix4x4 localToWorldTo)
+    // 把单颗粒子映射到另一侧：穿越点 from→to+经典半转，速度同映射。
+    // 二十四轮出射连续性重构（用户实测"水中折射/断层/散射"的根治）：
+    // 1) 锚点移到【真实门平面】(z=0)：调用方传入的 hitPoint 在检测面(z=+offset)上，
+    //    斜射时其横向位置比真实过门点偏 offset×tanθ（角度越大偏越多）——统一回移 offset；
+    // 2) 前推改为沿【出口光束方向】0.2m：旧版沿出口【法线】推 landingPush，斜射时把
+    //    整条出口光束横移 landingPush×cosθ=横向断层；沿光束推则出口光束与入口光束的
+    //    映射像严格是同一条直线（零横向断层）。切线飞行时兜底沿出口侧法线补推到0.05m；
+    // 3) 移除 remainingTime 帧内积分：旧版把出射粒子沿光束推出最多 速度×dt 米（1000m/s
+    //    低帧率下可达50米），门面上留下一段无粒子缝隙=断层，速度越快缝隙越大
+    //    （用户实测：速度10无感、100略明显、1000断层）。代价：粒子在传送帧损失
+    //    (1-t)×dt 的运动（次帧配对从出口继续，视觉不可见）。
+    // 防回穿乒乓：出口恒在出口侧≥0.05m（frontZ 兜底），规则1/2/3/4 不会回抓。
+    private void TeleportParticleThroughPortal(ref ParticleSystem.Particle p, Vector3 hitPoint, Vector3 vel, Transform fromPlane, Matrix4x4 worldToLocalFrom, Matrix4x4 localToWorldTo)
     {
-        Vector3 localHit = worldToLocalFrom.MultiplyPoint(hitPoint);
+        Vector3 realHit = hitPoint - fromPlane.forward * particleTeleportPlaneOffset;
+        Vector3 localHit = worldToLocalFrom.MultiplyPoint(realHit);
         Vector3 localVel = worldToLocalFrom.MultiplyVector(vel);
         if (useClassicHalfTurn)
         {
@@ -3931,16 +3944,26 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Vector3 exitPos = localToWorldTo.MultiplyPoint(localHit);
         Vector3 exitVel = localToWorldTo.MultiplyVector(localVel);
 
-        // 落点安全边距（防回穿乒乓，必需）：halfTurn 会把入口检测面的 z=+offset 翻成出口侧
-        // z=-offset（落在出口平面后方）。把落点推过出口检测面即可。
-        // 六轮简化：旧版在这里额外加了一个 retroWindow 裕量（怕被判定窗回抓）；新版规则2只抓
-        // 检测面【后侧】，而出口粒子落在出口门【前侧】且沿映射速度远离，永远不会被任何规则回抓，
-        // 窗值裕量不再需要——出射点因此比旧版缩近了 retroWindow 米。
-        Vector3 exitForward = localToWorldTo.MultiplyVector(Vector3.forward);
-        float landingPush = particleTeleportPlaneOffset * 2f + 0.1f;
-
-        float remainingTime = Mathf.Max(0f, (1f - t) * dt);
-        p.position = exitPos + exitForward * landingPush + exitVel * remainingTime;
+        float speed = exitVel.magnitude;
+        Vector3 exitNormal = localToWorldTo.MultiplyVector(Vector3.forward);
+        if (speed > 0.001f)
+        {
+            // 沿光束方向前推0.2m（防回穿乒乓的最小前侧距离）
+            p.position = exitPos + new Vector3(exitVel.x / speed, exitVel.y / speed, exitVel.z / speed) * 0.2f;
+            // 前侧保证：localVel.z（半转后）的符号即出口侧方向（符号随门的forward朝向）。
+            // 切线飞行时沿光束推不动前侧，补沿出口侧法线推到≥0.05m。
+            float frontZ = 0.2f * (localVel.z / speed);
+            float absZ = frontZ < 0f ? -frontZ : frontZ;
+            if (absZ < 0.05f)
+            {
+                float side = frontZ >= 0f ? 1f : -1f;
+                p.position += exitNormal * (side * (0.05f - absZ));
+            }
+        }
+        else
+        {
+            p.position = exitPos + exitNormal * 0.2f;
+        }
         p.velocity = exitVel;
     }
 
