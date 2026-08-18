@@ -3361,6 +3361,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             // 本帧局部坐标（规则3/规则4/诊断共用，每粒子只算一次）
             Vector3 localCurA = worldToLocalA.MultiplyPoint(curPos);
             Vector3 localCurB = worldToLocalB.MultiplyPoint(curPos);
+            // 二十二轮：捕获深度（诊断用）——规则2/3抓的是"已在门后深处"的粒子，
+            // 深度是采样伪影不是物理位置；捕获点会投影回检测面（出射锚定修复），
+            // 此值仅用于日志展示入深。
+            float capturedDepth = 0f;
 
             // 规则3 首见后侧兜底（window=0 零漏检的安全网）：未配对粒子当前位置已在
             // 检测面后侧且在门框内 → 立即传送。覆盖一切"穿越那一刻无记录"的情况：
@@ -3375,18 +3379,26 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if (behindA && (!behindB || localCurA.z <= localCurB.z))
                 {
                     doA = true;
-                    hitA = curPos;
+                    capturedDepth = particleTeleportPlaneOffset - localCurA.z;
+                    // 二十二轮：捕获点投影回检测面——深度是采样伪影，映射进出口会把出口
+                    // 光束沿出口法线推远"深度"米（两根筷子偏移的根源），投影后出射锚定出口门面。
+                    hitA = curPos + portalPlaneA.forward * capturedDepth;
                     tA = 1f;
                     ruleHit = 3;
                 }
                 else if (behindB)
                 {
                     doB = true;
-                    hitB = curPos;
+                    capturedDepth = particleTeleportPlaneOffset - localCurB.z;
+                    hitB = curPos + portalPlaneB.forward * capturedDepth;
                     tB = 1f;
                     ruleHit = 3;
                 }
             }
+
+            // 二十二轮：规则2的捕获深度记录（诊断用；捕获点已在函数内投影回检测面）
+            if (doA && ruleHit == 2) capturedDepth = particleTeleportPlaneOffset - localCurA.z;
+            else if (doB && ruleHit == 2) capturedDepth = particleTeleportPlaneOffset - localCurB.z;
 
             // 规则4 v2 反弹捕获（十七轮重构）：速度反转 + 反弹点重建（详见 TryBounceCapturePortal）。
             // 覆盖一切速度：高速粒子帧内反弹、帧末弹回数米远的场景，旧位置窗口漏捕90%，
@@ -3437,7 +3449,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     // 十八轮限流：每60帧窗口打印前25条+之后每100条1条，防疯狂刷屏；省略数进汇总
                     if (particleDebugEventLogged <= 25 || (particleDebugEventLogged % 100) == 0)
                     {
-                        Debug.Log("[粒子传送][事件] 规则" + ruleHit + " A→B 系统=" + ps.name + " 种子=" + seed + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
+                        // 二十二轮新增：入深（捕获时离入口检测面的深度；规则1≈0）+ 出射面距
+                        // （出射点到出口检测面的距离，应≈0.2左右=landingPush；远大于此=锚定异常）
+                        float exitPlaneDist = Vector3.Dot(p.position - portalPlaneB.position, portalPlaneB.forward);
+                        Debug.Log("[粒子传送][事件] 规则" + ruleHit + " A→B 系统=" + ps.name + " 种子=" + seed + " 入深=" + capturedDepth.ToString("F2") + " 出射面距=" + exitPlaneDist.ToString("F2") + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
                     }
                     else
                     {
@@ -3455,7 +3470,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     particleDebugEventLogged++;
                     if (particleDebugEventLogged <= 25 || (particleDebugEventLogged % 100) == 0)
                     {
-                        Debug.Log("[粒子传送][事件] 规则" + ruleHit + " B→A 系统=" + ps.name + " 种子=" + seed + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
+                        float exitPlaneDist = Vector3.Dot(p.position - portalPlaneA.position, portalPlaneA.forward);
+                        Debug.Log("[粒子传送][事件] 规则" + ruleHit + " B→A 系统=" + ps.name + " 种子=" + seed + " 入深=" + capturedDepth.ToString("F2") + " 出射面距=" + exitPlaneDist.ToString("F2") + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
                     }
                     else
                     {
@@ -3856,10 +3872,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 任何有限窗都追不上（用户实测速度1000复现：框内=True的粒子卡在窗外深处）。
         // 现在深度不限（particleTeleportRetroWindow<=0），框内是唯一也是足够的守卫：
         // 框外的墙后粒子永不误抓。retroWindow>0 时退化为老式深度上限（旧场景兼容用）。
+        // 二十二轮：hitPoint 投影回检测面——深度是采样伪影，若按当前深位置映射，出口光束会沿
+        // 出口门法线被推远"深度"米（用户实测"两根筷子"偏移的根源，出射被甩出30~60米）。
+        // 投影后出射锚定出口门面；框内判定仍用粒子当前真实位置 segEnd。
         if (zEnd <= 0f && (particleTeleportRetroWindow <= 0f || zEnd >= -particleTeleportRetroWindow))
         {
             t = 1f;
-            hitPoint = segEnd;
+            hitPoint = segEnd - normal * zEnd;
             Vector3 localEnd = worldToLocal.MultiplyPoint(segEnd);
             if (InflatedPointInPortalRect(localEnd, shapeType, inflateHalf))
             {
