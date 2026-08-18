@@ -126,12 +126,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
              "想要'撞墙前就被吸进门'的视觉就把此值调大到超过粒子碰撞半径（Collision模块勾Visualize Bounds可看见碰撞球）。")]
     public float particleTeleportPlaneOffset = 0.05f;
 
-    [Tooltip("后侧追补深度（米，沿门法线越过检测面之后的深度）。六轮语义修正：旧版符号写反了——" +
-             "旧条件抓的是门【前侧】正在靠近的粒子（甚至会把门前窗值米内的粒子提前吸走），后侧漏检从来抓不到，这是'窗=2仍残留隧穿'的病根。" +
-             "现已改为真正的'已过检测面且深度<=此值'追补。种子配对+出生反推+首见后侧兜底之后，此窗=0 也能一个不漏；" +
-             ">0 只是给槽位洗牌等极端情况多一层保险。调大代价：落点安全边距随之加大（出射点=2*offset+此窗+0.1），推荐 0~0.3。")]
+    [Tooltip("后侧追补深度（米，沿门法线越过检测面之后的深度）。十九轮修正：旧tooltip称'窗=0也一个不漏'只对正对门框直射的粒子成立——" +
+             "斜擦门边的粒子会在【框外】穿过检测面、随后才横向飘进门框后侧区域：穿越瞬间在框外（规则1不认）、飘进框时又无穿越事件，" +
+             "配对粒子会永远卡在门后（实测速度10斜射已复现：框内=True 配对=True 卡在z=-0.25~-0.33）。" +
+             "本窗就是这类'漂移入框'的补抓：已过检测面且深度<=此值且框内 → 传送。0=关闭（门后滞留永不清理）；" +
+             "推荐0.3~0.5（速度<=100），高速/大角度斜射可用到1.0。代价：粒子越过门面最深'此值'米后才被传送（框内才抓，视觉轻微）。")]
     [Range(0f, 2f)]
-    public float particleTeleportRetroWindow = 0f;
+    public float particleTeleportRetroWindow = 0.5f;
 
     [Tooltip("粒子传送诊断日志：每60帧输出一次'检测了多少粒子/传送了多少次'。粒子隧穿不传送时用它定位卡在哪一环：检测数=0说明系统没被读取（Simulation Space不是World/系统没播放/距离闸门）；检测数>0但传送=0说明穿越判定不命中（空间语义/门框范围/方向）。")]
     public bool debugParticleTeleportLog = false;
@@ -3182,7 +3183,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 particleDebugFrameCounter = 0;
                 int rootListCount = discoveredParticleSystems != null ? discoveredParticleSystems.Length : 0;
-                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（其中反弹捕获 " + particleDebugBounceCount + "），过平面滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容；事件日志共" + particleDebugEventLogged + "条，限流省略" + particleDebugEventSkipped + "条）");
+                Debug.Log("[粒子传送] 最近60帧：检测 " + particleDebugTestedCount + " 个粒子次，传送 " + particleDebugTeleportCount + " 次（其中反弹捕获 " + particleDebugBounceCount + "），门后框内滞留 " + particleDebugStuckCount + " 颗次，缓冲扩容 " + particleDebugTruncatedSystems + " 次（已注册：root扫描" + rootListCount + " + 放置发现" + placedDiscoveryCount + "，缓冲初始" + particleTeleportBufferSize + "自动扩容；事件日志共" + particleDebugEventLogged + "条，限流省略" + particleDebugEventSkipped + "条）");
                 particleDebugTestedCount = 0;
                 particleDebugTeleportCount = 0;
                 particleDebugBounceCount = 0;
@@ -3436,14 +3437,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 changed = true;
             }
 
-            // 诊断探针：
-            // 滞留计数 = 在实际平面(z<0)后侧未被传送。六轮后此值应收敛到接近0（只剩门框外的后侧粒子）；
-            // 样本只采"检测面后侧且深度浅(0~0.5m)"的未传送粒子——那才是刚穿越却没被传送的真隧穿嫌疑。
+            // 诊断探针（十九轮细化）：
+            // 滞留计数 = 已在检测面后侧【且框内】未被传送（框内才叫漏；框外=粒子根本不在门口，
+            // 属光束射偏/穿墙飞走，不是检测漏，不再计入）。样本采"后侧浅深度(0~0.5m)"的未传送粒子。
             if (debugParticleTeleportLog && !wasTeleported)
             {
                 float zA = localCurA.z;
                 float zB = localCurB.z;
-                if (zA < -0.01f || zB < -0.01f) particleDebugStuckCount++;
+                bool inRectA = InflatedPointInPortalRect(localCurA, shapeA, halfSize);
+                bool inRectB = InflatedPointInPortalRect(localCurB, shapeB, halfSize);
+                if ((zA < -0.01f && inRectA) || (zB < -0.01f && inRectB)) particleDebugStuckCount++;
 
                 float off = particleTeleportPlaneOffset;
                 bool suspectA = zA <= off && zA > off - 0.5f;
@@ -3451,8 +3454,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if ((suspectA || suspectB) && particleDebugStuckSamples < 6)
                 {
                     particleDebugStuckSamples++;
-                    bool inRectA = LocalPointInPortalRect(localCurA, shapeA);
-                    bool inRectB = LocalPointInPortalRect(localCurB, shapeB);
                     Debug.Log("[粒子传送][漏检嫌疑] 系统=" + ps.name + " zA=" + zA.ToString("F3") + " zB=" + zB.ToString("F3") + " 框内A=" + inRectA + " 框内B=" + inRectB + " 配对=" + paired + " 速度=" + worldVel.magnitude.ToString("F1") + " 种子=" + seed.ToString());
                 }
             }
