@@ -186,8 +186,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // 传送后防回弹设计（十六轮终稿，用户裁决）：【不做时间型免疫帧】——Portal 语义要求
     // 激光粒子可短时间内反复套娃穿门（A→B→A…），帧数免疫会吞掉第三次合法进洞、制造
     // 新的"穿墙"。防回弹靠三条状态型保证：
-    //   1) 出口落点前推：沿出口光束方向0.2m+切线兜底沿出口侧法线≥0.05m（二十四轮起，
-    //      恒在出口门的前侧；旧法线推法随二十四轮重构废弃）；
+    //   1) 出口落点前推：沿出口光束方向推，法向分量恰好=offset+0.01（二十五轮起——
+    //      最小安全值：必须越过出口检测面(z=offset)，否则下帧线段会再穿检测面被规则1
+    //      回抓=乒乓；近垂直入射时贴门面0.06m，可见死区最小）；
     //   2) 半转映射后出口速度必然背离出口门平面（几何不变量，与速度大小无关）；
     //   3) 规则本身状态型：规则1要求真实穿越、规则3要求未配对、规则4要求速度反转。
     // 若实测仍有"反复传送"，用 [粒子传送][事件] 日志定位是具体哪条规则在重抓，修该规则。
@@ -3467,8 +3468,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                     if (particleDebugEventLogged <= 25 || (particleDebugEventLogged % 100) == 0)
                     {
                         // 二十二轮新增：入深（捕获时离入口检测面的深度；规则1≈0）+ 出射面距
-                        // （出射点到出口门平面的距离；二十四轮后应≈±0.05~0.2，符号随门的
-                        // forward朝向——正值=forward侧。远大于此=锚定异常/剩余积分残留）
+                        // （出射点到出口门平面的距离；二十五轮起应≈±(offset+0.01)≈0.06，
+                        // 符号随门的forward朝向。远大于此=锚定异常/剩余积分残留）
                         float exitPlaneDist = Vector3.Dot(p.position - portalPlaneB.position, portalPlaneB.forward);
                         Debug.Log("[粒子传送][事件] 规则" + ruleHit + " A→B 系统=" + ps.name + " 种子=" + seed + " 入深=" + capturedDepth.ToString("F2") + " 出射面距=" + exitPlaneDist.ToString("F2") + " 出射=(" + p.position.x.ToString("F2") + "," + p.position.y.ToString("F2") + "," + p.position.z.ToString("F2") + ")");
                     }
@@ -3948,21 +3949,31 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Vector3 exitNormal = localToWorldTo.MultiplyVector(Vector3.forward);
         if (speed > 0.001f)
         {
-            // 沿光束方向前推0.2m（防回穿乒乓的最小前侧距离）
-            p.position = exitPos + new Vector3(exitVel.x / speed, exitVel.y / speed, exitVel.z / speed) * 0.2f;
-            // 前侧保证：localVel.z（半转后）的符号即出口侧方向（符号随门的forward朝向）。
-            // 切线飞行时沿光束推不动前侧，补沿出口侧法线推到≥0.05m。
-            float frontZ = 0.2f * (localVel.z / speed);
-            float absZ = frontZ < 0f ? -frontZ : frontZ;
-            if (absZ < 0.05f)
+            // 二十五轮：前推压到最小安全距离——法向分量恰好 targetZ=offset+0.01（防回穿的最小值：
+            // 必须越过出口检测面(z=offset)，否则下帧线段会再穿检测面被规则1回抓=乒乓）。
+            // 沿光束推（法向分量达标即可）：近垂直入射时出口贴门面0.06m（旧版0.2m的可见死区
+            // 消失——用户实测stretched billboard下"出口中间断开"的根源）；
+            // 切线入射时沿光束推不动法向（推距封顶2m），补沿出口侧法线推足targetZ。
+            float cosComp = localVel.z / speed;   // 出口光束的法向分量比例（带符号，符号=出口侧朝向）
+            float targetZ = particleTeleportPlaneOffset + 0.01f;
+            float side = cosComp >= 0f ? 1f : -1f;
+            float absCos = cosComp < 0f ? -cosComp : cosComp;
+            float push = 0f;
+            if (absCos > 0.01f)
             {
-                float side = frontZ >= 0f ? 1f : -1f;
-                p.position += exitNormal * (side * (0.05f - absZ));
+                push = targetZ / absCos;
+                if (push > 2f) push = 2f;
+            }
+            p.position = exitPos + new Vector3(exitVel.x / speed, exitVel.y / speed, exitVel.z / speed) * push;
+            float zNow = Vector3.Dot(p.position - exitPos, exitNormal);
+            if (side * zNow < targetZ)
+            {
+                p.position += exitNormal * (side * (targetZ - side * zNow));
             }
         }
         else
         {
-            p.position = exitPos + exitNormal * 0.2f;
+            p.position = exitPos + exitNormal * (particleTeleportPlaneOffset + 0.01f);
         }
         p.velocity = exitVel;
     }
