@@ -3166,13 +3166,66 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // 刚体传送核心：SebLague traveller 逻辑的 Udon 固定数组版
     // ============================================================
 
+    public void ProcessHeldRigidbodyPhysics()
+    {
+        if (!enabled || !enableRigidbodyTeleport || !allowHeldRigidbodyTeleport || portalGun == null || portalGun.GetHeldRigidbody() == null) return;
+        if (portalPlaneA == null || portalPlaneB == null || !portalPlaneA.gameObject.activeInHierarchy || !portalPlaneB.gameObject.activeInHierarchy) return;
+        ProcessRigidbodyForPortal(true, true);
+        if (portalGun.GetHeldRigidbody() != null) ProcessRigidbodyForPortal(false, true);
+    }
+
+    public bool HeldBoundsFitPortal(Transform portal, Bounds bounds, Vector3 displacement, float padding)
+    {
+        if (portal == null || (portal != portalPlaneA && portal != portalPlaneB)) return false;
+        Collider[] colliders = portalGun == null ? null : portalGun.GetHeldBodyColliders();
+        if (colliders == null || colliders.Length == 0) return false;
+        int shape = ResolvePortalShape(portal == portalPlaneA);
+        int exitShape = ResolvePortalShape(portal != portalPlaneA);
+        for (int c = 0; c < colliders.Length; c++)
+        {
+            Collider collider = colliders[c];
+            if (collider == null || !collider.enabled || collider.isTrigger || collider.attachedRigidbody != portalGun.GetHeldRigidbody()) continue;
+            if (collider.GetType() == typeof(BoxCollider))
+            {
+                BoxCollider box = (BoxCollider)collider;
+                Vector3 scale = box.transform.lossyScale;
+                Vector3 localPadding = new Vector3(padding / Mathf.Max(Mathf.Abs(scale.x), 0.0001f),
+                    padding / Mathf.Max(Mathf.Abs(scale.y), 0.0001f), padding / Mathf.Max(Mathf.Abs(scale.z), 0.0001f));
+                Vector3 half = box.size * 0.5f + localPadding;
+                for (int i = 0; i < 8; i++)
+                {
+                    Vector3 localCorner = box.center + new Vector3((i & 1) == 0 ? -half.x : half.x, (i & 2) == 0 ? -half.y : half.y, (i & 4) == 0 ? -half.z : half.z);
+                    Vector3 portalLocal = LocalPointForPortal(portal, collider.transform.TransformPoint(localCorner) + displacement);
+                    if (!LocalPointInPortalRect(portalLocal, shape) || !LocalPointInPortalRect(portalLocal, exitShape)) return false;
+                }
+            }
+            else
+            {
+                Bounds colliderBounds = collider.bounds;
+                Vector3 extents = colliderBounds.extents + Vector3.one * padding;
+                for (int i = 0; i < 8; i++)
+                {
+                    Vector3 corner = colliderBounds.center + displacement + new Vector3((i & 1) == 0 ? -extents.x : extents.x, (i & 2) == 0 ? -extents.y : extents.y, (i & 4) == 0 ? -extents.z : extents.z);
+                    Vector3 portalLocal = LocalPointForPortal(portal, corner);
+                    if (!LocalPointInPortalRect(portalLocal, shape) || !LocalPointInPortalRect(portalLocal, exitShape)) return false;
+                }
+            }
+        }
+        return true;
+    }
+
+    public void ReleaseHeldPortalPhysics(Rigidbody rb)
+    {
+        if (rb != null && enableRigidbodyTeleport && IsRigidbodyTrackedByEitherPortal(rb)) rb.gameObject.layer = rigidbodyPassThroughLayer;
+    }
+
     private void ProcessRigidbodyTravellers()
     {
         if (portalPlaneA == null || portalPlaneB == null) return;
 
         // 等价于 Seb 原版每个 Portal 在 LateUpdate 里 HandleTravellers。
-        ProcessRigidbodyForPortal(true);
-        ProcessRigidbodyForPortal(false);
+        ProcessRigidbodyForPortal(true, false);
+        ProcessRigidbodyForPortal(false, false);
     }
 
     // ============================================================
@@ -4420,7 +4473,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return InflatedPointInPortalRect(localPoint, shapeType, inflateHalf);
     }
 
-    private void ProcessRigidbodyForPortal(bool isPortalA)
+    private void ProcessRigidbodyForPortal(bool isPortalA, bool heldOnly)
     {
         Transform thisPlane = isPortalA ? portalPlaneA : portalPlaneB;
         Transform otherPlane = isPortalA ? portalPlaneB : portalPlaneA;
@@ -4440,6 +4493,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (baseThresholdDepth < 0.01f) baseThresholdDepth = 0.01f;
         float heldThresholdDepth = noClipDepth + heldRigidbodyTriggerDepthExtension;
         if (heldThresholdDepth < 0.01f) heldThresholdDepth = 0.01f;
+        if (portalGun != null) heldThresholdDepth = Mathf.Max(heldThresholdDepth, portalGun.GetHeldPortalTrackingDepth(thisPlane));
 
         // 查询体积可以比基础阈值大：目的是让高速刚体“有机会被加入追踪”。
         // 是否真正加入追踪，下面还会按该刚体自己的法线速度算 rbThresholdDepth。
@@ -4451,14 +4505,23 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         // 1) OnTravellerEnterPortal 替代：用 OverlapBox 找到进入门阈值体积的刚体，并加入本门追踪。
         // 注意：这里只“加入追踪”，绝不因为进入体积就直接传送；真正传送必须等下面的平面穿越判断。
-        int overlapCount = Physics.OverlapBoxNonAlloc(
-            thisPlane.position,
-            new Vector3(hx, hy, queryDepth),
-            rbOverlapBuffer,
-            thisPlane.rotation,
-            ~0,
-            QueryTriggerInteraction.Collide
-        );
+        int overlapCount;
+        if (heldOnly)
+        {
+            rbOverlapBuffer[0] = portalGun.GetHeldBodyCollider();
+            overlapCount = 1;
+        }
+        else
+        {
+            overlapCount = Physics.OverlapBoxNonAlloc(
+                thisPlane.position,
+                new Vector3(hx, hy, queryDepth),
+                rbOverlapBuffer,
+                thisPlane.rotation,
+                ~0,
+                QueryTriggerInteraction.Collide
+            );
+        }
 
         for (int c = 0; c < overlapCount; c++)
         {
@@ -4474,6 +4537,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (IsGameObjectOurClone(rb.gameObject)) continue;
 
             bool heldByGun = portalGun != null && portalGun.GetHeldRigidbody() == rb;
+            if (heldOnly && !heldByGun) continue;
             if (rb.isKinematic && !heldByGun) continue;
             if (heldByGun && !allowHeldRigidbodyTeleport) continue;
 
@@ -4532,7 +4596,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 ApplyPortalOverlayToGameObject(rb.gameObject);
             }
 
-            if (rb.gameObject.layer != rigidbodyPassThroughLayer)
+            if (!heldByGun && rb.gameObject.layer != rigidbodyPassThroughLayer)
             {
                 rb.gameObject.layer = rigidbodyPassThroughLayer;
             }
@@ -4559,6 +4623,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
 
             bool heldByGun = portalGun != null && portalGun.GetHeldRigidbody() == rb;
+            if (heldOnly && !heldByGun)
+            {
+                i++;
+                continue;
+            }
             if (rb.isKinematic && !heldByGun)
             {
                 // kinematic且没被枪抓着（比如传送枪被丢出去变kinematic）：不再追踪，同时销毁clone防止泄漏
@@ -4622,6 +4691,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 crossingWorldPosForTeleport = Vector3.Lerp(previousWorldPos, rbWorldPos, crossingT);
                 Vector3 crossingLocal = LocalPointForPortal(thisPlane, crossingWorldPosForTeleport);
                 crossedInsidePortal = LocalPointInPortalRect(crossingLocal, thisShape);
+                if (heldByGun) crossedInsidePortal = crossedInsidePortal && portalGun.CanHeldFitPortal(thisPlane, crossingWorldPosForTeleport - rbWorldPos);
             }
 
             if (crossedInsidePortal)
@@ -4778,15 +4848,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private Vector3 GetRigidbodyTravellerPosition(Rigidbody rb, bool heldByGun)
     {
         if (rb == null) return Vector3.zero;
-        if (heldByGun && rb.transform != null) return rb.transform.position;
         return rb.position;
     }
 
     private Vector3 GetRigidbodyTravellerVelocity(Rigidbody rb, bool heldByGun)
     {
         if (rb == null) return Vector3.zero;
-        // 抓取中的刚体是 kinematic，Unity/VRChat 不一定会给出可靠 rb.velocity。
-        // 这里仍返回 rb.velocity，避免传送枪脚本承担额外速度缓存；手持位置主要由 MovePosition 跟随。
         return rb.velocity;
     }
 
@@ -4900,7 +4967,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         rb.transform.rotation = newRot;
         rb.velocity = newVelocity;
         rb.angularVelocity = newAngularVelocity;
-        rb.gameObject.layer = rigidbodyPassThroughLayer;
+        if (!heldByGun) rb.gameObject.layer = rigidbodyPassThroughLayer;
 
         if (portalGun != null && portalGun.GetHeldRigidbody() == rb && allowHeldRigidbodyTeleport)
         {
