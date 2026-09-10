@@ -301,6 +301,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     public bool enableRigidbodyTeleport = true;
     [Tooltip("刚体检测用的 OverlapBox 额外深度扩展（基础值）。实际追踪深度还会按刚体沿门法线速度动态扩大，以降低高速漏检。")]
     public float rbTriggerDepthExtension = 0.8f;
+    [Tooltip("抓取刚体进入传送门前允许提前切到无环境碰撞层的额外深度。默认0.15米，避免门附近约1米范围都失去环境碰撞；传送门本身仍能提前一小段接管。")]
+    public float heldRigidbodyTriggerDepthExtension = 0.15f;
     [Tooltip("是否按刚体沿门法线速度动态扩大追踪深度。不是直接传送，只是更早加入 Seb traveller 追踪，降低高速隧穿。")]
     public bool enableRigidbodyDynamicTrackingDepth = true;
     [Tooltip("动态追踪深度上限，防止极高速刚体把 OverlapBox 扩得过大造成性能/误触发问题。")]
@@ -1099,7 +1101,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         }
         else
         {
-            if (debugTeleportVerbose && Time.frameCount % debugLogIntervalFrames == 0)
+            if (debugTeleportVerbose && debugLogIntervalFrames > 0 && Time.frameCount % debugLogIntervalFrames == 0)
             {
                 TPLog("[传送检测暂停] 直到帧 " + teleportBlockedUntilFrame);
             }
@@ -1579,25 +1581,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return Mathf.Abs(localPoint.x) < hx && Mathf.Abs(localPoint.y) < hy;
     }
 
-    // 二十一论：粒子中心到门框外扩边缘的距离（米）。正值=框内余量，负值=框外这么远。
-    // 诊断用：区分"擦边漏捕"（负零点几米）与"射偏/旧瞄准历史"（负好几米）。
-    float PortalRectMargin(Vector3 localPoint, int shapeType, float inflateHalf)
-    {
-        float hx = portalTriggerWidth * 0.5f + inflateHalf;
-        float hy = portalTriggerHeight * 0.5f + inflateHalf;
-        if (shapeType == PORTAL_SHAPE_CIRCLE)
-        {
-            float nx = localPoint.x / hx;
-            float ny = localPoint.y / hy;
-            float r = Mathf.Sqrt(nx * nx + ny * ny);
-            return (1f - r) * Mathf.Min(hx, hy);
-        }
-        // 方框与三角形（按包围盒近似）取两轴余量中较小者
-        float dx = hx - Mathf.Abs(localPoint.x);
-        float dy = hy - Mathf.Abs(localPoint.y);
-        return dx < dy ? dx : dy;
-    }
-
     void SetTravellerTracking(bool isPortalA, bool tracking, Vector3 previousLocal)
     {
         if (isPortalA)
@@ -1919,7 +1902,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         string portalName = isPortalA ? "A" : "B";
         string otherName = isPortalA ? "B" : "A";
 
-        if (debugTeleportVerbose && Time.frameCount % debugLogIntervalFrames == 0)
+        if (debugTeleportVerbose && debugLogIntervalFrames > 0 && Time.frameCount % debugLogIntervalFrames == 0)
         {
             if (bodyInXY || bodyInColliderZone || thisPortalState != 0 || GetTravellerTracking(isPortalA))
             {
@@ -1981,7 +1964,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                         {
                             RestorePassThroughLayer(markedCollider, isPortalA, sharedCollider, portalName, "far");
                         }
-                        else if (debugTeleportVerbose && Time.frameCount % debugLogIntervalFrames == 0)
+                        else if (debugTeleportVerbose && debugLogIntervalFrames > 0 && Time.frameCount % debugLogIntervalFrames == 0)
                         {
                             if (debugLayerLog) TPLog("[L hold " + portalName + "] other=" + otherName + " state=" + otherPortalState + " zone=" + otherBodyInColliderZone);
                         }
@@ -2547,7 +2530,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             headInsideVolumeB
         );
 
-        if (debugRecursiveRenderLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
+        if (debugRecursiveRenderLog && debugRecursiveLogIntervalFrames > 0 && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
         {
             TPLog("[递归渲染] A深度=" + recursiveDepthRenderedA + " BDepth=" + recursiveDepthRenderedB + " limit=" + recursiveRenderLimit);
         }
@@ -2756,7 +2739,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         cam.nearClipPlane = newNear;
         cam.ResetProjectionMatrix();
 
-        if (debugRecursiveClipLog && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
+        if (debugRecursiveClipLog && debugRecursiveLogIntervalFrames > 0 && Time.frameCount % debugRecursiveLogIntervalFrames == 0)
         {
             TPLog("[递归近裁剪] 序号=" + renderIndex + " start=" + startIndex + " forwardDst=" + forwardDst + " near=" + newNear + " cam=" + cam.name + " clip=" + clipPlane.name);
         }
@@ -4455,6 +4438,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         float hy = portalTriggerHeight * 0.5f;
         float baseThresholdDepth = noClipDepth + rbTriggerDepthExtension;
         if (baseThresholdDepth < 0.01f) baseThresholdDepth = 0.01f;
+        float heldThresholdDepth = noClipDepth + heldRigidbodyTriggerDepthExtension;
+        if (heldThresholdDepth < 0.01f) heldThresholdDepth = 0.01f;
 
         // 查询体积可以比基础阈值大：目的是让高速刚体“有机会被加入追踪”。
         // 是否真正加入追踪，下面还会按该刚体自己的法线速度算 rbThresholdDepth。
@@ -4496,10 +4481,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Vector3 localPos = LocalPointForPortal(thisPlane, rbWorldPos);
             if (!LocalPointInPortalRect(localPos, thisShape)) continue;
 
-            float rbThresholdDepth = baseThresholdDepth;
-            if (enableRigidbodyDynamicTrackingDepth)
+            float rbThresholdDepth = heldByGun ? heldThresholdDepth : baseThresholdDepth;
+            if (!heldByGun && enableRigidbodyDynamicTrackingDepth)
             {
-                float normalSpeed = Mathf.Abs(Vector3.Dot(GetRigidbodyTravellerVelocity(rb, heldByGun), thisPlane.forward));
+                float normalSpeed = Mathf.Abs(Vector3.Dot(GetRigidbodyTravellerVelocity(rb, false), thisPlane.forward));
                 rbThresholdDepth += normalSpeed * Time.deltaTime * 2f;
                 float maxDepth = Mathf.Max(baseThresholdDepth, rbMaxDynamicTrackingDepth);
                 if (rbThresholdDepth > maxDepth) rbThresholdDepth = maxDepth;
@@ -4507,6 +4492,10 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (Mathf.Abs(localPos.z) > rbThresholdDepth) continue;
 
             int originalLayer = FindTrackedRigidbodyOriginalLayer(rb);
+            if (originalLayer < 0 && heldByGun && portalGun != null)
+            {
+                originalLayer = portalGun.GetHeldRigidbodyOriginalLayer();
+            }
             if (originalLayer < 0) originalLayer = rb.gameObject.layer;
 
             Vector3 rbOffsetFromPortal = rbWorldPos - thisPlane.position;
@@ -4666,11 +4655,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
 
             Vector3 currentLocal = LocalPointForPortal(thisPlane, rbWorldPos);
-            bool stillInsideThreshold = LocalPointInPortalRect(currentLocal, thisShape) && Mathf.Abs(currentLocal.z) <= baseThresholdDepth;
+            float currentTrackDepth = heldByGun ? heldThresholdDepth : baseThresholdDepth;
+            bool stillInsideThreshold = LocalPointInPortalRect(currentLocal, thisShape) && Mathf.Abs(currentLocal.z) <= currentTrackDepth;
             if (!stillInsideThreshold)
             {
                 // Seb OnTriggerExit 替代：离开门阈值后移除 traveller；若另一扇门没接管，再还原图层，同时销毁clone
                 RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                if (heldByGun && portalGun != null && !IsRigidbodyTrackedByPortal(!isPortalA, rb))
+                {
+                    portalGun.RestoreHeldRigidbodyLayerAfterPortal();
+                }
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
                 RestorePortalOverlayIfUntracked(rb);
@@ -4990,6 +4984,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (trackedRigidbodiesB[i] == rb) return rbOriginalLayerB[i];
         }
         return -1;
+    }
+
+    public int GetTrackedRigidbodyOriginalLayer(Rigidbody rb)
+    {
+        return FindTrackedRigidbodyOriginalLayer(rb);
+    }
+
+    public bool IsRigidbodyTrackedByAnyPortal(Rigidbody rb)
+    {
+        return IsRigidbodyTrackedByPortal(true, rb) || IsRigidbodyTrackedByPortal(false, rb);
     }
 
     private bool IsRigidbodyTrackedByPortal(bool isPortalA, Rigidbody rb)
