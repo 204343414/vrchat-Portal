@@ -210,6 +210,10 @@ public class 传送枪 : UdonSharpBehaviour
     public float heldMaxForce = 90f;
     [Tooltip("未经限幅的弹簧拉力超过此值时开始累计断联时间（N）。")]
     public float heldBreakForce = 160f;
+    [Tooltip("玩家每增加1m/s速度，超力断联阈值增加的基础倍率；0恢复固定阈值。不改变实际牵引力或玩家受困保护。")]
+    public float heldBreakSpeedFactor = 0.5f;
+    [Tooltip("移动时超力断联阈值的最大倍率。")]
+    public float heldBreakMaxMultiplier = 4f;
     [Tooltip("拉力持续超限多久后断联（秒）。")]
     public float heldBreakDelay = 0.15f;
     [Tooltip("牵引速度上限（m/s），已有高速运动通过有限牵引力逐渐减速。")]
@@ -887,6 +891,15 @@ public class 传送枪 : UdonSharpBehaviour
         UpdateHeldRigidbodyPhysics();
     }
 
+    bool ShouldBreakHeldForce(float forceMagnitude, float playerSpeed, float dt)
+    {
+        float multiplier = Mathf.Min(1f + Mathf.Max(0f, playerSpeed) * Mathf.Max(0f, heldBreakSpeedFactor),
+            Mathf.Max(1f, heldBreakMaxMultiplier));
+        float threshold = Mathf.Max(0.01f, heldBreakForce) * multiplier;
+        heldOverloadTime = forceMagnitude > threshold ? heldOverloadTime + dt : 0f;
+        return heldOverloadTime >= Mathf.Max(dt, heldBreakDelay);
+    }
+
     void UpdateHeldRigidbodyPhysics()
     {
         if (heldRigidbody == null) return;
@@ -921,20 +934,21 @@ public class 传送枪 : UdonSharpBehaviour
         Vector3 requestedForce = (target - heldRigidbody.position) * Mathf.Max(0f, heldSpringStrength)
             + (targetVelocity - heldRigidbody.velocity) * Mathf.Max(0f, heldSpringDamping);
         heldPlayerSafetyActive = false;
+        if (localPlayer == null || !localPlayer.IsValid()) localPlayer = Networking.LocalPlayer;
+        bool hasPlayer = localPlayer != null && localPlayer.IsValid();
+        Vector3 playerVelocity = hasPlayer ? localPlayer.GetVelocity() : Vector3.zero;
         if (enableHeldPlayerSafety)
         {
-            if (localPlayer == null || !localPlayer.IsValid()) localPlayer = Networking.LocalPlayer;
-            if (localPlayer == null || !localPlayer.IsValid())
+            if (!hasPlayer)
             {
                 ReleaseHeldRigidbody();
                 return;
             }
-            requestedForce = ConstrainHeldForceForPlayer(target, targetVelocity, localPlayer.GetPosition(), localPlayer.GetVelocity(), dt);
+            requestedForce = ConstrainHeldForceForPlayer(target, targetVelocity, localPlayer.GetPosition(), playerVelocity, dt);
             if (heldRigidbody == null) return;
         }
         else heldPlayerBlockedTime = 0f;
-        heldOverloadTime = requestedForce.magnitude > Mathf.Max(0.01f, heldBreakForce) ? heldOverloadTime + dt : 0f;
-        if (heldOverloadTime >= Mathf.Max(dt, heldBreakDelay))
+        if (ShouldBreakHeldForce(requestedForce.magnitude, playerVelocity.magnitude, dt))
         {
             ReleaseHeldRigidbody();
             return;
