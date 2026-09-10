@@ -284,6 +284,19 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     public float maxViewAngle = 100f;
     public int checkInterval = 2;
 
+    [Tooltip("以保守门面投影交集剔除不可见的递归，不改变分辨率或最大层数。")]
+    public bool enablePortalMaskCulling = true;
+    public float portalRenderNearDistance = 1f;
+    [Tooltip("玩家视野宽高比的保守上界；Udon无法读取Screen尺寸。默认覆盖32:9，更宽屏幕应调大。仅影响入口粗筛，不改变画面投影。")]
+    public float portalViewerAspectBound = 3.6f;
+    private int portalInvisibleChecksA;
+    private int portalInvisibleChecksB;
+    private Vector2[] portalRenderMask;
+    private Vector2[] portalRenderMaskScratch;
+    private Vector2[] portalProjectedQuad;
+    private Vector3[] portalViewQuad;
+    private int portalRenderMaskCount;
+
     [Tooltip("强制关闭 A/B 传送门相机的 Occlusion Culling。传送门相机会穿墙渲染另一侧世界，Unity 遮挡剔除可能把门后/墙后的 clone 或刚体错误剔除。建议保持开启。")]
     public bool disablePortalCameraOcclusionCulling = true;
 
@@ -978,7 +991,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // ============================================================
 
         frameCounter++;
-        if (frameCounter >= checkInterval)
+        if (enablePortalMaskCulling || frameCounter >= checkInterval)
         {
             frameCounter = 0;
             bool forcePortalCameraRendering = isTeleporting;
@@ -990,8 +1003,25 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
             if (enableVisibilityOptimization && !forcePortalCameraRendering)
             {
-                bool portalAVisible = IsPortalVisible(playerHead, playerForward, portalPlaneA, rendererA);
-                bool portalBVisible = IsPortalVisible(playerHead, playerForward, portalPlaneB, rendererB);
+                bool portalAVisible;
+                bool portalBVisible;
+                if (enablePortalMaskCulling)
+                {
+                    float aspect = cameraB != null ? cameraB.aspect : 16f / 9f;
+                    if (cameraA != null) aspect = Mathf.Max(aspect, cameraA.aspect);
+                    aspect = Mathf.Max(aspect, portalViewerAspectBound);
+                    portalAVisible = IsPortalInViewerMask(portalPlaneA, playerHead, playerWorldRot, syncFOV, aspect);
+                    portalBVisible = IsPortalInViewerMask(portalPlaneB, playerHead, playerWorldRot, syncFOV, aspect);
+                    portalInvisibleChecksA = portalAVisible ? 0 : Mathf.Min(portalInvisibleChecksA + 1, 2);
+                    portalInvisibleChecksB = portalBVisible ? 0 : Mathf.Min(portalInvisibleChecksB + 1, 2);
+                    portalAVisible = portalInvisibleChecksA < 2;
+                    portalBVisible = portalInvisibleChecksB < 2;
+                }
+                else
+                {
+                    portalAVisible = IsPortalVisible(playerHead, playerForward, portalPlaneA, rendererA);
+                    portalBVisible = IsPortalVisible(playerHead, playerForward, portalPlaneB, rendererB);
+                }
                 isCameraBRendering = portalAVisible;
                 isCameraARendering = portalBVisible;
                 if (cameraA != null) cameraA.enabled = enableSebRecursiveRendering && recursiveForceManualCamerasDisabled ? false : isCameraARendering;
@@ -1001,6 +1031,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             {
                 isCameraARendering = true;
                 isCameraBRendering = true;
+                portalInvisibleChecksA = 0;
+                portalInvisibleChecksB = 0;
                 if (cameraA != null) cameraA.enabled = enableSebRecursiveRendering && recursiveForceManualCamerasDisabled ? false : true;
                 if (cameraB != null) cameraB.enabled = enableSebRecursiveRendering && recursiveForceManualCamerasDisabled ? false : true;
             }
@@ -2582,6 +2614,23 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         Matrix4x4 halfTurnMatrix = Matrix4x4.Rotate(Quaternion.AngleAxis(180f, Vector3.up));
         bool renderHalfTurn = useClassicHalfTurn || recursiveRenderUseClassicHalfTurn;
 
+        bool useMask = enablePortalMaskCulling && recursiveEarlyStop && !skipAllOblique
+            && PortalMaterialSupportsRenderMask(linkedMat) && PortalMaterialSupportsRenderMask(thisMat);
+        if (useMask)
+        {
+            ResetPortalRenderMask(0.025f);
+            // A near viewer always gets the first image, but deeper invisible layers can still stop.
+            if (!IsNearPortalForRendering(linkedPlane, viewerPos))
+            {
+                if (!IntersectPortalRenderMask(linkedPlane, viewerPos, viewerRot, syncFOV, portalCam.aspect))
+                {
+                    // Root visibility has a closing grace frame; never bypass it here.
+                    ResetPortalRenderMask(0.025f);
+                }
+            }
+        }
+        Matrix4x4 portalMapping = renderHalfTurn
+            ? thisLocalToWorld * halfTurnMatrix * linkedWorldToLocal : thisLocalToWorld * linkedWorldToLocal;
         int startIndex = limit;
         int count = 0;
 
@@ -2589,23 +2638,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             if (i > 0 && recursiveEarlyStop && !skipAllOblique)
             {
-                // Seb 用 BoundsOverlap 判断 linked portal 在当前递归相机里是否还可见。
-                // 这里用 WorldToViewportPoint 对门面四角做近似 bounds overlap，语义保持一致。
-                // skipAllOblique 时也跳过 early stop：头在门里时相机太近，bounds overlap 可能误判。
-                if (!PortalBoundsOverlapCameraView(portalCam, linkedPlane))
+                // Keep the existing near-plane exception; nested masks share the portal texture UV space.
+                if (useMask)
                 {
-                    break;
+                    if (!IntersectPortalRenderMask(linkedPlane, portalCam.transform.position, portalCam.transform.rotation, syncFOV, portalCam.aspect)) break;
                 }
+                else if (!PortalBoundsOverlapCameraView(portalCam, linkedPlane)) break;
             }
 
-            if (renderHalfTurn)
-            {
-                localToWorldMatrix = thisLocalToWorld * halfTurnMatrix * linkedWorldToLocal * localToWorldMatrix;
-            }
-            else
-            {
-                localToWorldMatrix = thisLocalToWorld * linkedWorldToLocal * localToWorldMatrix;
-            }
+            localToWorldMatrix = portalMapping * localToWorldMatrix;
 
             int renderOrderIndex = limit - i - 1;
             positions[renderOrderIndex] = localToWorldMatrix.GetColumn(3);
@@ -2785,6 +2826,132 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         {
             cam.ResetProjectionMatrix();
         }
+    }
+
+    bool IsNearPortalForRendering(Transform portal, Vector3 viewer)
+    {
+        if (portal == null) return false;
+        Vector3 local = LocalPointForPortal(portal, viewer);
+        Vector3 nearest = new Vector3(Mathf.Clamp(local.x, -portalTriggerWidth * 0.5f, portalTriggerWidth * 0.5f),
+            Mathf.Clamp(local.y, -portalTriggerHeight * 0.5f, portalTriggerHeight * 0.5f), 0f);
+        float distance = Mathf.Max(0f, portalRenderNearDistance);
+        return (WorldPointFromPortal(portal, nearest) - viewer).sqrMagnitude <= distance * distance;
+    }
+
+    bool IsPortalInViewerMask(Transform portal, Vector3 viewer, Quaternion rotation, float fov, float aspect)
+    {
+        if (portal == null || !portal.gameObject.activeInHierarchy) return false;
+        if (IsNearPortalForRendering(portal, viewer)) return true;
+        float extent = new Vector2(portalTriggerWidth, portalTriggerHeight).magnitude * 0.5f;
+        if (!useScaleFreePortalMatrix) extent *= portal.lossyScale.magnitude;
+        float distance = Mathf.Max(0f, maxRenderDistance) + extent;
+        if ((portal.position - viewer).sqrMagnitude > distance * distance) return false;
+        // The shader's distorted background need not be confined to the ordinary aperture.
+        Material mat = portal == portalPlaneA ? portalMatA : portalMatB;
+        if (!PortalMaterialSupportsRenderMask(mat)) return true;
+        ResetPortalRenderMask(isVRPlayer ? 0.1f : 0.025f);
+        return IntersectPortalRenderMask(portal, viewer, rotation, fov, aspect);
+    }
+
+    bool PortalMaterialSupportsRenderMask(Material mat)
+    {
+        if (mat == null || !mat.HasProperty("_Transition") || !mat.HasProperty("_OffsetY")) return false;
+        return mat.GetFloat("_Transition") >= 0.999f && Mathf.Abs(mat.GetFloat("_OffsetY")) < 0.0001f;
+    }
+
+    void ResetPortalRenderMask(float padding)
+    {
+        if (portalRenderMask == null || portalRenderMask.Length < 64
+            || portalRenderMaskScratch == null || portalRenderMaskScratch.Length < 64
+            || portalProjectedQuad == null || portalProjectedQuad.Length < 4
+            || portalViewQuad == null || portalViewQuad.Length < 4)
+        {
+            // Udon proxy reloads can turn null arrays into empty arrays.
+            // Eight intersections of convex quads need at most 36 vertices.
+            portalRenderMask = new Vector2[64];
+            portalRenderMaskScratch = new Vector2[64];
+            portalProjectedQuad = new Vector2[4];
+            portalViewQuad = new Vector3[4];
+        }
+        portalRenderMask[0] = new Vector2(-padding, -padding);
+        portalRenderMask[1] = new Vector2(1f + padding, -padding);
+        portalRenderMask[2] = new Vector2(1f + padding, 1f + padding);
+        portalRenderMask[3] = new Vector2(-padding, 1f + padding);
+        portalRenderMaskCount = 4;
+    }
+
+    float PortalMaskCross(Vector2 a, Vector2 b)
+    {
+        return a.x * b.y - a.y * b.x;
+    }
+
+    bool IntersectPortalRenderMask(Transform portal, Vector3 viewer, Quaternion rotation, float fov, float aspect)
+    {
+        if (portal == null) return true;
+        float padding = isVRPlayer ? 0.12f : 0.02f;
+        float hx = portalTriggerWidth * 0.5f + padding;
+        float hy = portalTriggerHeight * 0.5f + padding;
+        Quaternion inverseView = Quaternion.Inverse(rotation);
+        int front = 0;
+        int behind = 0;
+        for (int i = 0; i < 4; i++)
+        {
+            Vector3 corner = new Vector3(i == 0 || i == 3 ? -hx : hx, i < 2 ? -hy : hy, 0f);
+            Vector3 view = inverseView * (WorldPointFromPortal(portal, corner) - viewer);
+            portalViewQuad[i] = view;
+            if (view.z > 0.001f) front++;
+            if (view.z < -0.001f) behind++;
+        }
+        if (behind == 4) return false;
+        // Near-plane straddling is deliberately fail-open, never project negative depths.
+        if (front < 4) return true;
+        float tanHalf = Mathf.Tan(Mathf.Clamp(fov, 1f, 179f) * Mathf.Deg2Rad * 0.5f);
+        if (aspect <= 0f || tanHalf <= 0f) return true;
+        for (int i = 0; i < 4; i++)
+        {
+            Vector3 view = portalViewQuad[i];
+            Vector2 point = new Vector2(0.5f + view.x / (view.z * tanHalf * aspect * 2f),
+                0.5f + view.y / (view.z * tanHalf * 2f));
+            if (float.IsNaN(point.x) || float.IsNaN(point.y) || float.IsInfinity(point.x) || float.IsInfinity(point.y)) return true;
+            portalProjectedQuad[i] = point;
+        }
+        float area = 0f;
+        for (int i = 0; i < 4; i++) area += PortalMaskCross(portalProjectedQuad[i], portalProjectedQuad[(i + 1) % 4]);
+        if (Mathf.Abs(area) < 0.00000001f) return true;
+        float winding = area > 0f ? 1f : -1f;
+        for (int edgeIndex = 0; edgeIndex < 4; edgeIndex++)
+        {
+            Vector2 a = portalProjectedQuad[edgeIndex];
+            Vector2 edge = portalProjectedQuad[(edgeIndex + 1) % 4] - a;
+            float tolerance = 0.00001f * edge.magnitude;
+            int outputCount = 0;
+            Vector2 previous = portalRenderMask[portalRenderMaskCount - 1];
+            float previousDistance = winding * PortalMaskCross(edge, previous - a) + tolerance;
+            for (int i = 0; i < portalRenderMaskCount; i++)
+            {
+                Vector2 current = portalRenderMask[i];
+                float currentDistance = winding * PortalMaskCross(edge, current - a) + tolerance;
+                if ((previousDistance >= 0f) != (currentDistance >= 0f))
+                {
+                    if (outputCount >= portalRenderMaskScratch.Length) return true;
+                    float t = previousDistance / (previousDistance - currentDistance);
+                    portalRenderMaskScratch[outputCount++] = previous + (current - previous) * t;
+                }
+                if (currentDistance >= 0f)
+                {
+                    if (outputCount >= portalRenderMaskScratch.Length) return true;
+                    portalRenderMaskScratch[outputCount++] = current;
+                }
+                previous = current;
+                previousDistance = currentDistance;
+            }
+            if (outputCount == 0) return false;
+            Vector2[] swap = portalRenderMask;
+            portalRenderMask = portalRenderMaskScratch;
+            portalRenderMaskScratch = swap;
+            portalRenderMaskCount = outputCount;
+        }
+        return true;
     }
 
     bool PortalBoundsOverlapCameraView(Camera cam, Transform portalPlane)
