@@ -3389,7 +3389,29 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     public void ReleaseHeldPortalPhysics(Rigidbody rb)
     {
-        if (rb != null) RestoreRigidbodyPortalWallIgnore(rb);
+        if (rb == null) return;
+
+        // 释放抓取状态时，不能只还原 IgnoreCollision；held-only 追踪记录若残留，
+        // 下一帧仍可能把刚体重新加入门的临时碰撞关系。
+        RestoreRigidbodyPortalWallIgnore(rb);
+        RemoveRigidbodyTrackerForRelease(rb, trackedRigidbodiesA, rbPreviousOffsetFromPortalA,
+            rbOriginalLayerA, rbLastPortalSideA, ref trackedRBCountA);
+        RemoveRigidbodyTrackerForRelease(rb, trackedRigidbodiesB, rbPreviousOffsetFromPortalB,
+            rbOriginalLayerB, rbLastPortalSideB, ref trackedRBCountB);
+        DestroyRigidbodyClone(rb);
+        RestorePortalOverlayIfUntracked(rb);
+    }
+
+    private void RemoveRigidbodyTrackerForRelease(Rigidbody rb, Rigidbody[] trackers,
+        Vector3[] previousOffsets, int[] originalLayers, int[] lastSides, ref int count)
+    {
+        for (int i = count - 1; i >= 0; i--)
+        {
+            if (trackers[i] == rb)
+            {
+                count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+            }
+        }
     }
 
     private Collider GetPortalWallCollider(bool isPortalA)
