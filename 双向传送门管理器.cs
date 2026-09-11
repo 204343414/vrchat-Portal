@@ -616,6 +616,16 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     // 刚体检测 OverlapBox NonAlloc 缓冲。A/B 门顺序处理，共用一个缓冲即可，避免每帧分配 Collider[]。
     private const int MAX_RB_OVERLAP_COLLIDERS = 128;
     private Collider[] rbOverlapBuffer = new Collider[MAX_RB_OVERLAP_COLLIDERS];
+    private const int MAX_RB_WALL_IGNORE_PAIRS = 256;
+    private Rigidbody[] rbWallIgnoreRigidbodies = new Rigidbody[MAX_RB_WALL_IGNORE_PAIRS];
+    private Collider[] rbWallIgnoreBodies = new Collider[MAX_RB_WALL_IGNORE_PAIRS];
+    private Collider[] rbWallIgnoreWalls = new Collider[MAX_RB_WALL_IGNORE_PAIRS];
+    private bool[] rbWallIgnoreOriginalStates = new bool[MAX_RB_WALL_IGNORE_PAIRS];
+    private bool[] rbWallIgnorePortalA = new bool[MAX_RB_WALL_IGNORE_PAIRS];
+    private bool[] rbWallIgnorePortalB = new bool[MAX_RB_WALL_IGNORE_PAIRS];
+    private bool[] rbWallIgnoreSeen = new bool[MAX_RB_WALL_IGNORE_PAIRS];
+    private int rbWallIgnorePairCount;
+
 
     // Clip Volume 批量穿透：固定数组追踪当前被我们切到 playerPassThroughLayer 的静态Collider
     private const int MAX_CLIP_VOLUME_COLLIDERS = 64;
@@ -749,6 +759,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         // 脚本被禁用/卸载时兜底还原所有被我们切过layer的collider，防止永久残留
         RestoreAllClipVolumeColliders(clipVolumeTrackedCollidersA, clipVolumeOriginalLayersA, ref clipVolumeTrackedCountA);
         RestoreAllClipVolumeColliders(clipVolumeTrackedCollidersB, clipVolumeOriginalLayersB, ref clipVolumeTrackedCountB);
+        // 清理所有刚体与门墙的临时IgnoreCollision关系，避免禁用/重载后仍穿透地板。
+        RestoreRigidbodyPortalWallIgnore(null);
         // 还原所有被我们临时改过bounds/occlusion的源刚体renderer，防止残留
         RestoreAllRigidbodyCullingOverrides();
         // 销毁所有刚体clone，防止残留物体
@@ -3383,12 +3395,148 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     public void ReleaseHeldPortalPhysics(Rigidbody rb)
     {
-        if (rb != null && enableRigidbodyTeleport && IsRigidbodyTrackedByEitherPortal(rb)) rb.gameObject.layer = rigidbodyPassThroughLayer;
+        if (rb != null) RestoreRigidbodyPortalWallIgnore(rb);
+    }
+
+    private Collider GetPortalWallCollider(bool isPortalA)
+    {
+        Collider marked = portalGun == null ? null : (isPortalA ? portalGun.GetMarkedColliderA() : portalGun.GetMarkedColliderB());
+        return marked != null ? marked : (isPortalA ? portalWallColliderA : portalWallColliderB);
+    }
+
+    private void ApplyRigidbodyPortalWallIgnore(Rigidbody rb, bool isPortalA)
+    {
+        if (rb == null) return;
+        for (int i = 0; i < rbWallIgnorePairCount; i++)
+        {
+            if (rbWallIgnoreRigidbodies[i] == rb && IsRigidbodyPortalWallOwner(i, isPortalA)) rbWallIgnoreSeen[i] = false;
+        }
+
+        Collider[] bodies = rb.GetComponentsInChildren<Collider>(true);
+        BoxCollider clipVolume = isPortalA ? clipVolumeColliderA : clipVolumeColliderB;
+        if (clipVolume != null && clipVolume.enabled)
+        {
+            Transform clipT = clipVolume.transform;
+            Vector3 worldCenter = clipT.TransformPoint(clipVolume.center);
+            Vector3 halfExtents = Vector3.Scale(clipVolume.size * 0.5f, clipT.lossyScale);
+            int overlapCount = Physics.OverlapBoxNonAlloc(worldCenter, halfExtents, clipVolumeOverlapBuffer,
+                clipT.rotation, ~0, QueryTriggerInteraction.Ignore);
+            Transform portal = isPortalA ? portalPlaneA : portalPlaneB;
+            for (int i = 0; i < overlapCount; i++)
+            {
+                Collider wall = clipVolumeOverlapBuffer[i];
+                if (wall == null || wall == clipVolume || wall.isTrigger || wall.attachedRigidbody != null
+                    || IsColliderUnderPortalHierarchy(wall, portal)) continue;
+                AddRigidbodyPortalWallIgnorePair(rb, bodies, wall, isPortalA);
+            }
+        }
+        else
+        {
+            AddRigidbodyPortalWallIgnorePair(rb, bodies, GetPortalWallCollider(isPortalA), isPortalA);
+        }
+
+        for (int i = rbWallIgnorePairCount - 1; i >= 0; i--)
+        {
+            if (rbWallIgnoreRigidbodies[i] == rb && IsRigidbodyPortalWallOwner(i, isPortalA) && !rbWallIgnoreSeen[i])
+                ReleaseRigidbodyPortalWallOwnerAt(i, isPortalA);
+        }
+    }
+
+    private void AddRigidbodyPortalWallIgnorePair(Rigidbody rb, Collider[] bodies, Collider wall, bool isPortalA)
+    {
+        if (rb == null || wall == null || wall.attachedRigidbody != null || !wall.enabled || wall.isTrigger) return;
+        if (bodies == null) return;
+        for (int i = 0; i < bodies.Length; i++)
+        {
+            Collider body = bodies[i];
+            if (body == null || !body.enabled || body.isTrigger || body.attachedRigidbody != rb) continue;
+            int existing = -1;
+            for (int p = 0; p < rbWallIgnorePairCount; p++)
+            {
+                if (rbWallIgnoreRigidbodies[p] == rb && rbWallIgnoreBodies[p] == body && rbWallIgnoreWalls[p] == wall)
+                { existing = p; break; }
+            }
+            if (existing >= 0)
+            {
+                SetRigidbodyPortalWallOwner(existing, isPortalA, true);
+                rbWallIgnoreSeen[existing] = true;
+                continue;
+            }
+            if (rbWallIgnorePairCount >= MAX_RB_WALL_IGNORE_PAIRS) return;
+            int slot = rbWallIgnorePairCount++;
+            rbWallIgnoreRigidbodies[slot] = rb; rbWallIgnoreBodies[slot] = body; rbWallIgnoreWalls[slot] = wall;
+            rbWallIgnoreOriginalStates[slot] = Physics.GetIgnoreCollision(body, wall);
+            rbWallIgnorePortalA[slot] = isPortalA; rbWallIgnorePortalB[slot] = !isPortalA; rbWallIgnoreSeen[slot] = true;
+            Physics.IgnoreCollision(body, wall, true);
+        }
+    }
+
+    private void RestoreRigidbodyPortalWallIgnore(Rigidbody rb)
+    {
+        for (int i = rbWallIgnorePairCount - 1; i >= 0; i--)
+        {
+            if (rb != null && rbWallIgnoreRigidbodies[i] != rb) continue;
+            RestoreRigidbodyPortalWallIgnoreAt(i);
+        }
+    }
+
+    private void RestoreRigidbodyPortalWallIgnoreForPortal(Rigidbody rb, bool isPortalA)
+    {
+        for (int i = rbWallIgnorePairCount - 1; i >= 0; i--)
+        {
+            if (rbWallIgnoreRigidbodies[i] != rb || !IsRigidbodyPortalWallOwner(i, isPortalA)) continue;
+            ReleaseRigidbodyPortalWallOwnerAt(i, isPortalA);
+        }
+    }
+
+    private bool IsRigidbodyPortalWallOwner(int index, bool isPortalA)
+    {
+        return isPortalA ? rbWallIgnorePortalA[index] : rbWallIgnorePortalB[index];
+    }
+
+    private void SetRigidbodyPortalWallOwner(int index, bool isPortalA, bool value)
+    {
+        if (isPortalA) rbWallIgnorePortalA[index] = value;
+        else rbWallIgnorePortalB[index] = value;
+    }
+
+    private void ReleaseRigidbodyPortalWallOwnerAt(int index, bool isPortalA)
+    {
+        SetRigidbodyPortalWallOwner(index, isPortalA, false);
+        if (!rbWallIgnorePortalA[index] && !rbWallIgnorePortalB[index]) RestoreRigidbodyPortalWallIgnoreAt(index);
+    }
+
+    private void RestoreRigidbodyPortalWallIgnoreAt(int index)
+    {
+        Collider body = rbWallIgnoreBodies[index]; Collider wall = rbWallIgnoreWalls[index];
+        if (body != null && wall != null) Physics.IgnoreCollision(body, wall, rbWallIgnoreOriginalStates[index]);
+        int last = --rbWallIgnorePairCount;
+        rbWallIgnoreRigidbodies[index] = rbWallIgnoreRigidbodies[last]; rbWallIgnoreBodies[index] = rbWallIgnoreBodies[last];
+        rbWallIgnoreWalls[index] = rbWallIgnoreWalls[last]; rbWallIgnoreOriginalStates[index] = rbWallIgnoreOriginalStates[last];
+        rbWallIgnorePortalA[index] = rbWallIgnorePortalA[last]; rbWallIgnorePortalB[index] = rbWallIgnorePortalB[last]; rbWallIgnoreSeen[index] = rbWallIgnoreSeen[last];
+        rbWallIgnoreRigidbodies[last] = null; rbWallIgnoreBodies[last] = null; rbWallIgnoreWalls[last] = null; rbWallIgnorePortalA[last] = false; rbWallIgnorePortalB[last] = false; rbWallIgnoreSeen[last] = false;
+    }
+
+    private void CleanupRigidbodyPortalWallIgnores()
+    {
+        for (int i = rbWallIgnorePairCount - 1; i >= 0; i--)
+        {
+            Rigidbody rb = rbWallIgnoreRigidbodies[i];
+            if (rb == null)
+            {
+                RestoreRigidbodyPortalWallIgnoreAt(i);
+                continue;
+            }
+            if (rbWallIgnorePortalA[i] && !IsRigidbodyTrackedByPortal(true, rb)) ReleaseRigidbodyPortalWallOwnerAt(i, true);
+            if (i < rbWallIgnorePairCount && rbWallIgnoreRigidbodies[i] == rb && rbWallIgnorePortalB[i]
+                && !IsRigidbodyTrackedByPortal(false, rb)) ReleaseRigidbodyPortalWallOwnerAt(i, false);
+        }
     }
 
     private void ProcessRigidbodyTravellers()
     {
         if (portalPlaneA == null || portalPlaneB == null) return;
+        CleanupRigidbodyPortalWallIgnores();
 
         // 等价于 Seb 原版每个 Portal 在 LateUpdate 里 HandleTravellers。
         ProcessRigidbodyForPortal(true, false);
@@ -4763,10 +4911,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 ApplyPortalOverlayToGameObject(rb.gameObject);
             }
 
-            if (!heldByGun && rb.gameObject.layer != rigidbodyPassThroughLayer)
-            {
-                rb.gameObject.layer = rigidbodyPassThroughLayer;
-            }
+            // 抓取与未抓取刚体共用同一套按门Clip Volume的碰撞关系，避免叠墙只忽略一面。
+            ApplyRigidbodyPortalWallIgnore(rb, isPortalA);
 
             // 刚体进入门体积 → 创建出口侧clone虚影（仅本地）
             if (enableRigidbodyPortalClones)
@@ -4812,6 +4958,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 RestorePortalOverlayIfUntracked(rb);
                 continue;
             }
+
+            // 追踪期间持续重扫Clip Volume，及时加入新叠墙并恢复已离开范围的旧关系。
+            ApplyRigidbodyPortalWallIgnore(rb, isPortalA);
 
             // 注意：不使用帧冷却。真正的保护是下方的 crossedInsidePortal 判定：
             // 穿越必须满足"速度方向指向从门的一侧穿到另一侧"——刚被传送到出口侧的刚体，速度方向是离开门的，
@@ -4876,6 +5025,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 // Seb 原版：traveller.Teleport(from, to, m.GetColumn(3), m.rotation)
                 TeleportRigidbodySebStyle(rb, thisPlane, otherPlane, isPortalA, crossingWorldPosForTeleport, crossingT, heldByGun);
 
+                RestoreRigidbodyPortalWallIgnore(rb);
                 AddRigidbodyTracker(!isPortalA, rb, GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, originalLayer, RBSideFromSignedDistance(Vector3.Dot(GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, otherPlane.forward)));
 
                 // 兜底：如果因为某种原因clone不存在（刚进入volume同帧就穿越），补建一个。
@@ -5134,7 +5284,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         rb.transform.rotation = newRot;
         rb.velocity = newVelocity;
         rb.angularVelocity = newAngularVelocity;
-        if (!heldByGun) rb.gameObject.layer = rigidbodyPassThroughLayer;
 
         if (portalGun != null && portalGun.GetHeldRigidbody() == rb && allowHeldRigidbodyTeleport)
         {
@@ -6070,14 +6219,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     private void RestoreRigidbodyLayerIfSafe(Rigidbody rb, int originalLayer, bool otherPortalIsA)
     {
         if (rb == null) return;
-        if (!restoreRigidbodyLayerOnExit) return;
         if (IsRigidbodyTrackedByPortal(otherPortalIsA, rb)) return;
-        if (originalLayer < 0) return;
-
-        if (rb.gameObject.layer == rigidbodyPassThroughLayer)
-        {
-            rb.gameObject.layer = originalLayer;
-        }
+        RestoreRigidbodyPortalWallIgnoreForPortal(rb, !otherPortalIsA);
     }
 
     // Vector3 版本的 halfTurn：用于刚体速度/角速度映射（绕 Y 轴 180°：x,z 取反，y 不变）
