@@ -66,12 +66,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("玩家靠近传送门时，墙/地板/屏蔽碰撞体临时切换到的 Layer。当前推荐同样用 17 = Walkthrough：挡刚体/物品，不挡玩家。")]
     public int playerPassThroughLayer = 17;
 
-    [Tooltip("刚体进入传送门区域时切换至的 Layer。当前实测推荐 14 = PickupNoEnvironment：不撞世界墙/地板，但会和 13(Pickup) 碰撞，适合让门边 Pipe 环挡住刚体。")]
-    public int rigidbodyPassThroughLayer = 14;
-
-    [Tooltip("刚体离开传送门区域后是否自动还原原始 Layer")]
-    public bool restoreRigidbodyLayerOnExit = true;
-
     [Header("════════════ 传送门Clip Volume 批量穿透 ════════════")]
     [Tooltip("A门 Clip Volume：拖入一个 BoxCollider（可挂在门自身/子物体上，可设为Trigger）。" +
              "玩家靠近A门时，该Box体积内所有【非刚体、非Trigger、非传送门自身hierarchy】的静态Collider统一切到playerPassThroughLayer，离开后自动还原。" +
@@ -3395,7 +3389,29 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     public void ReleaseHeldPortalPhysics(Rigidbody rb)
     {
-        if (rb != null) RestoreRigidbodyPortalWallIgnore(rb);
+        if (rb == null) return;
+
+        // 释放抓取状态时，不能只还原 IgnoreCollision；held-only 追踪记录若残留，
+        // 下一帧仍可能把刚体重新加入门的临时碰撞关系。
+        RestoreRigidbodyPortalWallIgnore(rb);
+        RemoveRigidbodyTrackerForRelease(rb, trackedRigidbodiesA, rbPreviousOffsetFromPortalA,
+            rbOriginalLayerA, rbLastPortalSideA, ref trackedRBCountA);
+        RemoveRigidbodyTrackerForRelease(rb, trackedRigidbodiesB, rbPreviousOffsetFromPortalB,
+            rbOriginalLayerB, rbLastPortalSideB, ref trackedRBCountB);
+        DestroyRigidbodyClone(rb);
+        RestorePortalOverlayIfUntracked(rb);
+    }
+
+    private void RemoveRigidbodyTrackerForRelease(Rigidbody rb, Rigidbody[] trackers,
+        Vector3[] previousOffsets, int[] originalLayers, int[] lastSides, ref int count)
+    {
+        for (int i = count - 1; i >= 0; i--)
+        {
+            if (trackers[i] == rb)
+            {
+                count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+            }
+        }
     }
 
     private Collider GetPortalWallCollider(bool isPortalA)
@@ -3421,12 +3437,12 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Vector3 halfExtents = Vector3.Scale(clipVolume.size * 0.5f, clipT.lossyScale);
             int overlapCount = Physics.OverlapBoxNonAlloc(worldCenter, halfExtents, clipVolumeOverlapBuffer,
                 clipT.rotation, ~0, QueryTriggerInteraction.Ignore);
-            Transform portal = isPortalA ? portalPlaneA : portalPlaneB;
+            Transform portalRoot = isPortalA ? portalParentA : portalParentB;
             for (int i = 0; i < overlapCount; i++)
             {
                 Collider wall = clipVolumeOverlapBuffer[i];
                 if (wall == null || wall == clipVolume || wall.isTrigger || wall.attachedRigidbody != null
-                    || IsColliderUnderPortalHierarchy(wall, portal)) continue;
+                    || IsColliderUnderPortalHierarchy(wall, portalRoot)) continue;
                 AddRigidbodyPortalWallIgnorePair(rb, bodies, wall, isPortalA);
             }
         }
@@ -4944,7 +4960,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (rb.isKinematic && !heldByGun)
             {
                 // kinematic且没被枪抓着（比如传送枪被丢出去变kinematic）：不再追踪，同时销毁clone防止泄漏
-                RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                RestoreRigidbodyCollisionIfSafe(rb, !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
                 RestorePortalOverlayIfUntracked(rb);
@@ -4952,7 +4968,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
             if (heldByGun && !allowHeldRigidbodyTeleport)
             {
-                RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                RestoreRigidbodyCollisionIfSafe(rb, !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
                 RestorePortalOverlayIfUntracked(rb);
@@ -5025,8 +5041,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 // Seb 原版：traveller.Teleport(from, to, m.GetColumn(3), m.rotation)
                 TeleportRigidbodySebStyle(rb, thisPlane, otherPlane, isPortalA, crossingWorldPosForTeleport, crossingT, heldByGun);
 
-                RestoreRigidbodyPortalWallIgnore(rb);
+                // 传送交接不能先清空 IgnoreCollision：那会在物理帧中产生一个碰撞恢复窗口，
+                // 地洞/地板可能立即把刚体弹飞。先让出口门接管，再释放入口门的 owner。
                 AddRigidbodyTracker(!isPortalA, rb, GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, originalLayer, RBSideFromSignedDistance(Vector3.Dot(GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, otherPlane.forward)));
+                ApplyRigidbodyPortalWallIgnore(rb, !isPortalA);
+                RestoreRigidbodyPortalWallIgnoreForPortal(rb, isPortalA);
 
                 // 兜底：如果因为某种原因clone不存在（刚进入volume同帧就穿越），补建一个。
                 if (enableRigidbodyPortalClones && FindCloneIndexForRigidbody(rb) < 0)
@@ -5046,8 +5065,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             bool stillInsideThreshold = LocalPointInPortalRect(currentLocal, thisShape) && Mathf.Abs(currentLocal.z) <= currentTrackDepth;
             if (!stillInsideThreshold)
             {
-                // Seb OnTriggerExit 替代：离开门阈值后移除 traveller；若另一扇门没接管，再还原图层，同时销毁clone
-                RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                // Seb OnTriggerExit 替代：离开门阈值后移除 traveller；先释放本门的临时碰撞忽略。
+                // 另一扇门仍持有同一刚体时，保留它的临时碰撞忽略关系。
+                RestoreRigidbodyCollisionIfSafe(rb, !isPortalA);
                 if (heldByGun && portalGun != null && !IsRigidbodyTrackedByPortal(!isPortalA, rb))
                 {
                     portalGun.RestoreHeldRigidbodyLayerAfterPortal();
@@ -5442,10 +5462,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (col == null) continue;
             if (col == clipVolume) continue;
             if (col.isTrigger) continue;
-            // 跳过有Rigidbody的：动态物体走rigidbodyPassThroughLayer独立通道，这里不处理
+            // 动态物体由刚体专用的逐Collider忽略逻辑处理，这里只处理静态墙/地板。
             if (col.attachedRigidbody != null) continue;
-            // 跳过传送门自身hierarchy下的Collider（Pipe等，layer 13 Pickup本来就不挡玩家）
-            if (IsColliderUnderPortalHierarchy(col, portalPlane)) continue;
+            // 排除整个传送门根节点下的碰撞体，包括与 portalPlane 同级的 Pipe 边框。
+            Transform portalRoot = portalPlane == portalPlaneA ? portalParentA : portalParentB;
+            if (IsColliderUnderPortalHierarchy(col, portalRoot)) continue;
 
             GameObject obj = col.gameObject;
             // 已经是目标 layer：
@@ -6216,7 +6237,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return false;
     }
 
-    private void RestoreRigidbodyLayerIfSafe(Rigidbody rb, int originalLayer, bool otherPortalIsA)
+    private void RestoreRigidbodyCollisionIfSafe(Rigidbody rb, bool otherPortalIsA)
     {
         if (rb == null) return;
         if (IsRigidbodyTrackedByPortal(otherPortalIsA, rb)) return;
