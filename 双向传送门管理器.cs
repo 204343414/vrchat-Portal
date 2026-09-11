@@ -5019,8 +5019,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 // Seb 原版：traveller.Teleport(from, to, m.GetColumn(3), m.rotation)
                 TeleportRigidbodySebStyle(rb, thisPlane, otherPlane, isPortalA, crossingWorldPosForTeleport, crossingT, heldByGun);
 
-                RestoreRigidbodyPortalWallIgnore(rb);
+                // 传送交接不能先清空 IgnoreCollision：那会在物理帧中产生一个碰撞恢复窗口，
+                // 地洞/地板可能立即把刚体弹飞。先让出口门接管，再释放入口门的 owner。
                 AddRigidbodyTracker(!isPortalA, rb, GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, originalLayer, RBSideFromSignedDistance(Vector3.Dot(GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, otherPlane.forward)));
+                ApplyRigidbodyPortalWallIgnore(rb, !isPortalA);
+                RestoreRigidbodyPortalWallIgnoreForPortal(rb, isPortalA);
 
                 // 兜底：如果因为某种原因clone不存在（刚进入volume同帧就穿越），补建一个。
                 if (enableRigidbodyPortalClones && FindCloneIndexForRigidbody(rb) < 0)
