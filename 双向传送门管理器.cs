@@ -5440,7 +5440,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             // 动态物体由刚体专用的逐Collider忽略逻辑处理，这里只处理静态墙/地板。
             if (col.attachedRigidbody != null) continue;
             // 排除整个传送门根节点下的碰撞体，包括与 portalPlane 同级的 Pipe 边框。
-            Transform portalRoot = isPortalA ? portalParentA : portalParentB;
+            Transform portalRoot = portalPlane == portalPlaneA ? portalParentA : portalParentB;
             if (IsColliderUnderPortalHierarchy(col, portalRoot)) continue;
 
             GameObject obj = col.gameObject;
