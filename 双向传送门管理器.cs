@@ -66,12 +66,6 @@ public class 双向传送门管理器 : UdonSharpBehaviour
     [Tooltip("玩家靠近传送门时，墙/地板/屏蔽碰撞体临时切换到的 Layer。当前推荐同样用 17 = Walkthrough：挡刚体/物品，不挡玩家。")]
     public int playerPassThroughLayer = 17;
 
-    [Tooltip("刚体进入传送门区域时切换至的 Layer。当前实测推荐 14 = PickupNoEnvironment：不撞世界墙/地板，但会和 13(Pickup) 碰撞，适合让门边 Pipe 环挡住刚体。")]
-    public int rigidbodyPassThroughLayer = 14;
-
-    [Tooltip("刚体离开传送门区域后是否自动还原原始 Layer")]
-    public bool restoreRigidbodyLayerOnExit = true;
-
     [Header("════════════ 传送门Clip Volume 批量穿透 ════════════")]
     [Tooltip("A门 Clip Volume：拖入一个 BoxCollider（可挂在门自身/子物体上，可设为Trigger）。" +
              "玩家靠近A门时，该Box体积内所有【非刚体、非Trigger、非传送门自身hierarchy】的静态Collider统一切到playerPassThroughLayer，离开后自动还原。" +
@@ -862,8 +856,17 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             isVRPlayer = localPlayer.IsUserInVR();
         }
 
-        if (portalMatA != null) portalMatA.SetFloat(recursiveDisplayMaskProperty, 1f);
-        if (portalMatB != null) portalMatB.SetFloat(recursiveDisplayMaskProperty, 1f);
+        if (portalMatA != null)
+        {
+            portalMatA.SetFloat(recursiveDisplayMaskProperty, 1f);
+            // 终端圈形状跟随该门判定形状（0=圆 1=三角 2=方框），shader 里 SDF 现算
+            portalMatA.SetFloat("_EdgeShape", ResolvePortalShape(true));
+        }
+        if (portalMatB != null)
+        {
+            portalMatB.SetFloat(recursiveDisplayMaskProperty, 1f);
+            portalMatB.SetFloat("_EdgeShape", ResolvePortalShape(false));
+        }
         SyncPortalRenderTextureBindings();
 
         // 默认关闭过渡 Cube（只在传送时开启）
@@ -897,6 +900,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
     private void LateUpdate()
     {
+        // VRC SDK 的本地玩家对象在 Start() 时可能尚未就绪（ClientSim/域重载后尤其常见），
+        // 只在 Start 抓一次会永久 null → 本函数每帧空转（刚体追踪/clone/穿门全死）。失效时持续重取。
+        if (localPlayer == null || !localPlayer.IsValid()) localPlayer = Networking.LocalPlayer;
         if (localPlayer == null || !localPlayer.IsValid()) return;
         if (portalParentA == null || portalParentB == null) return;
         if (portalPlaneA == null || portalPlaneB == null) return;
@@ -2320,12 +2326,15 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             // 出口目标距离：取 exitSideMinDistance 和 teleportTriggerOffset 的较大值。
             // 这样传送后玩家落在出口门的外边缘（沉浸式：从一扇门的外缘进，从另一扇门的外缘出）。
             float exitTargetDist = Mathf.Max(Mathf.Abs(exitSideMinDistance), teleportTriggerOffset);
-            float desiredZ = desiredExitSide * exitTargetDist;
-            bool wrongSide = SideFromLocalZ(afterLocalForSide.z) != desiredExitSide;
-            bool tooClose = Mathf.Abs(afterLocalForSide.z) < exitTargetDist;
-            if (wrongSide || tooClose)
+            // 同时保证触发点（hybrid 模式下是头部）和 TeleportTo 实际设置的 root 都在出口安全侧。
+            // 斜门上头/root 的门法线深度可能相差较大；只检查触发点会让 root 留在门背面。
+            float exitClearance = Mathf.Min(
+                desiredExitSide * afterLocalForSide.z,
+                desiredExitSide * LocalPointForPortal(toPlane, newTeleportPos).z
+            );
+            if (exitClearance < exitTargetDist)
             {
-                exitSideFix = desiredZ - afterLocalForSide.z;
+                exitSideFix = desiredExitSide * (exitTargetDist - exitClearance);
                 Vector3 fixOffset = toPlane.forward * exitSideFix;
                 newTeleportPos += fixOffset;
                 cameraHeadAfterTeleport += fixOffset;
@@ -2708,6 +2717,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (recursiveTerminalUseDisplayMask && linkedMat != null)
             {
                 SetPortalDisplayMask(linkedMat, 0f);
+                // 递归终点改为边缘效果：门面改画 _EdgeTex 白火焰环（颜色按本门 _OutlineColor/_OutlineColor2 自动染色、形状按 _EdgeShape SDF 现算），中心透明露出门后世界
+                linkedMat.SetFloat("_TerminalEdge", 1f);
             }
             else if (linkedScreen != null)
             {
@@ -2741,6 +2752,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 if (recursiveTerminalUseDisplayMask && linkedMat != null)
                 {
                     SetPortalDisplayMask(linkedMat, 1f);
+                    linkedMat.SetFloat("_TerminalEdge", 0f);
                 }
                 else if (linkedTerminalHiddenByRenderer && linkedScreen != null)
                 {
@@ -2753,7 +2765,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
         // Restore states before player camera renders.
         if (thisMat != null) SetPortalDisplayMask(thisMat, oldThisMask);
-        if (linkedMat != null) SetPortalDisplayMask(linkedMat, oldLinkedMask);
+        if (linkedMat != null)
+        {
+            SetPortalDisplayMask(linkedMat, oldLinkedMask);
+            linkedMat.SetFloat("_TerminalEdge", 0f);
+        }
         if (thisScreen != null) thisScreen.enabled = oldThisScreenEnabled;
         if (linkedScreen != null) linkedScreen.enabled = oldLinkedScreenEnabled;
         portalCam.clearFlags = oldClearFlags;
@@ -3351,51 +3367,85 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (portalPlaneA == null || portalPlaneB == null || !portalPlaneA.gameObject.activeInHierarchy || !portalPlaneB.gameObject.activeInHierarchy) return;
         ProcessRigidbodyForPortal(true, true);
         if (portalGun.GetHeldRigidbody() != null) ProcessRigidbodyForPortal(false, true);
+
     }
 
-    public bool HeldBoundsFitPortal(Transform portal, Bounds bounds, Vector3 displacement, float padding)
+    // 判断手持刚体的中心是否已进入指定门洞的追踪区。
+    // 只看中心点+门形+追踪深度，不要求斜放物体的所有角都塞进洞。
+    // 仅按刚体中心的门洞投影判定；不要求物体全部角点入洞，也不限制沿门法线的距离。
+    public bool IsHeldRigidbodyCenterInsidePortalAperture(Transform portal)
     {
-        if (portal == null || (portal != portalPlaneA && portal != portalPlaneB)) return false;
-        Collider[] colliders = portalGun == null ? null : portalGun.GetHeldBodyColliders();
-        if (colliders == null || colliders.Length == 0) return false;
-        int shape = ResolvePortalShape(portal == portalPlaneA);
-        int exitShape = ResolvePortalShape(portal != portalPlaneA);
-        for (int c = 0; c < colliders.Length; c++)
-        {
-            Collider collider = colliders[c];
-            if (collider == null || !collider.enabled || collider.isTrigger || collider.attachedRigidbody != portalGun.GetHeldRigidbody()) continue;
-            if (collider.GetType() == typeof(BoxCollider))
-            {
-                BoxCollider box = (BoxCollider)collider;
-                Vector3 scale = box.transform.lossyScale;
-                Vector3 localPadding = new Vector3(padding / Mathf.Max(Mathf.Abs(scale.x), 0.0001f),
-                    padding / Mathf.Max(Mathf.Abs(scale.y), 0.0001f), padding / Mathf.Max(Mathf.Abs(scale.z), 0.0001f));
-                Vector3 half = box.size * 0.5f + localPadding;
-                for (int i = 0; i < 8; i++)
-                {
-                    Vector3 localCorner = box.center + new Vector3((i & 1) == 0 ? -half.x : half.x, (i & 2) == 0 ? -half.y : half.y, (i & 4) == 0 ? -half.z : half.z);
-                    Vector3 portalLocal = LocalPointForPortal(portal, collider.transform.TransformPoint(localCorner) + displacement);
-                    if (!LocalPointInPortalRect(portalLocal, shape) || !LocalPointInPortalRect(portalLocal, exitShape)) return false;
-                }
-            }
-            else
-            {
-                Bounds colliderBounds = collider.bounds;
-                Vector3 extents = colliderBounds.extents + Vector3.one * padding;
-                for (int i = 0; i < 8; i++)
-                {
-                    Vector3 corner = colliderBounds.center + displacement + new Vector3((i & 1) == 0 ? -extents.x : extents.x, (i & 2) == 0 ? -extents.y : extents.y, (i & 4) == 0 ? -extents.z : extents.z);
-                    Vector3 portalLocal = LocalPointForPortal(portal, corner);
-                    if (!LocalPointInPortalRect(portalLocal, shape) || !LocalPointInPortalRect(portalLocal, exitShape)) return false;
-                }
-            }
-        }
-        return true;
+        if (portal == null || portalGun == null) return false;
+        Rigidbody heldBody = portalGun.GetHeldRigidbody();
+        if (heldBody == null) return false;
+        bool isA = portal == portalPlaneA;
+        if (!isA && portal != portalPlaneB) return false;
+        Vector3 local = LocalPointForPortal(portal, heldBody.position);
+        return LocalPointInPortalRect(local, ResolvePortalShape(isA));
     }
 
     public void ReleaseHeldPortalPhysics(Rigidbody rb)
     {
-        if (rb != null) RestoreRigidbodyPortalWallIgnore(rb);
+        if (rb == null) return;
+
+        // 松手提交：刚体还插在门洞里（门框内且已过面）时，一次性镜像到出口侧再交还物理，
+        // 否则恢复碰撞后会永远卡在伪墙/墙体里。两级判定见 CommitHeldRigidbodyToClone 注释。
+        CommitHeldRigidbodyToClone(rb);
+
+        // 释放位置修正：被抓取刚体带着穿墙忽略待在伪墙/夹层里松手时，恢复碰撞会被物理引擎随机挤出。
+        // 与 TeleportRigidbodySebStyle 的出口侧修正同一规则：放到出口门平面外缘（不改速度/动能）。
+        if (enableExitSideCorrection)
+        {
+            float exitTargetDist = Mathf.Max(Mathf.Abs(exitSideMinDistance), teleportTriggerOffset);
+            Transform bestPlane = null;
+            float bestAbsZ = float.MaxValue;
+            Vector3 bestLocal = Vector3.zero;
+            if (portalPlaneA != null)
+            {
+                int shapeA = ResolvePortalShape(true);
+                Vector3 localA = LocalPointForPortal(portalPlaneA, rb.position);
+                if (LocalPointInPortalRect(localA, shapeA) && localA.z < exitTargetDist && Mathf.Abs(localA.z) < bestAbsZ)
+                {
+                    bestPlane = portalPlaneA; bestAbsZ = Mathf.Abs(localA.z); bestLocal = localA;
+                }
+            }
+            if (portalPlaneB != null)
+            {
+                int shapeB = ResolvePortalShape(false);
+                Vector3 localB = LocalPointForPortal(portalPlaneB, rb.position);
+                if (LocalPointInPortalRect(localB, shapeB) && localB.z < exitTargetDist && Mathf.Abs(localB.z) < bestAbsZ)
+                {
+                    bestPlane = portalPlaneB; bestAbsZ = Mathf.Abs(localB.z); bestLocal = localB;
+                }
+            }
+            if (bestPlane != null)
+            {
+                rb.position += bestPlane.forward * (exitTargetDist - bestLocal.z);
+                rb.transform.position = rb.position;
+            }
+        }
+
+        // 释放抓取状态时，不能只还原 IgnoreCollision；held-only 追踪记录若残留，
+        // 下一帧仍可能把刚体重新加入门的临时碰撞关系。
+        RestoreRigidbodyPortalWallIgnore(rb);
+        RemoveRigidbodyTrackerForRelease(rb, trackedRigidbodiesA, rbPreviousOffsetFromPortalA,
+            rbOriginalLayerA, rbLastPortalSideA, ref trackedRBCountA);
+        RemoveRigidbodyTrackerForRelease(rb, trackedRigidbodiesB, rbPreviousOffsetFromPortalB,
+            rbOriginalLayerB, rbLastPortalSideB, ref trackedRBCountB);
+        DestroyRigidbodyClone(rb);
+        RestorePortalOverlayIfUntracked(rb);
+    }
+
+    private void RemoveRigidbodyTrackerForRelease(Rigidbody rb, Rigidbody[] trackers,
+        Vector3[] previousOffsets, int[] originalLayers, int[] lastSides, ref int count)
+    {
+        for (int i = count - 1; i >= 0; i--)
+        {
+            if (trackers[i] == rb)
+            {
+                count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
+            }
+        }
     }
 
     private Collider GetPortalWallCollider(bool isPortalA)
@@ -3421,19 +3471,17 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             Vector3 halfExtents = Vector3.Scale(clipVolume.size * 0.5f, clipT.lossyScale);
             int overlapCount = Physics.OverlapBoxNonAlloc(worldCenter, halfExtents, clipVolumeOverlapBuffer,
                 clipT.rotation, ~0, QueryTriggerInteraction.Ignore);
-            Transform portal = isPortalA ? portalPlaneA : portalPlaneB;
+            Transform portalRoot = isPortalA ? portalParentA : portalParentB;
             for (int i = 0; i < overlapCount; i++)
             {
                 Collider wall = clipVolumeOverlapBuffer[i];
                 if (wall == null || wall == clipVolume || wall.isTrigger || wall.attachedRigidbody != null
-                    || IsColliderUnderPortalHierarchy(wall, portal)) continue;
+                    || IsColliderUnderPortalHierarchy(wall, portalRoot)) continue;
                 AddRigidbodyPortalWallIgnorePair(rb, bodies, wall, isPortalA);
             }
         }
-        else
-        {
-            AddRigidbodyPortalWallIgnorePair(rb, bodies, GetPortalWallCollider(isPortalA), isPortalA);
-        }
+        // “被标记的墙体”（伪墙本体）必须始终在忽略表内：不能只依赖 clip volume 恰好扫到它。
+        AddRigidbodyPortalWallIgnorePair(rb, bodies, GetPortalWallCollider(isPortalA), isPortalA);
 
         for (int i = rbWallIgnorePairCount - 1; i >= 0; i--)
         {
@@ -3538,7 +3586,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         if (portalPlaneA == null || portalPlaneB == null) return;
         CleanupRigidbodyPortalWallIgnores();
 
-        // 等价于 Seb 原版每个 Portal 在 LateUpdate 里 HandleTravellers。
+        // 普通刚体由 LateUpdate 处理；手持刚体独占枪的 FixedUpdate 路径，避免同一帧双重穿越采样。
         ProcessRigidbodyForPortal(true, false);
         ProcessRigidbodyForPortal(false, false);
     }
@@ -4852,7 +4900,8 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (IsGameObjectOurClone(rb.gameObject)) continue;
 
             bool heldByGun = portalGun != null && portalGun.GetHeldRigidbody() == rb;
-            if (heldOnly && !heldByGun) continue;
+            // 手持刚体只走枪的 FixedUpdate 专用路径；普通 LateUpdate 全量扫描不能再处理它。
+            if (heldOnly != heldByGun) continue;
             if (rb.isKinematic && !heldByGun) continue;
             if (heldByGun && !allowHeldRigidbodyTeleport) continue;
 
@@ -4936,7 +4985,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
 
             bool heldByGun = portalGun != null && portalGun.GetHeldRigidbody() == rb;
-            if (heldOnly && !heldByGun)
+            if (heldOnly != heldByGun)
             {
                 i++;
                 continue;
@@ -4944,7 +4993,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (rb.isKinematic && !heldByGun)
             {
                 // kinematic且没被枪抓着（比如传送枪被丢出去变kinematic）：不再追踪，同时销毁clone防止泄漏
-                RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                RestoreRigidbodyCollisionIfSafe(rb, !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
                 RestorePortalOverlayIfUntracked(rb);
@@ -4952,7 +5001,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             }
             if (heldByGun && !allowHeldRigidbodyTeleport)
             {
-                RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                RestoreRigidbodyCollisionIfSafe(rb, !isPortalA);
                 DestroyRigidbodyClone(rb);
                 count = RemoveRigidbodyTrackerAt(i, trackers, previousOffsets, originalLayers, lastSides, count);
                 RestorePortalOverlayIfUntracked(rb);
@@ -4968,6 +5017,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
 
             Vector3 rbWorldPos = GetRigidbodyTravellerPosition(rb, heldByGun);
             Vector3 currentOffset = rbWorldPos - thisPlane.position;
+            Vector3 currentLocal = LocalPointForPortal(thisPlane, rbWorldPos);
             Vector3 previousOffset = previousOffsets[i];
 
             float previousDot = Vector3.Dot(previousOffset, thisPlane.forward);
@@ -5007,7 +5057,24 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 crossingWorldPosForTeleport = Vector3.Lerp(previousWorldPos, rbWorldPos, crossingT);
                 Vector3 crossingLocal = LocalPointForPortal(thisPlane, crossingWorldPosForTeleport);
                 crossedInsidePortal = LocalPointInPortalRect(crossingLocal, thisShape);
-                if (heldByGun) crossedInsidePortal = crossedInsidePortal && portalGun.CanHeldFitPortal(thisPlane, crossingWorldPosForTeleport - rbWorldPos);
+                // 一句话算法：刚体在门框内过了门中线就立即按出口位置计算（传送），
+                // 不再对刚体做"塞得进门"的角点苛检——斜着/翻着进洞照样算穿门。
+            }
+            else if (!heldByGun && currentDot < 0f && LocalPointInPortalRect(currentLocal, thisShape))
+            {
+                // 门洞补抓（与粒子传送"规则2/3"同义）：非手持刚体已在门平面后侧且落在门框内=已进洞/嵌墙，
+                // 穿越事件可能因蹭边、翻滚、隧穿漏检——不补就会永远留在墙里。仅当它没有在主动飞出
+                // （法向速度指向门外），且不在另一扇门的门前"已出来"区域（防拽回）时，按穿越同款数学补送对面。
+                // 手持刚体不走这里：握持期间枪独占定位（松手由 CommitHeldRigidbodyToClone 提交）。
+                float normalSpeedOut = Vector3.Dot(GetRigidbodyTravellerVelocity(rb, false), thisPlane.forward);
+                if (normalSpeedOut <= rbPostCrossNormalSpeedEpsilon)
+                {
+                    int otherShape = ResolvePortalShape(!isPortalA);
+                    Vector3 localAtExit = LocalPointForPortal(otherPlane, rbWorldPos);
+                    float exitTrackDepth = noClipDepth + rbTriggerDepthExtension;
+                    bool alreadyOutAtExit = localAtExit.z >= 0f && localAtExit.z <= exitTrackDepth && LocalPointInPortalRect(localAtExit, otherShape);
+                    if (!alreadyOutAtExit) crossedInsidePortal = true;
+                }
             }
 
             if (crossedInsidePortal)
@@ -5025,8 +5092,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 // Seb 原版：traveller.Teleport(from, to, m.GetColumn(3), m.rotation)
                 TeleportRigidbodySebStyle(rb, thisPlane, otherPlane, isPortalA, crossingWorldPosForTeleport, crossingT, heldByGun);
 
-                RestoreRigidbodyPortalWallIgnore(rb);
+                // 传送交接不能先清空 IgnoreCollision：那会在物理帧中产生一个碰撞恢复窗口，
+                // 地洞/地板可能立即把刚体弹飞。先让出口门接管，再释放入口门的 owner。
                 AddRigidbodyTracker(!isPortalA, rb, GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, originalLayer, RBSideFromSignedDistance(Vector3.Dot(GetRigidbodyTravellerPosition(rb, heldByGun) - otherPlane.position, otherPlane.forward)));
+                ApplyRigidbodyPortalWallIgnore(rb, !isPortalA);
+                RestoreRigidbodyPortalWallIgnoreForPortal(rb, isPortalA);
 
                 // 兜底：如果因为某种原因clone不存在（刚进入volume同帧就穿越），补建一个。
                 if (enableRigidbodyPortalClones && FindCloneIndexForRigidbody(rb) < 0)
@@ -5041,13 +5111,13 @@ public class 双向传送门管理器 : UdonSharpBehaviour
                 continue;
             }
 
-            Vector3 currentLocal = LocalPointForPortal(thisPlane, rbWorldPos);
             float currentTrackDepth = heldByGun ? heldThresholdDepth : baseThresholdDepth;
             bool stillInsideThreshold = LocalPointInPortalRect(currentLocal, thisShape) && Mathf.Abs(currentLocal.z) <= currentTrackDepth;
             if (!stillInsideThreshold)
             {
-                // Seb OnTriggerExit 替代：离开门阈值后移除 traveller；若另一扇门没接管，再还原图层，同时销毁clone
-                RestoreRigidbodyLayerIfSafe(rb, originalLayers[i], !isPortalA);
+                // Seb OnTriggerExit 替代：离开门阈值后移除 traveller；先释放本门的临时碰撞忽略。
+                // 另一扇门仍持有同一刚体时，保留它的临时碰撞忽略关系。
+                RestoreRigidbodyCollisionIfSafe(rb, !isPortalA);
                 if (heldByGun && portalGun != null && !IsRigidbodyTrackedByPortal(!isPortalA, rb))
                 {
                     portalGun.RestoreHeldRigidbodyLayerAfterPortal();
@@ -5442,10 +5512,11 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             if (col == null) continue;
             if (col == clipVolume) continue;
             if (col.isTrigger) continue;
-            // 跳过有Rigidbody的：动态物体走rigidbodyPassThroughLayer独立通道，这里不处理
+            // 动态物体由刚体专用的逐Collider忽略逻辑处理，这里只处理静态墙/地板。
             if (col.attachedRigidbody != null) continue;
-            // 跳过传送门自身hierarchy下的Collider（Pipe等，layer 13 Pickup本来就不挡玩家）
-            if (IsColliderUnderPortalHierarchy(col, portalPlane)) continue;
+            // 排除整个传送门根节点下的碰撞体，包括与 portalPlane 同级的 Pipe 边框。
+            Transform portalRoot = portalPlane == portalPlaneA ? portalParentA : portalParentB;
+            if (IsColliderUnderPortalHierarchy(col, portalRoot)) continue;
 
             GameObject obj = col.gameObject;
             // 已经是目标 layer：
@@ -6216,7 +6287,7 @@ public class 双向传送门管理器 : UdonSharpBehaviour
         return false;
     }
 
-    private void RestoreRigidbodyLayerIfSafe(Rigidbody rb, int originalLayer, bool otherPortalIsA)
+    private void RestoreRigidbodyCollisionIfSafe(Rigidbody rb, bool otherPortalIsA)
     {
         if (rb == null) return;
         if (IsRigidbodyTrackedByPortal(otherPortalIsA, rb)) return;
