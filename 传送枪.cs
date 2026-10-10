@@ -210,13 +210,9 @@ public class 传送枪 : UdonSharpBehaviour
     public float heldMaxForce = 90f;
     [Tooltip("未经限幅的弹簧拉力超过此值时开始累计断联时间（N）。")]
     public float heldBreakForce = 160f;
-    [Tooltip("玩家每增加1m/s速度，超力断联阈值增加的基础倍率；0恢复固定阈值。不改变实际牵引力或玩家受困保护。")]
-    public float heldBreakSpeedFactor = 0.5f;
-    [Tooltip("移动时超力断联阈值的最大倍率。")]
-    public float heldBreakMaxMultiplier = 4f;
     [Tooltip("拉力持续超限多久后断联（秒）。")]
     public float heldBreakDelay = 0.15f;
-    [Tooltip("牵引速度上限（m/s），已有高速运动通过有限牵引力逐渐减速。")]
+    [Tooltip("刚体相对玩家移动速度的牵引上限（m/s）；玩家与刚体共同高速运动不受世界绝对速度限制。")]
     public float heldMaxSpeed = 8f;
     [Tooltip("旋转牵引强度。")]
     public float heldRotationStrength = 60f;
@@ -268,17 +264,9 @@ public class 传送枪 : UdonSharpBehaviour
     private float originalHeldMaxAngularVelocity;
     private Collider[] heldBodyColliders;
     private int[] originalHeldColliderLayers;
-    private Collider heldIgnoredWallA;
-    private Collider heldIgnoredWallB;
-    private bool[] originalHeldWallIgnoreA;
-    private bool[] originalHeldWallIgnoreB;
     private float heldOverloadTime;
     private Vector3 previousHeldTarget;
     private bool hasPreviousHeldTarget;
-    private Vector3 mappedFromPosition;
-    private Vector3 mappedToPosition;
-    private Quaternion mappedFromRotation;
-    private Quaternion mappedToRotation;
     private bool isGrabbing = false;
     private bool heldTargetMappedThroughPortal = false;
     private Transform heldTargetFromPortal;
@@ -394,11 +382,18 @@ public class 传送枪 : UdonSharpBehaviour
         {
             // 已有抓取物体 → 释放
             ReleaseHeldRigidbody();
+            return;
         }
-        else
+
+        // 没有抓取 → 尝试抓取（桌面 LMB/E、VR 握枪手扳机共用这一个入口）
+        TryGrabRigidbody();
+
+        // VR：抓取优先，没打到刚体才放门。放哪扇门由握枪手决定：左手=B，其余（右手/无手信息）=A，与轴映射一致
+        if (heldRigidbody == null && localPlayer != null && localPlayer.IsValid() && localPlayer.IsUserInVR())
         {
-            // 没有抓取 → 尝试抓取
-            TryGrabRigidbody();
+            VRC_Pickup selfPickup = GetComponent<VRC_Pickup>();
+            bool isLeftHand = selfPickup != null && localPlayer.GetPickupInHand(VRC_Pickup.PickupHand.Left) == selfPickup;
+            TryShootPortal(!isLeftHand);
         }
     }
 
@@ -508,8 +503,6 @@ public class 传送枪 : UdonSharpBehaviour
         heldBodyColliders = rb.GetComponentsInChildren<Collider>(true);
         heldPlayerSafetyNormals = new Vector3[heldBodyColliders.Length * 3];
         originalHeldColliderLayers = new int[heldBodyColliders.Length];
-        originalHeldWallIgnoreA = new bool[heldBodyColliders.Length];
-        originalHeldWallIgnoreB = new bool[heldBodyColliders.Length];
         bool hasMeshCollider = false;
         for (int i = 0; i < heldBodyColliders.Length; i++)
         {
@@ -536,7 +529,6 @@ public class 传送枪 : UdonSharpBehaviour
     void ReleaseHeldRigidbody()
     {
         Rigidbody rb = heldRigidbody;
-        RestoreHeldWallCollisions();
         if (rb != null)
         {
             for (int i = 0; i < heldBodyColliders.Length; i++)
@@ -551,7 +543,7 @@ public class 传送枪 : UdonSharpBehaviour
             rb.collisionDetectionMode = originalHeldCollisionDetectionMode;
         }
         heldRigidbody = null;
-        // 释放后由原有普通刚体追踪接管，不把本体硬搬到clone，也不清零动量。
+        // 释放后交由管理器 ReleaseHeldPortalPhysics 处理（门洞内一次性镜像提交到出口侧+出口修正），其余交普通刚体追踪接管；此处不清零动量。
         if (rb != null && portalManager != null) portalManager.ReleaseHeldPortalPhysics(rb);
         originalHeldLayer = -1;
         heldBodyColliders = null;
@@ -591,21 +583,34 @@ public class 传送枪 : UdonSharpBehaviour
     public void UpdateHeldAfterTeleport(Vector3 newWorldPos, Quaternion newWorldRot, Transform fromPortal, Transform toPortal, bool useClassicHalfTurn)
     {
         if (heldRigidbody == null) return;
-        if (heldTargetMappedThroughPortal && heldTargetFromPortal == toPortal && heldTargetToPortal == fromPortal)
+
+        // 只在刚体真实越过门平面后做一次坐标交接。比较刚体当前出口位置到
+        // 原目标/传送后目标的距离：哪套坐标更贴近刚体，就用哪套；不猜玩家朝向、不松手。
+        if (portalManager != null && shootPoint != null && fromPortal != null && toPortal != null)
         {
-            ClearHeldPortalTargetMapping();
-        }
-        else if (heldTargetMappedThroughPortal)
-        {
-            ReleaseHeldRigidbody();
-            return;
+            Vector3 rawTarget = shootPoint.position + shootPoint.forward * Mathf.Max(0f, heldDistance);
+            Vector3 mappedLocal = portalManager.LocalPointForPortal(fromPortal, rawTarget);
+            if (useClassicHalfTurn) mappedLocal = Quaternion.AngleAxis(180f, Vector3.up) * mappedLocal;
+            Vector3 mappedTarget = portalManager.WorldPointFromPortal(toPortal, mappedLocal);
+            float directError = Vector3.Distance(newWorldPos, rawTarget);
+            float mappedError = Vector3.Distance(newWorldPos, mappedTarget);
+            bool sameMapping = heldTargetMappedThroughPortal && heldTargetFromPortal == fromPortal && heldTargetToPortal == toPortal;
+            if (mappedError + 0.05f < directError || (sameMapping && mappedError <= directError + 0.05f))
+            {
+                SetHeldPortalTargetMapping(fromPortal, toPortal, useClassicHalfTurn);
+            }
+            else
+            {
+                ClearHeldPortalTargetMapping();
+            }
         }
         else
         {
-            SetHeldPortalTargetMapping(fromPortal, toPortal, useClassicHalfTurn);
+            ClearHeldPortalTargetMapping();
         }
+
+        hasPreviousHeldTarget = false;
         ApplyHeldCollisionLayer();
-        UpdateHeldWallCollisions();
     }
 
     public Rigidbody GetHeldRigidbody()
@@ -629,13 +634,6 @@ public class 传送枪 : UdonSharpBehaviour
         heldTargetFromPortal = fromPortal;
         heldTargetToPortal = toPortal;
         heldTargetUseClassicHalfTurn = useClassicHalfTurn;
-        if (heldTargetMappedThroughPortal)
-        {
-            mappedFromPosition = fromPortal.position;
-            mappedToPosition = toPortal.position;
-            mappedFromRotation = fromPortal.rotation;
-            mappedToRotation = toPortal.rotation;
-        }
     }
 
     public void ClearHeldPortalTargetMapping()
@@ -648,19 +646,23 @@ public class 传送枪 : UdonSharpBehaviour
     public void HandlePlayerTeleportedThroughPortal(Transform fromPortal, Transform toPortal, bool useClassicHalfTurn)
     {
         if (heldRigidbody == null) return;
+
+        bool heldBodyAtEntry = portalManager != null
+            && portalManager.IsHeldRigidbodyCenterInsidePortalAperture(fromPortal);
+
+        // 玩家同向追上刚体，且刚体中心投影已离开入口门洞时，回到普通同空间目标。
+        // 若中心投影仍在洞内，保留映射，等刚体自己越过中线后再交接出口坐标。
         if (heldTargetMappedThroughPortal && heldTargetFromPortal == fromPortal && heldTargetToPortal == toPortal)
         {
-            ClearHeldPortalTargetMapping();
+            if (!heldBodyAtEntry) ClearHeldPortalTargetMapping();
         }
-        else if (heldTargetMappedThroughPortal)
-        {
-            ReleaseHeldRigidbody();
-            return;
-        }
-        else
+        // 玩家先过门、刚体中心还在入口门洞：把弹簧目标暂时映回刚体一侧，防止目标点瞬移。
+        // 只看中心投影与实际门形，不查八个角、不额外卡深度；洞旁侧向物体中心在洞外，不会误触发。
+        else if (!heldTargetMappedThroughPortal && heldBodyAtEntry)
         {
             SetHeldPortalTargetMapping(toPortal, fromPortal, useClassicHalfTurn);
         }
+        // 反向穿门或其他状态不匹配只保留现有目标，不把它当松手理由。
         hasPreviousHeldTarget = false;
     }
 
@@ -723,73 +725,6 @@ public class 传送枪 : UdonSharpBehaviour
             + Mathf.Abs(n.x) * e.x + Mathf.Abs(n.y) * e.y + Mathf.Abs(n.z) * e.z
             + Mathf.Abs(Vector3.Dot(heldRigidbody.velocity, n)) * Time.fixedDeltaTime * 2f
             + Mathf.Max(0f, heldCollisionSkin) + 0.05f;
-    }
-
-    public bool CanHeldFitPortal(Transform portal, Vector3 displacement)
-    {
-        if (heldRigidbody == null || portalManager == null || GetHeldBodyCollider() == null) return false;
-        return portalManager.HeldBoundsFitPortal(portal, GetHeldBounds(), displacement, Mathf.Max(0f, heldCollisionSkin));
-    }
-
-    Collider GetHeldPortalWall(Transform portal, Collider wall)
-    {
-        if (portal == null || wall == null || !portal.gameObject.activeInHierarchy || !wall.enabled || wall.isTrigger || wall.attachedRigidbody != null) return null;
-        if (Mathf.Abs(Vector3.Dot(heldRigidbody.position - portal.position, portal.forward)) > GetHeldPortalTrackingDepth(portal)) return null;
-        if (!CanHeldFitPortal(portal, Vector3.zero)) return null;
-        Bounds bounds = GetHeldBounds();
-        float rotationPadding = heldRigidbody.angularVelocity.magnitude * bounds.extents.magnitude * Time.fixedDeltaTime * 2f;
-        Vector3 nextOffset = heldRigidbody.velocity * Time.fixedDeltaTime * 2f;
-        if (!portalManager.HeldBoundsFitPortal(portal, bounds, nextOffset, Mathf.Max(0f, heldCollisionSkin) + rotationPadding)) return null;
-        return wall;
-    }
-
-    void RestoreHeldWallCollisions()
-    {
-        if (heldBodyColliders != null)
-        {
-            for (int i = 0; i < heldBodyColliders.Length; i++)
-            {
-                Collider col = heldBodyColliders[i];
-                if (col == null) continue;
-                if (heldIgnoredWallA != null) Physics.IgnoreCollision(col, heldIgnoredWallA, originalHeldWallIgnoreA[i]);
-                if (heldIgnoredWallB != null) Physics.IgnoreCollision(col, heldIgnoredWallB, originalHeldWallIgnoreB[i]);
-            }
-        }
-        heldIgnoredWallA = null;
-        heldIgnoredWallB = null;
-    }
-
-    void UpdateHeldWallCollisions()
-    {
-        Collider wallA = null;
-        Collider wallB = null;
-        if (portalManager != null && portalManager.enabled && portalManager.enableRigidbodyTeleport && portalManager.allowHeldRigidbodyTeleport
-            && portalManager.portalPlaneA != null && portalManager.portalPlaneB != null
-            && portalManager.portalPlaneA.gameObject.activeInHierarchy && portalManager.portalPlaneB.gameObject.activeInHierarchy)
-        {
-            wallA = GetHeldPortalWall(portalManager.portalPlaneA, markedColliderA != null ? markedColliderA : portalManager.portalWallColliderA);
-            wallB = GetHeldPortalWall(portalManager.portalPlaneB, markedColliderB != null ? markedColliderB : portalManager.portalWallColliderB);
-            if (wallB == wallA) wallB = null;
-        }
-        if (wallA == heldIgnoredWallA && wallB == heldIgnoredWallB) return;
-        RestoreHeldWallCollisions();
-        heldIgnoredWallA = wallA;
-        heldIgnoredWallB = wallB;
-        for (int i = 0; i < heldBodyColliders.Length; i++)
-        {
-            Collider col = heldBodyColliders[i];
-            if (col == null) continue;
-            if (wallA != null)
-            {
-                originalHeldWallIgnoreA[i] = Physics.GetIgnoreCollision(col, wallA);
-                if (col.attachedRigidbody == heldRigidbody && !col.isTrigger) Physics.IgnoreCollision(col, wallA, true);
-            }
-            if (wallB != null)
-            {
-                originalHeldWallIgnoreB[i] = Physics.GetIgnoreCollision(col, wallB);
-                if (col.attachedRigidbody == heldRigidbody && !col.isTrigger) Physics.IgnoreCollision(col, wallB, true);
-            }
-        }
     }
 
     Vector3 MapHeldTargetPoint(Vector3 point)
@@ -891,11 +826,9 @@ public class 传送枪 : UdonSharpBehaviour
         UpdateHeldRigidbodyPhysics();
     }
 
-    bool ShouldBreakHeldForce(float forceMagnitude, float playerSpeed, float dt)
+    bool ShouldBreakHeldForce(float forceMagnitude, float dt)
     {
-        float multiplier = Mathf.Min(1f + Mathf.Max(0f, playerSpeed) * Mathf.Max(0f, heldBreakSpeedFactor),
-            Mathf.Max(1f, heldBreakMaxMultiplier));
-        float threshold = Mathf.Max(0.01f, heldBreakForce) * multiplier;
+        float threshold = Mathf.Max(0.01f, heldBreakForce);
         heldOverloadTime = forceMagnitude > threshold ? heldOverloadTime + dt : 0f;
         return heldOverloadTime >= Mathf.Max(dt, heldBreakDelay);
     }
@@ -910,20 +843,15 @@ public class 传送枪 : UdonSharpBehaviour
         }
         if (heldTargetMappedThroughPortal && (portalManager == null || !portalManager.enabled || !portalManager.enableRigidbodyTeleport
             || !portalManager.allowHeldRigidbodyTeleport || heldTargetFromPortal == null || heldTargetToPortal == null
-            || !heldTargetFromPortal.gameObject.activeInHierarchy || !heldTargetToPortal.gameObject.activeInHierarchy
-            || Vector3.Distance(heldTargetFromPortal.position, mappedFromPosition) > 0.001f
-            || Vector3.Distance(heldTargetToPortal.position, mappedToPosition) > 0.001f
-            || Quaternion.Angle(heldTargetFromPortal.rotation, mappedFromRotation) > 0.1f
-            || Quaternion.Angle(heldTargetToPortal.rotation, mappedToRotation) > 0.1f))
+            || !heldTargetFromPortal.gameObject.activeInHierarchy || !heldTargetToPortal.gameObject.activeInHierarchy))
         {
-            ReleaseHeldRigidbody();
-            return;
+            // 门/映射设施失效时退回普通手持目标，不释放刚体。
+            ClearHeldPortalTargetMapping();
         }
 
         // 先处理上一物理步的穿门，再计算本步牵引，避免低帧率下数个物理步仍拉向旧空间。
         if (portalManager != null) portalManager.ProcessHeldRigidbodyPhysics();
         if (heldRigidbody == null) return;
-        UpdateHeldWallCollisions();
         float dt = Mathf.Max(0.001f, Time.fixedDeltaTime);
         Vector3 rawTarget = shootPoint.position + shootPoint.forward * Mathf.Max(0f, heldDistance);
         Vector3 target = MapHeldTargetPoint(rawTarget);
@@ -948,7 +876,7 @@ public class 传送枪 : UdonSharpBehaviour
             if (heldRigidbody == null) return;
         }
         else heldPlayerBlockedTime = 0f;
-        if (ShouldBreakHeldForce(requestedForce.magnitude, playerVelocity.magnitude, dt))
+        if (ShouldBreakHeldForce(requestedForce.magnitude, dt))
         {
             ReleaseHeldRigidbody();
             return;
@@ -956,8 +884,14 @@ public class 传送枪 : UdonSharpBehaviour
         float maxForce = Mathf.Max(0f, heldMaxForce);
         Vector3 force = Vector3.ClampMagnitude(requestedForce, maxForce);
         Vector3 nextVelocity = heldRigidbody.velocity + force * (dt / heldRigidbody.mass);
-        // A global speed clamp can turn safe outward braking into a force toward the player.
-        if (!heldPlayerSafetyActive) nextVelocity = Vector3.ClampMagnitude(nextVelocity, Mathf.Max(0.01f, heldMaxSpeed));
+        // 只限制刚体相对玩家的速度，保留玩家与刚体共同的高速运动；否则高空跳崖时
+        // 世界速度超过8m/s会把刚体硬截慢，制造相对滞后并误触发超力断联。
+        if (!heldPlayerSafetyActive)
+        {
+            Vector3 relativeNextVelocity = nextVelocity - playerVelocity;
+            relativeNextVelocity = Vector3.ClampMagnitude(relativeNextVelocity, Mathf.Max(0.01f, heldMaxSpeed));
+            nextVelocity = playerVelocity + relativeNextVelocity;
+        }
         force = Vector3.ClampMagnitude((nextVelocity - heldRigidbody.velocity) * (heldRigidbody.mass / dt), maxForce);
         heldRigidbody.AddForce(force, ForceMode.Force);
 
@@ -1033,10 +967,26 @@ public class 传送枪 : UdonSharpBehaviour
             if (Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger") > 0.7f && !vrTriggerLeftPressed)
             {
                 vrTriggerLeftPressed = true;
-                TryShootPortal(true);
+                // 仅当这把枪确实握在“左手”、且另一根扳机没被同时压下时，右扳机才是独立于 Use 事件的另一根扳机，
+                // 才在这里动手；否则这次按压归 OnPickupUseDown 统一处理（抓取优先/释放/放门），轴只负责锁存，杜绝双触发。
+                VRC_Pickup selfPickup = GetComponent<VRC_Pickup>();
+                if (selfPickup != null && localPlayer.GetPickupInHand(VRC_Pickup.PickupHand.Left) == selfPickup
+                    && Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger") < 0.3f)
+                {
+                    // VR 扳机优先级：抓取优先，没打到刚体才放门；已抓着则是释放刚体
+                    if (heldRigidbody != null)
+                    {
+                        ReleaseHeldRigidbody();
+                    }
+                    else
+                    {
+                        TryGrabRigidbody();
+                        if (heldRigidbody == null) TryShootPortal(true);
+                    }
+                }
             }
 
-            // VR 左手 Grip 抓取保留作为兜底（主要使用 Pickup Use）
+            // 松扳机回到零位后才解锁下一次按压（与下方 Secondary 释放分支同构）
             else if (Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger") < 0.3f)
             {
                 vrTriggerLeftPressed = false;
@@ -1045,7 +995,22 @@ public class 传送枪 : UdonSharpBehaviour
             if (Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger") > 0.7f && !vrTriggerRightPressed)
             {
                 vrTriggerRightPressed = true;
-                TryShootPortal(false);
+                // 对称：仅当枪握在“右手”、且右扳机没被同时压下时，左扳机才是独立于 Use 事件的另一根扳机，才在这里动手
+                VRC_Pickup selfPickup = GetComponent<VRC_Pickup>();
+                if (selfPickup != null && localPlayer.GetPickupInHand(VRC_Pickup.PickupHand.Right) == selfPickup
+                    && Input.GetAxisRaw("Oculus_CrossPlatform_PrimaryIndexTrigger") < 0.3f)
+                {
+                    // VR 扳机优先级：抓取优先，没打到刚体才放门；已抓着则是释放刚体
+                    if (heldRigidbody != null)
+                    {
+                        ReleaseHeldRigidbody();
+                    }
+                    else
+                    {
+                        TryGrabRigidbody();
+                        if (heldRigidbody == null) TryShootPortal(false);
+                    }
+                }
             }
             else if (Input.GetAxisRaw("Oculus_CrossPlatform_SecondaryIndexTrigger") < 0.3f)
             {
