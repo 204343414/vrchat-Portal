@@ -2326,12 +2326,9 @@ public class 双向传送门管理器 : UdonSharpBehaviour
             // 出口目标距离：取 exitSideMinDistance 和 teleportTriggerOffset 的较大值。
             // 这样传送后玩家落在出口门的外边缘（沉浸式：从一扇门的外缘进，从另一扇门的外缘出）。
             float exitTargetDist = Mathf.Max(Mathf.Abs(exitSideMinDistance), teleportTriggerOffset);
-            // 同时保证触发点（hybrid 模式下是头部）和 TeleportTo 实际设置的 root 都在出口安全侧。
-            // 斜门上头/root 的门法线深度可能相差较大；只检查触发点会让 root 留在门背面。
-            float exitClearance = Mathf.Min(
-                desiredExitSide * afterLocalForSide.z,
-                desiredExitSide * LocalPointForPortal(toPlane, newTeleportPos).z
-            );
+            // 只校正 traveller 的触发点。地板/天花板门中，玩家根节点与头部本来就可能分处门平面两侧；
+            // 把 root 也强行推到出口侧会额外平移一个身高，造成双地洞传送后越飞越高。
+            float exitClearance = desiredExitSide * afterLocalForSide.z;
             if (exitClearance < exitTargetDist)
             {
                 exitSideFix = desiredExitSide * (exitTargetDist - exitClearance);
